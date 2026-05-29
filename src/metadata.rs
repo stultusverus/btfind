@@ -477,6 +477,7 @@ fn mark_metadata_complete_and_emit(
     if !info.files.is_empty() {
         store.insert_files(info_hash, &info.files)?;
     }
+    store.refresh_torrent_fts(info_hash)?;
     if stats_tx.send(CrawlStatsEvent::MetadataFetched).is_err() {
         tracing::warn!("stats_tx send failed after metadata fetch");
     }

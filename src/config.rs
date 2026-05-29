@@ -14,6 +14,9 @@ pub struct Config {
 
     #[serde(default)]
     pub crawl: CrawlConfig,
+
+    #[serde(default)]
+    pub web: WebConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -113,6 +116,23 @@ fn default_dht_node_max_age_hours() -> u32 {
     24
 }
 
+#[derive(Debug, Deserialize)]
+pub struct WebConfig {
+    #[serde(default = "default_web_host")]
+    pub host: String,
+
+    #[serde(default = "default_web_port")]
+    pub port: u16,
+}
+
+fn default_web_host() -> String {
+    "127.0.0.1".to_string()
+}
+
+fn default_web_port() -> u16 {
+    8080
+}
+
 impl Default for NetworkConfig {
     fn default() -> Self {
         NetworkConfig {
@@ -153,6 +173,15 @@ impl Default for CrawlConfig {
     }
 }
 
+impl Default for WebConfig {
+    fn default() -> Self {
+        WebConfig {
+            host: default_web_host(),
+            port: default_web_port(),
+        }
+    }
+}
+
 #[allow(clippy::derivable_impls)]
 impl Default for Config {
     fn default() -> Self {
@@ -161,6 +190,7 @@ impl Default for Config {
             metadata: MetadataConfig::default(),
             database: DatabaseConfig::default(),
             crawl: CrawlConfig::default(),
+            web: WebConfig::default(),
         }
     }
 }

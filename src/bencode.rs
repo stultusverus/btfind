@@ -281,7 +281,7 @@ mod tests {
         };
 
         let encoded = msg.to_bytes();
-        assert!(encoded.len() > 0);
+        assert!(!encoded.is_empty());
     }
 
     #[test]
