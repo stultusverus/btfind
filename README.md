@@ -1,0 +1,114 @@
+# btfind
+
+BitTorrent DHT sniffer — crawls the DHT network, discovers torrents, fetches metadata (BEP 9), stores results in SQLite, and provides CLI search.
+
+## Installation
+
+```bash
+cargo install --path .
+```
+
+Requires Rust 1.73+.
+
+## Usage
+
+```
+btfind run       Start the crawler
+btfind search    Search collected torrents
+btfind stats     Show crawler statistics
+btfind prune     Remove old torrents
+```
+
+### btfind run
+
+```bash
+# Run for 60 seconds
+btfind run --duration 60
+
+# Run continuously (Ctrl+C to stop)
+btfind run --continuous
+
+# Custom port and concurrency
+btfind run --continuous --port 6882 --max-concurrent 20
+```
+
+### btfind search
+
+```bash
+# Search by name
+btfind search --query ubuntu
+
+# Sort by size
+btfind search --query iso --sort total_size
+
+# JSON output
+btfind search --query debian --json
+
+# Show all, sorted by name
+btfind search --sort name --limit 100
+```
+
+### btfind stats
+
+```
+btfind stats
+```
+
+Outputs: total torrents, metadata complete count, files indexed, total data size.
+
+### btfind prune
+
+```bash
+# Remove torrents not seen in 90 days
+btfind prune --older-than 90
+```
+
+## Configuration
+
+Optional config at `~/.config/btfind/config.toml`:
+
+```toml
+[network]
+port = 6881
+bootstrap_nodes = [
+    "67.215.246.10:6881",
+    "87.98.162.88:6881",
+    "82.221.103.244:6881",
+]
+
+[metadata]
+max_concurrent = 10
+peer_timeout_secs = 30
+retry_after_hours = 24
+peer_attempt_retention_hours = 72
+
+[database]
+path = "~/.local/share/btfind/torrents.db"
+
+[crawl]
+get_peers_interval_secs = 5
+bucket_refresh_mins = 15
+resume_info_hash_limit = 5000
+dht_node_resume_limit = 1024
+dht_node_max_age_hours = 24
+```
+
+CLI flags override config values.
+
+## How It Works
+
+Three subsystems run on a Tokio async runtime:
+
+- **DHT Crawler** — Bootstraps into the BitTorrent DHT via Kademlia, walks the network with `find_node`, and discovers info_hashes from `get_peers` and `announce_peer` messages (KRPC over UDP).
+- **Metadata Fetcher** — Receives discovered info_hashes, connects to peers via TCP (BitTorrent wire protocol), negotiates BEP 9 extensions (`ut_metadata`), and downloads torrent metadata (name, size, file list).
+- **SQLite Store** — Persists torrents and files with deduplication by info_hash. Supports full-text search, statistics, and pruning.
+
+Data flows through `tokio::sync::mpsc` channels: DHT crawler → metadata fetcher → SQLite.
+
+## Database
+
+Stored at `~/.local/share/btfind/torrents.db` (SQLite, WAL mode).
+
+## License
+
+MIT
