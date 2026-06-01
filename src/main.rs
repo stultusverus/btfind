@@ -43,7 +43,7 @@ enum Commands {
 
     /// Search collected torrents
     Search {
-        /// Text query to search torrent names
+        /// Text query to search torrent names and file paths
         #[arg(long)]
         query: Option<String>,
 

@@ -36,7 +36,7 @@ btfind run --port 6882 --max-concurrent 20
 
 ### btfind search
 
-Search uses SQLite FTS5 (trigram tokenizer) over torrent names and file paths. Results are ranked by relevance for non-empty queries.
+Search is literal by default over torrent names and file paths. Normal queries (3+ characters) use SQLite FTS5 with the trigram tokenizer, with results ranked by relevance. Short queries (1-2 characters) fall back to a `LIKE` substring search with deterministic ordering (no relevance rank).
 
 ```bash
 # Search by name or file path
@@ -91,7 +91,7 @@ When `btfind serve` is running:
 
 ```
 GET /                         Dashboard HTML page
-GET /api/search?q=ubuntu      Search torrents (FTS5, ranked)
+GET /api/search?q=ubuntu      Search torrents (literal, FTS5/ranked for 3+ char queries)
 GET /api/stats                Crawler statistics
 GET /api/torrents/<info_hash>  Torrent detail with file list
 GET /api/torrents/<info_hash>/magnet  Magnet URI (text/plain)
