@@ -275,8 +275,8 @@ impl Store {
             }
         }
 
+        Self::refresh_torrent_fts_locked(&tx, &hash_hex)?;
         tx.commit()?;
-        Self::refresh_torrent_fts_locked(&conn, &hash_hex)?;
         Ok(())
     }
 
