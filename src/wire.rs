@@ -519,7 +519,7 @@ mod tests {
             reqq: None,
         };
         let dict = ext.to_dict();
-        assert!(dict.len() > 0);
+        assert!(!dict.is_empty());
     }
 
     #[test]
@@ -736,15 +736,15 @@ mod tests {
 
         // ut_metadata = -1 should be rejected
         let parsed = ExtendedHandshake::from_bytes(&make_with_m_value(-1)).unwrap();
-        assert!(parsed.m.get("ut_metadata").is_none());
+        assert!(!parsed.m.contains_key("ut_metadata"));
 
         // ut_metadata = 0 should be rejected
         let parsed = ExtendedHandshake::from_bytes(&make_with_m_value(0)).unwrap();
-        assert!(parsed.m.get("ut_metadata").is_none());
+        assert!(!parsed.m.contains_key("ut_metadata"));
 
         // ut_metadata = 300 should be rejected (>255)
         let parsed = ExtendedHandshake::from_bytes(&make_with_m_value(300)).unwrap();
-        assert!(parsed.m.get("ut_metadata").is_none());
+        assert!(!parsed.m.contains_key("ut_metadata"));
 
         // ut_metadata = 1 should be accepted
         let parsed = ExtendedHandshake::from_bytes(&make_with_m_value(1)).unwrap();

@@ -22,7 +22,7 @@ pub struct TorrentRecord {
     pub metadata_complete: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 pub struct CrawlStats {
     pub total_torrents: i64,
     pub total_metadata_complete: i64,
@@ -62,6 +62,7 @@ impl Store {
             conn: Mutex::new(conn),
         };
         store.init_schema()?;
+        store.backfill_fts_if_needed()?;
         Ok(store)
     }
 
@@ -136,6 +137,13 @@ impl Store {
             );
 
             CREATE INDEX IF NOT EXISTS idx_dht_nodes_last_seen ON dht_nodes(last_seen);
+
+            CREATE VIRTUAL TABLE IF NOT EXISTS torrent_fts USING fts5(
+                info_hash UNINDEXED,
+                name,
+                paths,
+                tokenize = 'trigram'
+            );
 
             PRAGMA journal_mode=WAL;
             PRAGMA foreign_keys=ON;
@@ -221,7 +229,9 @@ impl Store {
                 if metadata_complete { 1i32 } else { 0i32 },
             ],
         )?;
-        Ok(conn.last_insert_rowid())
+        let rowid = conn.last_insert_rowid();
+        Self::refresh_torrent_fts_locked(&conn, &hash_hex)?;
+        Ok(rowid)
     }
 
     pub fn mark_metadata_complete(
@@ -242,6 +252,7 @@ impl Store {
         if updated == 0 {
             return Err(rusqlite::Error::QueryReturnedNoRows);
         }
+        Self::refresh_torrent_fts_locked(&conn, &hash_hex)?;
         Ok(())
     }
 
@@ -264,6 +275,7 @@ impl Store {
             }
         }
 
+        Self::refresh_torrent_fts_locked(&tx, &hash_hex)?;
         tx.commit()?;
         Ok(())
     }
@@ -295,27 +307,87 @@ impl Store {
         sort_by: &str,
     ) -> Result<Vec<TorrentRecord>, rusqlite::Error> {
         let conn = self.conn.lock().expect("store connection mutex poisoned");
-        let pattern = format!("%{}%", query);
+        let query_trimmed = query.trim();
 
-        let order = match sort_by {
-            "first_seen" => "first_seen DESC",
-            "total_size" => "total_size DESC",
-            "name" => "name ASC",
-            _ => "last_seen DESC",
-        };
+        if query_trimmed.is_empty() {
+            let order = sort_order_sql(sort_by);
+            let sql = format!(
+                "SELECT info_hash, name, piece_length, total_size, file_count, source, first_seen, last_seen, last_attempt, metadata_complete
+                 FROM torrents
+                 ORDER BY {}
+                 LIMIT ?1",
+                order
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(params![limit as i64], row_to_torrent)?;
+            let mut results = Vec::new();
+            for row in rows {
+                results.push(row?);
+            }
+            return Ok(results);
+        }
 
+        if query_trimmed.chars().count() < 3 {
+            let pattern = format!("%{}%", escape_like_literal(query_trimmed));
+            let effective_sort = if sort_by == "rank" {
+                "last_seen"
+            } else {
+                sort_by
+            };
+            let order = sort_order_sql(effective_sort);
+            let sql = format!(
+                "SELECT info_hash, name, piece_length, total_size, file_count, source, first_seen, last_seen, last_attempt, metadata_complete
+                 FROM torrents t
+                 WHERE COALESCE(t.name, '') LIKE ?1 ESCAPE '\\'
+                    OR EXISTS (
+                        SELECT 1 FROM files f
+                        WHERE f.torrent_id = t.info_hash
+                          AND f.path LIKE ?1 ESCAPE '\\'
+                    )
+                 ORDER BY {}
+                 LIMIT ?2",
+                order
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(params![pattern, limit as i64], row_to_torrent)?;
+            let mut results = Vec::new();
+            for row in rows {
+                results.push(row?);
+            }
+            return Ok(results);
+        }
+
+        let fts_query = fts_literal_query(query_trimmed);
+
+        if sort_by == "rank" {
+            let sql = "SELECT t.info_hash, t.name, t.piece_length, t.total_size, t.file_count, t.source, t.first_seen, t.last_seen, t.last_attempt, t.metadata_complete
+                       FROM torrent_fts f
+                       JOIN torrents t ON t.info_hash = f.info_hash
+                       WHERE torrent_fts MATCH ?1
+                       ORDER BY bm25(torrent_fts, 1.0, 5.0, 1.0), t.last_seen DESC
+                       LIMIT ?2";
+            let mut stmt = conn.prepare(sql)?;
+            let rows = stmt.query_map(params![fts_query, limit as i64], row_to_torrent)?;
+            let mut results = Vec::new();
+            for row in rows {
+                results.push(row?);
+            }
+            return Ok(results);
+        }
+
+        let order = sort_order_sql(sort_by);
         let sql = format!(
-            "SELECT info_hash, name, piece_length, total_size, file_count, source, first_seen, last_seen, last_attempt, metadata_complete
-             FROM torrents
-             WHERE COALESCE(name, '') LIKE ?1
+            "SELECT t.info_hash, t.name, t.piece_length, t.total_size, t.file_count, t.source, t.first_seen, t.last_seen, t.last_attempt, t.metadata_complete
+             FROM torrent_fts f
+             JOIN torrents t ON t.info_hash = f.info_hash
+             WHERE torrent_fts MATCH ?1
              ORDER BY {}
              LIMIT ?2",
             order
         );
 
         let mut stmt = conn.prepare(&sql)?;
-
-        let rows = stmt.query_map(params![pattern, limit as i64], row_to_torrent)?;
+        let rows = stmt.query_map(params![fts_query, limit as i64], row_to_torrent)?;
         let mut results = Vec::new();
         for row in rows {
             results.push(row?);
@@ -391,6 +463,19 @@ impl Store {
     pub fn prune_old_torrents(&self, days: i64) -> Result<i64, rusqlite::Error> {
         let conn = self.conn.lock().expect("store connection mutex poisoned");
         let cutoff = chrono::Utc::now().timestamp() - days * 86400;
+
+        let mut hashes = Vec::new();
+        {
+            let mut stmt = conn.prepare("SELECT info_hash FROM torrents WHERE last_seen < ?1")?;
+            let rows = stmt.query_map(params![cutoff], |row| row.get::<_, String>(0))?;
+            for row in rows {
+                hashes.push(row?);
+            }
+        }
+
+        for h in &hashes {
+            conn.execute("DELETE FROM torrent_fts WHERE info_hash = ?1", params![h])?;
+        }
         let removed = conn.execute("DELETE FROM torrents WHERE last_seen < ?1", params![cutoff])?;
         Ok(removed as i64)
     }
@@ -554,6 +639,139 @@ impl Store {
         }
         Ok(counts)
     }
+
+    fn refresh_torrent_fts_locked(
+        conn: &Connection,
+        info_hash_hex: &str,
+    ) -> Result<(), rusqlite::Error> {
+        conn.execute(
+            "DELETE FROM torrent_fts WHERE info_hash = ?1",
+            params![info_hash_hex],
+        )?;
+
+        let name: Option<String> = conn
+            .query_row(
+                "SELECT name FROM torrents WHERE info_hash = ?1 AND metadata_complete = 1",
+                params![info_hash_hex],
+                |row| row.get(0),
+            )
+            .ok();
+
+        if name.is_none() || name.as_deref() == Some("") {
+            let file_count: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM files WHERE torrent_id = ?1",
+                params![info_hash_hex],
+                |row| row.get(0),
+            )?;
+            if file_count == 0 {
+                return Ok(());
+            }
+        }
+
+        let mut paths = Vec::new();
+        {
+            let mut stmt =
+                conn.prepare("SELECT path FROM files WHERE torrent_id = ?1 ORDER BY path")?;
+            let rows = stmt.query_map(params![info_hash_hex], |row| row.get::<_, String>(0))?;
+            for row in rows {
+                paths.push(row?);
+            }
+        }
+        let paths_joined = paths.join(" ");
+
+        let name_val = name.unwrap_or_default();
+
+        conn.execute(
+            "INSERT INTO torrent_fts (info_hash, name, paths) VALUES (?1, ?2, ?3)",
+            params![info_hash_hex, name_val, paths_joined],
+        )?;
+
+        Ok(())
+    }
+
+    pub fn refresh_torrent_fts(&self, info_hash: &InfoHash) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock().expect("store connection mutex poisoned");
+        let hash_hex = hex::encode(info_hash);
+        Self::refresh_torrent_fts_locked(&conn, &hash_hex)
+    }
+
+    pub fn rebuild_search_index(&self) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock().expect("store connection mutex poisoned");
+        conn.execute("DELETE FROM torrent_fts", [])?;
+
+        let mut hashes = Vec::new();
+        {
+            let mut stmt =
+                conn.prepare("SELECT info_hash FROM torrents WHERE metadata_complete = 1")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            for row in rows {
+                hashes.push(row?);
+            }
+        }
+
+        for hash_hex in &hashes {
+            Self::refresh_torrent_fts_locked(&conn, hash_hex)?;
+        }
+
+        Ok(())
+    }
+
+    fn backfill_fts_if_needed(&self) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock().expect("store connection mutex poisoned");
+
+        let fts_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM torrent_fts", [], |row| row.get(0))?;
+        if fts_count > 0 {
+            return Ok(());
+        }
+
+        let complete_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM torrents WHERE metadata_complete = 1",
+            [],
+            |row| row.get(0),
+        )?;
+
+        if complete_count == 0 {
+            return Ok(());
+        }
+
+        drop(conn);
+        self.rebuild_search_index()
+    }
+
+    #[allow(dead_code)]
+    pub fn get_files(&self, info_hash: &InfoHash) -> Result<Vec<(String, i64)>, rusqlite::Error> {
+        let conn = self.conn.lock().expect("store connection mutex poisoned");
+        let hash_hex = hex::encode(info_hash);
+        let mut stmt =
+            conn.prepare("SELECT path, size FROM files WHERE torrent_id = ?1 ORDER BY path")?;
+        let rows = stmt.query_map(params![hash_hex], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(results)
+    }
+
+    #[allow(dead_code)]
+    pub fn get_torrent_by_hex(
+        &self,
+        info_hash_hex: &str,
+    ) -> Result<Option<TorrentRecord>, rusqlite::Error> {
+        let conn = self.conn.lock().expect("store connection mutex poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT info_hash, name, piece_length, total_size, file_count, source, first_seen, last_seen, last_attempt, metadata_complete
+             FROM torrents WHERE info_hash = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![info_hash_hex], row_to_torrent)?;
+        match rows.next() {
+            Some(Ok(record)) => Ok(Some(record)),
+            Some(Err(e)) => Err(e),
+            None => Ok(None),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -564,6 +782,33 @@ impl Store {
             .expect("store connection mutex poisoned")
             .execute_batch(sql)
     }
+}
+
+fn sort_order_sql(sort_by: &str) -> &'static str {
+    match sort_by {
+        "first_seen" => "first_seen DESC",
+        "total_size" => "total_size DESC",
+        "name" => "name ASC",
+        _ => "last_seen DESC",
+    }
+}
+
+fn fts_literal_query(input: &str) -> String {
+    format!("\"{}\"", input.replace('"', "\"\""))
+}
+
+fn escape_like_literal(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '%' | '_' | '\\' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 fn row_to_torrent(row: &rusqlite::Row) -> rusqlite::Result<TorrentRecord> {
@@ -678,15 +923,43 @@ mod tests {
     #[test]
     fn test_search_torrents() {
         let store = test_db();
+        let h1 = [1u8; 20];
+        let h2 = [2u8; 20];
+        let h3 = [3u8; 20];
+
         store
-            .upsert_torrent([1u8; 20], Some("ubuntu iso".into()), 1_000_000, 1, "dht")
+            .upsert_torrent(h1, Some("ubuntu iso".into()), 1_000_000, 1, "dht")
             .unwrap();
         store
-            .upsert_torrent([2u8; 20], Some("debian iso".into()), 2_000_000, 1, "dht")
+            .upsert_torrent(h2, Some("debian iso".into()), 2_000_000, 1, "dht")
             .unwrap();
         store
-            .upsert_torrent([3u8; 20], Some("fedora iso".into()), 3_000_000, 1, "dht")
+            .upsert_torrent(h3, Some("fedora iso".into()), 3_000_000, 1, "dht")
             .unwrap();
+
+        store
+            .mark_metadata_complete(&h1, "ubuntu iso", 262144, 1_000_000, 1)
+            .unwrap();
+        store
+            .insert_files(&h1, &[("ubuntu.iso".into(), 1_000_000)])
+            .unwrap();
+        store.refresh_torrent_fts(&h1).unwrap();
+
+        store
+            .mark_metadata_complete(&h2, "debian iso", 262144, 2_000_000, 1)
+            .unwrap();
+        store
+            .insert_files(&h2, &[("debian.iso".into(), 2_000_000)])
+            .unwrap();
+        store.refresh_torrent_fts(&h2).unwrap();
+
+        store
+            .mark_metadata_complete(&h3, "fedora iso", 262144, 3_000_000, 1)
+            .unwrap();
+        store
+            .insert_files(&h3, &[("fedora.iso".into(), 3_000_000)])
+            .unwrap();
+        store.refresh_torrent_fts(&h3).unwrap();
 
         let results = store.search_torrents("ubuntu", 10, "last_seen").unwrap();
         assert_eq!(results.len(), 1);
@@ -849,7 +1122,7 @@ mod tests {
         let result = store.conn.lock().expect("store connection mutex poisoned").query_row(
             "SELECT info_hash, name, piece_length, total_size, file_count, source, first_seen, last_seen, last_attempt, metadata_complete FROM torrents WHERE info_hash = ?1",
             rusqlite::params![bad_hex],
-            |row| row_to_torrent(row),
+            row_to_torrent,
         );
         assert!(result.is_err());
     }
@@ -1110,5 +1383,525 @@ mod tests {
         let result = store.mark_metadata_complete(&[0xFAu8; 20], "missing", 16384, 42, 1);
 
         assert!(matches!(result, Err(rusqlite::Error::QueryReturnedNoRows)));
+    }
+
+    #[test]
+    fn test_fts5_available() {
+        let store = test_db();
+        let conn = store.conn.lock().expect("store connection mutex poisoned");
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='torrent_fts'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_fts_search_by_name() {
+        let store = test_db();
+        let info_hash = [0xA1u8; 20];
+
+        store
+            .upsert_torrent(
+                info_hash,
+                Some("Ubuntu 24.04 LTS".into()),
+                4_000_000_000,
+                1,
+                "dht",
+            )
+            .unwrap();
+        store
+            .mark_metadata_complete(&info_hash, "Ubuntu 24.04 LTS", 262144, 4_000_000_000, 1)
+            .unwrap();
+        store
+            .insert_files(&info_hash, &[("ubuntu-24.04.iso".into(), 4_000_000_000)])
+            .unwrap();
+        store.refresh_torrent_fts(&info_hash).unwrap();
+
+        let results = store.search_torrents("Ubuntu", 10, "rank").unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name.as_deref(), Some("Ubuntu 24.04 LTS"));
+    }
+
+    #[test]
+    fn test_fts_search_by_file_path() {
+        let store = test_db();
+        let info_hash = [0xA2u8; 20];
+
+        store
+            .upsert_torrent(
+                info_hash,
+                Some("Some Movie".into()),
+                2_000_000_000,
+                1,
+                "dht",
+            )
+            .unwrap();
+        store
+            .mark_metadata_complete(&info_hash, "Some Movie", 262144, 2_000_000_000, 1)
+            .unwrap();
+        store
+            .insert_files(
+                &info_hash,
+                &[("movies/action/some_movie.mkv".into(), 2_000_000_000)],
+            )
+            .unwrap();
+        store.refresh_torrent_fts(&info_hash).unwrap();
+
+        let results = store.search_torrents("action", 10, "rank").unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name.as_deref(), Some("Some Movie"));
+    }
+
+    #[test]
+    fn test_fts_search_empty_query_returns_all() {
+        let store = test_db();
+
+        for i in 0u8..5 {
+            let info_hash = [i; 20];
+            store
+                .upsert_torrent(info_hash, Some(format!("torrent_{i}")), 1000, 1, "dht")
+                .unwrap();
+        }
+
+        let results = store.search_torrents("", 10, "last_seen").unwrap();
+        assert!(results.len() >= 5);
+    }
+
+    #[test]
+    fn test_fts_search_rank_sort() {
+        let store = test_db();
+
+        let h1 = [0xB1u8; 20];
+        let h2 = [0xB2u8; 20];
+
+        store
+            .upsert_torrent(h1, Some("Ubuntu Server LTS".into()), 1_000_000, 1, "dht")
+            .unwrap();
+        store
+            .mark_metadata_complete(&h1, "Ubuntu Server LTS", 262144, 1_000_000, 1)
+            .unwrap();
+        store
+            .insert_files(&h1, &[("ubuntu.iso".into(), 1_000_000)])
+            .unwrap();
+        store.refresh_torrent_fts(&h1).unwrap();
+
+        store
+            .upsert_torrent(h2, Some("Debian Linux".into()), 1_000_000, 1, "dht")
+            .unwrap();
+        store
+            .mark_metadata_complete(&h2, "Debian Linux", 262144, 1_000_000, 1)
+            .unwrap();
+        store
+            .insert_files(&h2, &[("debian/ubuntu.iso".into(), 1_000_000)])
+            .unwrap();
+        store.refresh_torrent_fts(&h2).unwrap();
+
+        let results = store.search_torrents("ubuntu", 10, "rank").unwrap();
+        assert!(!results.is_empty());
+        assert_eq!(results[0].name.as_deref(), Some("Ubuntu Server LTS"));
+    }
+
+    #[test]
+    fn test_fts_rebuild_index() {
+        let store = test_db();
+        let info_hash = [0xC1u8; 20];
+
+        store
+            .upsert_torrent(info_hash, Some("Test Torrent".into()), 1_000, 1, "dht")
+            .unwrap();
+        store
+            .mark_metadata_complete(&info_hash, "Test Torrent", 262144, 1_000, 1)
+            .unwrap();
+        store
+            .insert_files(&info_hash, &[("test/file.dat".into(), 1_000)])
+            .unwrap();
+
+        store
+            .conn
+            .lock()
+            .expect("store connection mutex poisoned")
+            .execute("DELETE FROM torrent_fts", [])
+            .unwrap();
+
+        store.rebuild_search_index().unwrap();
+
+        let results = store.search_torrents("file", 10, "rank").unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn test_fts_search_invalid_query_does_not_panic() {
+        let store = test_db();
+        let result = store.search_torrents("\"", 10, "rank");
+        assert!(result.is_err() || result.is_ok());
+    }
+
+    #[test]
+    fn test_get_files() {
+        let store = test_db();
+        let info_hash = [0xD1u8; 20];
+
+        store
+            .upsert_torrent(info_hash, Some("test".into()), 1000, 2, "dht")
+            .unwrap();
+        store
+            .insert_files(
+                &info_hash,
+                &[("a.txt".to_string(), 500), ("b.txt".to_string(), 500)],
+            )
+            .unwrap();
+
+        let files = store.get_files(&info_hash).unwrap();
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].0, "a.txt");
+        assert_eq!(files[1].0, "b.txt");
+    }
+
+    #[test]
+    fn test_get_torrent_by_hex() {
+        let store = test_db();
+        let info_hash = [0xE1u8; 20];
+        let hash_hex = hex::encode(info_hash);
+
+        store
+            .upsert_torrent(info_hash, Some("test".into()), 1000, 1, "dht")
+            .unwrap();
+
+        let t = store.get_torrent_by_hex(&hash_hex).unwrap().unwrap();
+        assert_eq!(t.name.as_deref(), Some("test"));
+
+        let missing = store
+            .get_torrent_by_hex("ffffffffffffffffffffffffffffffffffffffff")
+            .unwrap();
+        assert!(missing.is_none());
+    }
+
+    #[test]
+    fn test_fts_search_punctuation_ubuntu_version() {
+        let store = test_db();
+        let hash = [0xA6u8; 20];
+        store
+            .upsert_torrent(hash, Some("ubuntu-24.04".into()), 1_000_000, 1, "dht")
+            .unwrap();
+        store
+            .mark_metadata_complete(&hash, "ubuntu-24.04", 262144, 1_000_000, 1)
+            .unwrap();
+        store
+            .insert_files(&hash, &[("ubuntu.iso".into(), 1_000_000)])
+            .unwrap();
+
+        let results = store.search_torrents("ubuntu-24.04", 10, "rank").unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name.as_deref(), Some("ubuntu-24.04"));
+    }
+
+    #[test]
+    fn test_fts_search_punctuation_dot() {
+        let store = test_db();
+        let hash = [0xA7u8; 20];
+        store
+            .upsert_torrent(hash, Some("foo.bar".into()), 1_000_000, 1, "dht")
+            .unwrap();
+        store
+            .mark_metadata_complete(&hash, "foo.bar", 262144, 1_000_000, 1)
+            .unwrap();
+        store
+            .insert_files(&hash, &[("foo.bar.zip".into(), 1_000_000)])
+            .unwrap();
+
+        let results = store.search_torrents("foo.bar", 10, "rank").unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name.as_deref(), Some("foo.bar"));
+    }
+
+    #[test]
+    fn test_fts_search_punctuation_plus() {
+        let store = test_db();
+        let hash = [0xA8u8; 20];
+        store
+            .upsert_torrent(hash, Some("C++ Primer".into()), 1_000_000, 1, "dht")
+            .unwrap();
+        store
+            .mark_metadata_complete(&hash, "C++ Primer", 262144, 1_000_000, 1)
+            .unwrap();
+        store
+            .insert_files(&hash, &[("cpp_primer.pdf".into(), 1_000_000)])
+            .unwrap();
+
+        let results = store.search_torrents("C++", 10, "rank").unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name.as_deref(), Some("C++ Primer"));
+    }
+
+    #[test]
+    fn test_fts_search_punctuation_brackets() {
+        let store = test_db();
+        let hash = [0xA9u8; 20];
+        store
+            .upsert_torrent(hash, Some("[SubsPlease] Show".into()), 1_000_000, 1, "dht")
+            .unwrap();
+        store
+            .mark_metadata_complete(&hash, "[SubsPlease] Show", 262144, 1_000_000, 1)
+            .unwrap();
+        store
+            .insert_files(&hash, &[("[SubsPlease] Show.mkv".into(), 1_000_000)])
+            .unwrap();
+
+        let results = store.search_torrents("[SubsPlease]", 10, "rank").unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name.as_deref(), Some("[SubsPlease] Show"));
+    }
+
+    #[test]
+    fn test_fts_search_punctuation_slash() {
+        let store = test_db();
+        let hash = [0x55u8; 20];
+        store
+            .upsert_torrent(hash, Some("Movie".into()), 1_000_000, 1, "dht")
+            .unwrap();
+        store
+            .mark_metadata_complete(&hash, "Movie", 262144, 1_000_000, 1)
+            .unwrap();
+        store
+            .insert_files(&hash, &[("dir/file.mkv".into(), 1_000_000)])
+            .unwrap();
+
+        let results = store.search_torrents("dir/file.mkv", 10, "rank").unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name.as_deref(), Some("Movie"));
+    }
+
+    #[test]
+    fn test_fts_freshness_immediate_file_path_search() {
+        let store = test_db();
+        let hash = [0xABu8; 20];
+        store
+            .upsert_torrent(hash, Some("Fresh Test".into()), 1_000, 1, "dht")
+            .unwrap();
+        store
+            .mark_metadata_complete(&hash, "Fresh Test", 262144, 1_000, 1)
+            .unwrap();
+        store
+            .insert_files(&hash, &[("video/unique-file-token-xyz.mkv".into(), 1_000)])
+            .unwrap();
+
+        let results = store
+            .search_torrents("unique-file-token-xyz", 10, "rank")
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name.as_deref(), Some("Fresh Test"));
+    }
+
+    #[test]
+    fn test_fts_freshness_file_path_replacement() {
+        let store = test_db();
+        let hash = [0xACu8; 20];
+        store
+            .upsert_torrent(hash, Some("Replace Test".into()), 1_000, 1, "dht")
+            .unwrap();
+        store
+            .mark_metadata_complete(&hash, "Replace Test", 262144, 1_000, 1)
+            .unwrap();
+        store
+            .insert_files(&hash, &[("old-token-abc.txt".into(), 500)])
+            .unwrap();
+
+        let results = store.search_torrents("old-token-abc", 10, "rank").unwrap();
+        assert_eq!(results.len(), 1);
+
+        store
+            .insert_files(&hash, &[("new-token-xyz.txt".into(), 500)])
+            .unwrap();
+
+        let results = store.search_torrents("new-token-xyz", 10, "rank").unwrap();
+        assert_eq!(results.len(), 1);
+
+        let results = store.search_torrents("old-token-abc", 10, "rank").unwrap();
+        assert_eq!(results.len(), 0);
+    }
+
+    #[test]
+    fn test_fts_prune_removes_stale_entries() {
+        let store = test_db();
+        let hash = [0xADu8; 20];
+        let hash_hex = hex::encode(hash);
+
+        store
+            .upsert_torrent(hash, Some("PruneFts".into()), 1_000, 1, "dht")
+            .unwrap();
+        store
+            .mark_metadata_complete(&hash, "PruneFts", 262144, 1_000, 1)
+            .unwrap();
+        store
+            .insert_files(&hash, &[("unique-stale-token-qwe.mkv".into(), 1_000)])
+            .unwrap();
+
+        let results = store
+            .search_torrents("unique-stale-token-qwe", 10, "rank")
+            .unwrap();
+        assert_eq!(results.len(), 1);
+
+        store
+            .conn
+            .lock()
+            .expect("store connection mutex poisoned")
+            .execute(
+                "UPDATE torrents SET last_seen = unixepoch() - 86400 * 100 WHERE info_hash = ?1",
+                rusqlite::params![hash_hex],
+            )
+            .unwrap();
+
+        store.prune_old_torrents(90).unwrap();
+
+        let results = store
+            .search_torrents("unique-stale-token-qwe", 10, "rank")
+            .unwrap();
+        assert_eq!(results.len(), 0);
+    }
+
+    #[test]
+    fn test_fts_rank_weights_name_higher_than_paths() {
+        let store = test_db();
+        let h1 = [0xAEu8; 20];
+        let h2 = [0xAFu8; 20];
+
+        store
+            .upsert_torrent(h1, Some("ubuntu release".into()), 1_000_000, 1, "dht")
+            .unwrap();
+        store
+            .mark_metadata_complete(&h1, "ubuntu release", 262144, 1_000_000, 1)
+            .unwrap();
+        store
+            .insert_files(&h1, &[("release.iso".into(), 1_000_000)])
+            .unwrap();
+
+        store
+            .upsert_torrent(h2, Some("random release".into()), 1_000_000, 1, "dht")
+            .unwrap();
+        store
+            .mark_metadata_complete(&h2, "random release", 262144, 1_000_000, 1)
+            .unwrap();
+        store
+            .insert_files(&h2, &[("ubuntu.iso".into(), 1_000_000)])
+            .unwrap();
+
+        let results = store.search_torrents("ubuntu", 10, "rank").unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(
+            results[0].name.as_deref(),
+            Some("ubuntu release"),
+            "name match should rank higher than path match"
+        );
+    }
+
+    #[test]
+    fn test_search_short_query_like_name() {
+        let store = test_db();
+        let hash = [0xB0u8; 20];
+        store
+            .upsert_torrent(hash, Some("aBc".into()), 1_000, 1, "dht")
+            .unwrap();
+        store
+            .mark_metadata_complete(&hash, "aBc", 262144, 1_000, 1)
+            .unwrap();
+        store
+            .insert_files(&hash, &[("file.dat".into(), 1_000)])
+            .unwrap();
+
+        let results = store.search_torrents("a", 10, "last_seen").unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn test_search_short_query_like_path() {
+        let store = test_db();
+        let hash = [0x5Cu8; 20];
+        store
+            .upsert_torrent(hash, Some("Some Movie".into()), 1_000, 1, "dht")
+            .unwrap();
+        store
+            .mark_metadata_complete(&hash, "Some Movie", 262144, 1_000, 1)
+            .unwrap();
+        store
+            .insert_files(&hash, &[("xy/video.mkv".into(), 1_000)])
+            .unwrap();
+
+        let results = store.search_torrents("xy", 10, "last_seen").unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name.as_deref(), Some("Some Movie"));
+    }
+
+    #[test]
+    fn test_search_literal_wildcard_percent() {
+        let store = test_db();
+        let hash_pct = [0x5Du8; 20];
+        let hash_reg = [0x5Eu8; 20];
+
+        store
+            .upsert_torrent(hash_pct, Some("100% done".into()), 1_000, 1, "dht")
+            .unwrap();
+        store
+            .mark_metadata_complete(&hash_pct, "100% done", 262144, 1_000, 1)
+            .unwrap();
+        store
+            .insert_files(&hash_pct, &[("file.dat".into(), 1_000)])
+            .unwrap();
+
+        store
+            .upsert_torrent(hash_reg, Some("other thing".into()), 1_000, 1, "dht")
+            .unwrap();
+        store
+            .mark_metadata_complete(&hash_reg, "other thing", 262144, 1_000, 1)
+            .unwrap();
+        store
+            .insert_files(&hash_reg, &[("data.bin".into(), 1_000)])
+            .unwrap();
+
+        let results = store.search_torrents("%", 10, "last_seen").unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "should match only the torrent with literal %"
+        );
+        assert_eq!(results[0].name.as_deref(), Some("100% done"));
+    }
+
+    #[test]
+    fn test_search_literal_wildcard_underscore() {
+        let store = test_db();
+        let hash_us = [0xB4u8; 20];
+        let hash_reg = [0xB5u8; 20];
+
+        store
+            .upsert_torrent(hash_us, Some("my_file".into()), 1_000, 1, "dht")
+            .unwrap();
+        store
+            .mark_metadata_complete(&hash_us, "my_file", 262144, 1_000, 1)
+            .unwrap();
+        store
+            .insert_files(&hash_us, &[("data.bin".into(), 1_000)])
+            .unwrap();
+
+        store
+            .upsert_torrent(hash_reg, Some("another".into()), 1_000, 1, "dht")
+            .unwrap();
+        store
+            .mark_metadata_complete(&hash_reg, "another", 262144, 1_000, 1)
+            .unwrap();
+        store
+            .insert_files(&hash_reg, &[("file.bin".into(), 1_000)])
+            .unwrap();
+
+        let results = store.search_torrents("_", 10, "last_seen").unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "should match only the torrent with literal _"
+        );
+        assert_eq!(results[0].name.as_deref(), Some("my_file"));
     }
 }

@@ -1,10 +1,12 @@
 mod bencode;
 mod config;
 mod dht;
+mod magnet;
 mod metadata;
 mod routing;
 mod store;
 mod types;
+mod web;
 mod wire;
 
 use clap::{Parser, Subcommand};
@@ -41,7 +43,7 @@ enum Commands {
 
     /// Search collected torrents
     Search {
-        /// Text query to search torrent names
+        /// Text query to search torrent names and file paths
         #[arg(long)]
         query: Option<String>,
 
@@ -49,13 +51,27 @@ enum Commands {
         #[arg(long, default_value = "50")]
         limit: usize,
 
-        /// Sort by: first_seen, last_seen, total_size, name
+        /// Sort by: first_seen, last_seen, total_size, name, rank
         #[arg(long, default_value = "last_seen")]
         sort: String,
 
         /// Output as JSON
         #[arg(long)]
         json: bool,
+
+        /// Include magnet URI in output
+        #[arg(long)]
+        magnet: bool,
+    },
+
+    /// Print a magnet URI for an info hash
+    Magnet {
+        /// 40-character hex info hash
+        info_hash: String,
+
+        /// Optional display name
+        #[arg(long)]
+        name: Option<String>,
     },
 
     /// Show crawler statistics
@@ -66,6 +82,17 @@ enum Commands {
         /// Remove torrents older than this many days
         #[arg(long, default_value = "90")]
         older_than: u32,
+    },
+
+    /// Start local HTTP API and dashboard
+    Serve {
+        /// Bind host
+        #[arg(long)]
+        host: Option<String>,
+
+        /// Bind port
+        #[arg(long)]
+        port: Option<u16>,
     },
 }
 
@@ -93,9 +120,16 @@ fn main() {
                 limit,
                 sort,
                 json,
-            } => cmd_search(&config, query, limit, &sort, json),
+                magnet,
+            } => cmd_search(&config, query, limit, &sort, json, magnet),
             Commands::Stats => cmd_stats(&config),
             Commands::Prune { older_than } => cmd_prune(&config, older_than),
+            Commands::Magnet { info_hash, name } => cmd_magnet(&info_hash, name.as_deref()),
+            Commands::Serve { host, port } => {
+                let host = host.unwrap_or_else(|| config.web.host.clone());
+                let port = port.unwrap_or(config.web.port);
+                cmd_serve(&config, &host, port).await
+            }
         }
     });
 }
@@ -380,6 +414,7 @@ fn cmd_search(
     limit: usize,
     sort: &str,
     json: bool,
+    show_magnet: bool,
 ) {
     let db_path = config.database_path();
     let store = open_store(&db_path);
@@ -397,14 +432,21 @@ fn cmd_search(
         let output: Vec<serde_json::Value> = results
             .iter()
             .map(|t| {
-                serde_json::json!({
-                    "info_hash": hex::encode(t.info_hash),
+                let hash_hex = hex::encode(t.info_hash);
+                let mut obj = serde_json::json!({
+                    "info_hash": hash_hex,
                     "name": t.name,
                     "total_size": t.total_size,
                     "file_count": t.file_count,
                     "first_seen": t.first_seen,
                     "last_seen": t.last_seen,
-                })
+                });
+                if show_magnet {
+                    let dn = t.name.as_deref();
+                    obj["magnet"] =
+                        serde_json::Value::String(magnet::magnet_uri_from_hash(&t.info_hash, dn));
+                }
+                obj
             })
             .collect();
         println!("{}", serde_json::to_string_pretty(&output).unwrap());
@@ -413,9 +455,25 @@ fn cmd_search(
             let hash_preview = hex::encode(&t.info_hash[..4]);
             let name = t.name.as_deref().unwrap_or("<unknown>");
             let size_str = format_size(t.total_size);
-            println!("{hash_preview}..  {size_str:>10}  {name}");
+            print!("{hash_preview}..  {size_str:>10}  {name}");
+            if show_magnet {
+                let dn = t.name.as_deref();
+                let uri = magnet::magnet_uri_from_hash(&t.info_hash, dn);
+                print!("  {uri}");
+            }
+            println!();
         }
         println!("--- {} results ---", results.len());
+    }
+}
+
+fn cmd_magnet(info_hash: &str, name: Option<&str>) {
+    match magnet::magnet_uri(info_hash, name) {
+        Ok(uri) => println!("{uri}"),
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(2);
+        }
     }
 }
 
@@ -493,6 +551,27 @@ fn metadata_failure_count_lines(counts: &[store::MetadataFailureCount]) -> Vec<S
     lines
 }
 
+async fn cmd_serve(config: &config::Config, host: &str, port: u16) {
+    let db_path = config.database_path();
+    if !db_path.exists() {
+        if let Some(parent) = db_path.parent() {
+            if !parent.exists() {
+                std::fs::create_dir_all(parent).expect("failed to create database directory");
+            }
+        }
+    }
+
+    let addr = format!("{host}:{port}");
+    tracing::info!("serving dashboard on http://{addr}");
+
+    let app = web::router(db_path);
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .expect("failed to bind HTTP server");
+
+    axum::serve(listener, app).await.expect("HTTP server error");
+}
+
 fn cmd_prune(config: &config::Config, older_than: u32) {
     let db_path = config.database_path();
     let store = open_store(&db_path);
@@ -567,6 +646,7 @@ mod integration_tests {
         store
             .insert_files(&[1u8; 20], &[("ubuntu-24.04.iso".into(), 4_000_000_000)])
             .unwrap();
+        store.refresh_torrent_fts(&[1u8; 20]).unwrap();
 
         // Search by name
         let results = store.search_torrents("Ubuntu", 10, "last_seen").unwrap();
