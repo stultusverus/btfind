@@ -1,5 +1,5 @@
 use crate::magnet;
-use crate::store::{CrawlStats, Store, TorrentRecord};
+use crate::store::{CrawlStats, Store, TorrentRecord, TorrentSearchFilters};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -68,13 +68,16 @@ struct SearchQuery {
     #[serde(default = "default_limit")]
     limit: usize,
     sort: Option<String>,
+    complete_only: Option<bool>,
+    min_size: Option<i64>,
+    max_size: Option<i64>,
 }
 
 fn default_limit() -> usize {
     50
 }
 
-#[derive(serde::Serialize)]
+#[derive(Debug, serde::Serialize)]
 struct SearchResult {
     info_hash: String,
     name: Option<String>,
@@ -110,6 +113,27 @@ fn clamp_limit(limit: usize) -> usize {
     limit.clamp(1, 500)
 }
 
+fn validate_search_filters(params: &SearchQuery) -> Result<TorrentSearchFilters, ApiError> {
+    if matches!(params.min_size, Some(size) if size < 0) {
+        return Err(ApiError::BadRequest("min_size must be non-negative".into()));
+    }
+    if matches!(params.max_size, Some(size) if size < 0) {
+        return Err(ApiError::BadRequest("max_size must be non-negative".into()));
+    }
+    if let (Some(min_size), Some(max_size)) = (params.min_size, params.max_size) {
+        if max_size < min_size {
+            return Err(ApiError::BadRequest(
+                "max_size must be greater than or equal to min_size".into(),
+            ));
+        }
+    }
+    Ok(TorrentSearchFilters {
+        complete_only: params.complete_only.unwrap_or(false),
+        min_size: params.min_size,
+        max_size: params.max_size,
+    })
+}
+
 fn validate_info_hash_hex(hex_str: &str) -> Result<(), ApiError> {
     if hex_str.len() != 40 || !hex_str.chars().all(|c| c.is_ascii_hexdigit()) {
         Err(ApiError::BadRequest(
@@ -137,6 +161,7 @@ async fn api_search(
     Query(params): Query<SearchQuery>,
 ) -> Result<Json<Vec<SearchResult>>, ApiError> {
     let limit = clamp_limit(params.limit);
+    let filters = validate_search_filters(&params)?;
 
     if let Some(ref sort) = params.sort {
         validate_sort(sort)?;
@@ -151,7 +176,7 @@ async fn api_search(
         } else {
             "rank"
         });
-        Ok(store.search_torrents(query, limit, sort)?)
+        Ok(store.search_torrents_filtered(query, limit, sort, filters)?)
     })
     .await
     .map_err(|e| ApiError::Join(e.to_string()))??;
@@ -254,4 +279,95 @@ async fn api_magnet(
         .header("Content-Type", "text/plain; charset=utf-8")
         .body(axum::body::Body::from(uri))
         .unwrap())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::extract::{Query, State};
+    use std::fs;
+
+    fn temp_db_path(name: &str) -> PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("btfind-web-test-{name}-{}.db", std::process::id()));
+        let _ = fs::remove_file(&path);
+        path
+    }
+
+    fn seed_web_search_db(path: &PathBuf) {
+        let store = Store::open(path).unwrap();
+        let incomplete = [0xD0u8; 20];
+        let complete = [0xD1u8; 20];
+
+        store
+            .upsert_torrent(incomplete, Some("ubuntu unknown".into()), 999, 0, "dht")
+            .unwrap();
+        store
+            .upsert_torrent(complete, Some("ubuntu complete".into()), 2_000, 1, "dht")
+            .unwrap();
+        store
+            .mark_metadata_complete(&complete, "ubuntu complete", 262144, 2_000, 1)
+            .unwrap();
+        store
+            .insert_files(&complete, &[("ubuntu.iso".into(), 2_000)])
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_api_search_complete_only_excludes_incomplete_torrents() {
+        let db_path = temp_db_path("complete-only");
+        seed_web_search_db(&db_path);
+
+        let Json(results) = api_search(
+            State(AppState {
+                db_path: db_path.clone(),
+            }),
+            Query(SearchQuery {
+                q: Some("ubuntu".into()),
+                limit: 10,
+                sort: Some("last_seen".into()),
+                complete_only: Some(true),
+                min_size: None,
+                max_size: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name.as_deref(), Some("ubuntu complete"));
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn test_api_search_rejects_invalid_size_range() {
+        let db_path = temp_db_path("invalid-size-range");
+        seed_web_search_db(&db_path);
+
+        let result = api_search(
+            State(AppState {
+                db_path: db_path.clone(),
+            }),
+            Query(SearchQuery {
+                q: Some("ubuntu".into()),
+                limit: 10,
+                sort: Some("last_seen".into()),
+                complete_only: Some(true),
+                min_size: Some(5_000),
+                max_size: Some(1_000),
+            }),
+        )
+        .await;
+
+        match result {
+            Err(ApiError::BadRequest(message)) => {
+                assert_eq!(
+                    message,
+                    "max_size must be greater than or equal to min_size"
+                );
+            }
+            other => panic!("expected bad request, got {other:?}"),
+        }
+        let _ = fs::remove_file(db_path);
+    }
 }

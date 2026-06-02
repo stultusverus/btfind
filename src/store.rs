@@ -1,5 +1,6 @@
 use crate::types::{InfoHash, NodeContact, NodeId};
-use rusqlite::{params, Connection};
+use rusqlite::types::Value;
+use rusqlite::{params, params_from_iter, Connection};
 use std::net::SocketAddrV4;
 use std::path::Path;
 use std::sync::Mutex;
@@ -53,6 +54,13 @@ pub struct MetadataFailureCount {
 
 pub struct Store {
     conn: Mutex<Connection>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TorrentSearchFilters {
+    pub complete_only: bool,
+    pub min_size: Option<i64>,
+    pub max_size: Option<i64>,
 }
 
 impl Store {
@@ -306,20 +314,35 @@ impl Store {
         limit: usize,
         sort_by: &str,
     ) -> Result<Vec<TorrentRecord>, rusqlite::Error> {
+        self.search_torrents_filtered(query, limit, sort_by, TorrentSearchFilters::default())
+    }
+
+    pub fn search_torrents_filtered(
+        &self,
+        query: &str,
+        limit: usize,
+        sort_by: &str,
+        filters: TorrentSearchFilters,
+    ) -> Result<Vec<TorrentRecord>, rusqlite::Error> {
         let conn = self.conn.lock().expect("store connection mutex poisoned");
         let query_trimmed = query.trim();
 
         if query_trimmed.is_empty() {
             let order = sort_order_sql(sort_by);
-            let sql = format!(
+            let mut sql =
                 "SELECT info_hash, name, piece_length, total_size, file_count, source, first_seen, last_seen, last_attempt, metadata_complete
-                 FROM torrents
-                 ORDER BY {}
-                 LIMIT ?1",
+                 FROM torrents t"
+                    .to_string();
+            let mut params = Vec::new();
+            append_filter_clauses(&mut sql, &mut params, false, "t", filters);
+            sql.push_str(&format!(
+                " ORDER BY {}
+                 LIMIT ?",
                 order
-            );
+            ));
+            params.push(Value::from(limit as i64));
             let mut stmt = conn.prepare(&sql)?;
-            let rows = stmt.query_map(params![limit as i64], row_to_torrent)?;
+            let rows = stmt.query_map(params_from_iter(params), row_to_torrent)?;
             let mut results = Vec::new();
             for row in rows {
                 results.push(row?);
@@ -335,21 +358,26 @@ impl Store {
                 sort_by
             };
             let order = sort_order_sql(effective_sort);
-            let sql = format!(
+            let mut sql =
                 "SELECT info_hash, name, piece_length, total_size, file_count, source, first_seen, last_seen, last_attempt, metadata_complete
                  FROM torrents t
-                 WHERE COALESCE(t.name, '') LIKE ?1 ESCAPE '\\'
+                 WHERE (COALESCE(t.name, '') LIKE ?1 ESCAPE '\\'
                     OR EXISTS (
                         SELECT 1 FROM files f
                         WHERE f.torrent_id = t.info_hash
                           AND f.path LIKE ?1 ESCAPE '\\'
-                    )
-                 ORDER BY {}
-                 LIMIT ?2",
+                    ))"
+                    .to_string();
+            let mut params = vec![Value::from(pattern)];
+            append_filter_clauses(&mut sql, &mut params, true, "t", filters);
+            sql.push_str(&format!(
+                " ORDER BY {}
+                 LIMIT ?",
                 order
-            );
+            ));
+            params.push(Value::from(limit as i64));
             let mut stmt = conn.prepare(&sql)?;
-            let rows = stmt.query_map(params![pattern, limit as i64], row_to_torrent)?;
+            let rows = stmt.query_map(params_from_iter(params), row_to_torrent)?;
             let mut results = Vec::new();
             for row in rows {
                 results.push(row?);
@@ -360,14 +388,20 @@ impl Store {
         let fts_query = fts_literal_query(query_trimmed);
 
         if sort_by == "rank" {
-            let sql = "SELECT t.info_hash, t.name, t.piece_length, t.total_size, t.file_count, t.source, t.first_seen, t.last_seen, t.last_attempt, t.metadata_complete
+            let mut sql = "SELECT t.info_hash, t.name, t.piece_length, t.total_size, t.file_count, t.source, t.first_seen, t.last_seen, t.last_attempt, t.metadata_complete
                        FROM torrent_fts f
                        JOIN torrents t ON t.info_hash = f.info_hash
-                       WHERE torrent_fts MATCH ?1
-                       ORDER BY bm25(torrent_fts, 1.0, 5.0, 1.0), t.last_seen DESC
-                       LIMIT ?2";
-            let mut stmt = conn.prepare(sql)?;
-            let rows = stmt.query_map(params![fts_query, limit as i64], row_to_torrent)?;
+                       WHERE torrent_fts MATCH ?"
+                .to_string();
+            let mut params = vec![Value::from(fts_query)];
+            append_filter_clauses(&mut sql, &mut params, true, "t", filters);
+            sql.push_str(
+                " ORDER BY bm25(torrent_fts, 1.0, 5.0, 1.0), t.last_seen DESC
+                       LIMIT ?",
+            );
+            params.push(Value::from(limit as i64));
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(params_from_iter(params), row_to_torrent)?;
             let mut results = Vec::new();
             for row in rows {
                 results.push(row?);
@@ -376,18 +410,23 @@ impl Store {
         }
 
         let order = sort_order_sql(sort_by);
-        let sql = format!(
+        let mut sql =
             "SELECT t.info_hash, t.name, t.piece_length, t.total_size, t.file_count, t.source, t.first_seen, t.last_seen, t.last_attempt, t.metadata_complete
              FROM torrent_fts f
              JOIN torrents t ON t.info_hash = f.info_hash
-             WHERE torrent_fts MATCH ?1
-             ORDER BY {}
-             LIMIT ?2",
+             WHERE torrent_fts MATCH ?"
+                .to_string();
+        let mut params = vec![Value::from(fts_query)];
+        append_filter_clauses(&mut sql, &mut params, true, "t", filters);
+        sql.push_str(&format!(
+            " ORDER BY {}
+             LIMIT ?",
             order
-        );
+        ));
+        params.push(Value::from(limit as i64));
 
         let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(params![fts_query, limit as i64], row_to_torrent)?;
+        let rows = stmt.query_map(params_from_iter(params), row_to_torrent)?;
         let mut results = Vec::new();
         for row in rows {
             results.push(row?);
@@ -790,6 +829,42 @@ fn sort_order_sql(sort_by: &str) -> &'static str {
         "total_size" => "total_size DESC",
         "name" => "name ASC",
         _ => "last_seen DESC",
+    }
+}
+
+fn append_filter_clauses(
+    sql: &mut String,
+    params: &mut Vec<Value>,
+    has_where: bool,
+    alias: &str,
+    filters: TorrentSearchFilters,
+) {
+    let mut needs_and = has_where;
+    if filters.complete_only {
+        append_filter_prefix(sql, &mut needs_and);
+        sql.push_str(alias);
+        sql.push_str(".metadata_complete = 1");
+    }
+    if let Some(min_size) = filters.min_size {
+        append_filter_prefix(sql, &mut needs_and);
+        sql.push_str(alias);
+        sql.push_str(".total_size >= ?");
+        params.push(Value::from(min_size));
+    }
+    if let Some(max_size) = filters.max_size {
+        append_filter_prefix(sql, &mut needs_and);
+        sql.push_str(alias);
+        sql.push_str(".total_size <= ?");
+        params.push(Value::from(max_size));
+    }
+}
+
+fn append_filter_prefix(sql: &mut String, needs_and: &mut bool) {
+    if *needs_and {
+        sql.push_str(" AND ");
+    } else {
+        sql.push_str(" WHERE ");
+        *needs_and = true;
     }
 }
 
@@ -1796,6 +1871,120 @@ mod tests {
             Some("ubuntu release"),
             "name match should rank higher than path match"
         );
+    }
+
+    #[test]
+    fn test_filtered_search_complete_only_applies_before_limit() {
+        let store = test_db();
+        let incomplete = [0xC0u8; 20];
+        let complete = [0xC1u8; 20];
+
+        store
+            .upsert_torrent(incomplete, Some("alpha unknown".into()), 999, 0, "dht")
+            .unwrap();
+        store
+            .upsert_torrent(complete, Some("alpha complete".into()), 1_000, 1, "dht")
+            .unwrap();
+        store
+            .mark_metadata_complete(&complete, "alpha complete", 262144, 1_000, 1)
+            .unwrap();
+        store
+            .insert_files(&complete, &[("alpha/file.dat".into(), 1_000)])
+            .unwrap();
+
+        let results = store
+            .search_torrents_filtered(
+                "alpha",
+                1,
+                "last_seen",
+                TorrentSearchFilters {
+                    complete_only: true,
+                    min_size: None,
+                    max_size: None,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name.as_deref(), Some("alpha complete"));
+        assert!(results[0].metadata_complete);
+    }
+
+    #[test]
+    fn test_filtered_empty_search_complete_only_applies_before_limit() {
+        let store = test_db();
+        let incomplete = [0xC5u8; 20];
+        let complete = [0xC6u8; 20];
+
+        store
+            .upsert_torrent(incomplete, Some("unknown".into()), 999, 0, "dht")
+            .unwrap();
+        store
+            .upsert_torrent(complete, Some("complete".into()), 1_000, 1, "dht")
+            .unwrap();
+        store
+            .mark_metadata_complete(&complete, "complete", 262144, 1_000, 1)
+            .unwrap();
+        store
+            .insert_files(&complete, &[("file.dat".into(), 1_000)])
+            .unwrap();
+
+        let results = store
+            .search_torrents_filtered(
+                "",
+                1,
+                "last_seen",
+                TorrentSearchFilters {
+                    complete_only: true,
+                    min_size: None,
+                    max_size: None,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name.as_deref(), Some("complete"));
+        assert!(results[0].metadata_complete);
+    }
+
+    #[test]
+    fn test_filtered_search_size_range() {
+        let store = test_db();
+        let small = [0xC2u8; 20];
+        let medium = [0xC3u8; 20];
+        let large = [0xC4u8; 20];
+
+        for (hash, name, size) in [
+            (small, "linux small", 500),
+            (medium, "linux medium", 2_000),
+            (large, "linux large", 5_000),
+        ] {
+            store
+                .upsert_torrent(hash, Some(name.into()), size, 1, "dht")
+                .unwrap();
+            store
+                .mark_metadata_complete(&hash, name, 262144, size, 1)
+                .unwrap();
+            store
+                .insert_files(&hash, &[("linux/file.bin".into(), size)])
+                .unwrap();
+        }
+
+        let results = store
+            .search_torrents_filtered(
+                "linux",
+                10,
+                "total_size",
+                TorrentSearchFilters {
+                    complete_only: true,
+                    min_size: Some(1_000),
+                    max_size: Some(3_000),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name.as_deref(), Some("linux medium"));
     }
 
     #[test]

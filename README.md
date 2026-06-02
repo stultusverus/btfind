@@ -92,6 +92,7 @@ When `btfind serve` is running:
 ```
 GET /                         Dashboard HTML page
 GET /api/search?q=ubuntu      Search torrents (literal, FTS5/ranked for 3+ char queries)
+                            Optional: sort, limit, complete_only, min_size, max_size
 GET /api/stats                Crawler statistics
 GET /api/torrents/<info_hash>  Torrent detail with file list
 GET /api/torrents/<info_hash>/magnet  Magnet URI (text/plain)
