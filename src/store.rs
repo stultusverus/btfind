@@ -56,6 +56,12 @@ pub struct Store {
     conn: Mutex<Connection>,
 }
 
+#[derive(Debug)]
+pub struct TorrentSearchPage {
+    pub results: Vec<TorrentRecord>,
+    pub total: i64,
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TorrentSearchFilters {
     pub complete_only: bool,
@@ -324,30 +330,49 @@ impl Store {
         sort_by: &str,
         filters: TorrentSearchFilters,
     ) -> Result<Vec<TorrentRecord>, rusqlite::Error> {
+        Ok(self
+            .search_torrents_filtered_page(query, limit, 0, sort_by, filters)?
+            .results)
+    }
+
+    pub fn search_torrents_filtered_page(
+        &self,
+        query: &str,
+        limit: usize,
+        offset: usize,
+        sort_by: &str,
+        filters: TorrentSearchFilters,
+    ) -> Result<TorrentSearchPage, rusqlite::Error> {
         let conn = self.conn.lock().expect("store connection mutex poisoned");
         let query_trimmed = query.trim();
 
         if query_trimmed.is_empty() {
             let order = sort_order_sql(sort_by);
-            let mut sql =
+            let mut base_sql =
                 "SELECT info_hash, name, piece_length, total_size, file_count, source, first_seen, last_seen, last_attempt, metadata_complete
                  FROM torrents t"
                     .to_string();
             let mut params = Vec::new();
-            append_filter_clauses(&mut sql, &mut params, false, "t", filters);
+            append_filter_clauses(&mut base_sql, &mut params, false, "t", filters);
+            let mut count_sql = "SELECT COUNT(*) FROM torrents t".to_string();
+            let mut count_params = Vec::new();
+            append_filter_clauses(&mut count_sql, &mut count_params, false, "t", filters);
+            let total = count_search_results(&conn, &count_sql, count_params)?;
+            let mut sql = base_sql;
             sql.push_str(&format!(
                 " ORDER BY {}
-                 LIMIT ?",
+                 LIMIT ? OFFSET ?",
                 order
             ));
             params.push(Value::from(limit as i64));
+            params.push(Value::from(offset as i64));
             let mut stmt = conn.prepare(&sql)?;
             let rows = stmt.query_map(params_from_iter(params), row_to_torrent)?;
             let mut results = Vec::new();
             for row in rows {
                 results.push(row?);
             }
-            return Ok(results);
+            return Ok(TorrentSearchPage { results, total });
         }
 
         if query_trimmed.chars().count() < 3 {
@@ -358,7 +383,7 @@ impl Store {
                 sort_by
             };
             let order = sort_order_sql(effective_sort);
-            let mut sql =
+            let mut base_sql =
                 "SELECT info_hash, name, piece_length, total_size, file_count, source, first_seen, last_seen, last_attempt, metadata_complete
                  FROM torrents t
                  WHERE (COALESCE(t.name, '') LIKE ?1 ESCAPE '\\'
@@ -368,62 +393,95 @@ impl Store {
                           AND f.path LIKE ?1 ESCAPE '\\'
                     ))"
                     .to_string();
-            let mut params = vec![Value::from(pattern)];
-            append_filter_clauses(&mut sql, &mut params, true, "t", filters);
+            let mut params = vec![Value::from(pattern.clone())];
+            append_filter_clauses(&mut base_sql, &mut params, true, "t", filters);
+            let mut count_sql = "SELECT COUNT(*) FROM torrents t
+                 WHERE (COALESCE(t.name, '') LIKE ?1 ESCAPE '\\'
+                    OR EXISTS (
+                        SELECT 1 FROM files f
+                        WHERE f.torrent_id = t.info_hash
+                          AND f.path LIKE ?1 ESCAPE '\\'
+                    ))"
+            .to_string();
+            let mut count_params = vec![Value::from(pattern)];
+            append_filter_clauses(&mut count_sql, &mut count_params, true, "t", filters);
+            let total = count_search_results(&conn, &count_sql, count_params)?;
+            let mut sql = base_sql;
             sql.push_str(&format!(
                 " ORDER BY {}
-                 LIMIT ?",
+                 LIMIT ? OFFSET ?",
                 order
             ));
             params.push(Value::from(limit as i64));
+            params.push(Value::from(offset as i64));
             let mut stmt = conn.prepare(&sql)?;
             let rows = stmt.query_map(params_from_iter(params), row_to_torrent)?;
             let mut results = Vec::new();
             for row in rows {
                 results.push(row?);
             }
-            return Ok(results);
+            return Ok(TorrentSearchPage { results, total });
         }
 
         let fts_query = fts_literal_query(query_trimmed);
 
         if sort_by == "rank" {
-            let mut sql = "SELECT t.info_hash, t.name, t.piece_length, t.total_size, t.file_count, t.source, t.first_seen, t.last_seen, t.last_attempt, t.metadata_complete
+            let mut base_sql = "SELECT t.info_hash, t.name, t.piece_length, t.total_size, t.file_count, t.source, t.first_seen, t.last_seen, t.last_attempt, t.metadata_complete
                        FROM torrent_fts f
                        JOIN torrents t ON t.info_hash = f.info_hash
                        WHERE torrent_fts MATCH ?"
                 .to_string();
-            let mut params = vec![Value::from(fts_query)];
-            append_filter_clauses(&mut sql, &mut params, true, "t", filters);
+            let mut params = vec![Value::from(fts_query.clone())];
+            append_filter_clauses(&mut base_sql, &mut params, true, "t", filters);
+            let mut count_sql = "SELECT COUNT(*)
+                       FROM torrent_fts f
+                       JOIN torrents t ON t.info_hash = f.info_hash
+                       WHERE torrent_fts MATCH ?"
+                .to_string();
+            let mut count_params = vec![Value::from(fts_query)];
+            append_filter_clauses(&mut count_sql, &mut count_params, true, "t", filters);
+            let total = count_search_results(&conn, &count_sql, count_params)?;
+            let mut sql = base_sql;
             sql.push_str(
                 " ORDER BY bm25(torrent_fts, 1.0, 5.0, 1.0), t.last_seen DESC
-                       LIMIT ?",
+                       LIMIT ? OFFSET ?",
             );
             params.push(Value::from(limit as i64));
+            params.push(Value::from(offset as i64));
             let mut stmt = conn.prepare(&sql)?;
             let rows = stmt.query_map(params_from_iter(params), row_to_torrent)?;
             let mut results = Vec::new();
             for row in rows {
                 results.push(row?);
             }
-            return Ok(results);
+            return Ok(TorrentSearchPage { results, total });
         }
 
         let order = sort_order_sql(sort_by);
-        let mut sql =
+        let mut base_sql =
             "SELECT t.info_hash, t.name, t.piece_length, t.total_size, t.file_count, t.source, t.first_seen, t.last_seen, t.last_attempt, t.metadata_complete
              FROM torrent_fts f
              JOIN torrents t ON t.info_hash = f.info_hash
              WHERE torrent_fts MATCH ?"
                 .to_string();
-        let mut params = vec![Value::from(fts_query)];
-        append_filter_clauses(&mut sql, &mut params, true, "t", filters);
+        let mut params = vec![Value::from(fts_query.clone())];
+        append_filter_clauses(&mut base_sql, &mut params, true, "t", filters);
+        let mut count_sql = "SELECT COUNT(*)
+             FROM torrent_fts f
+             JOIN torrents t ON t.info_hash = f.info_hash
+             WHERE torrent_fts MATCH ?"
+            .to_string();
+        let mut count_params = vec![Value::from(fts_query)];
+        append_filter_clauses(&mut count_sql, &mut count_params, true, "t", filters);
+        let total = count_search_results(&conn, &count_sql, count_params)?;
+        let mut sql = base_sql;
         sql.push_str(&format!(
             " ORDER BY {}
-             LIMIT ?",
+             LIMIT ? OFFSET ?",
             order
         ));
         params.push(Value::from(limit as i64));
+        params.push(Value::from(offset as i64));
 
         let mut stmt = conn.prepare(&sql)?;
         let rows = stmt.query_map(params_from_iter(params), row_to_torrent)?;
@@ -431,7 +489,7 @@ impl Store {
         for row in rows {
             results.push(row?);
         }
-        Ok(results)
+        Ok(TorrentSearchPage { results, total })
     }
 
     pub fn get_stats(&self) -> Result<CrawlStats, rusqlite::Error> {
@@ -866,6 +924,14 @@ fn append_filter_prefix(sql: &mut String, needs_and: &mut bool) {
         sql.push_str(" WHERE ");
         *needs_and = true;
     }
+}
+
+fn count_search_results(
+    conn: &Connection,
+    sql: &str,
+    params: Vec<Value>,
+) -> Result<i64, rusqlite::Error> {
+    conn.query_row(sql, params_from_iter(params), |row| row.get(0))
 }
 
 fn fts_literal_query(input: &str) -> String {
@@ -1945,6 +2011,43 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name.as_deref(), Some("complete"));
         assert!(results[0].metadata_complete);
+    }
+
+    #[test]
+    fn test_filtered_search_page_returns_total_and_offset_results() {
+        let store = test_db();
+
+        for (idx, name) in ["alpha", "bravo", "charlie"].into_iter().enumerate() {
+            let hash = [0xD5u8 + idx as u8; 20];
+            store
+                .upsert_torrent(hash, Some(name.into()), 1_000, 1, "dht")
+                .unwrap();
+            store
+                .mark_metadata_complete(&hash, name, 262144, 1_000, 1)
+                .unwrap();
+            store
+                .insert_files(&hash, &[("file.dat".into(), 1_000)])
+                .unwrap();
+        }
+
+        let page = store
+            .search_torrents_filtered_page(
+                "",
+                2,
+                1,
+                "name",
+                TorrentSearchFilters {
+                    complete_only: true,
+                    min_size: None,
+                    max_size: None,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(page.total, 3);
+        assert_eq!(page.results.len(), 2);
+        assert_eq!(page.results[0].name.as_deref(), Some("bravo"));
+        assert_eq!(page.results[1].name.as_deref(), Some("charlie"));
     }
 
     #[test]

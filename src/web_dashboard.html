@@ -57,6 +57,10 @@ button { padding: 0 14px; cursor: pointer; white-space: nowrap; }
 .ghost:hover, .row:hover { background: var(--panel-2); }
 .status { min-height: 22px; margin-bottom: 8px; color: var(--muted); font-size: 13px; }
 .status.error { color: var(--danger); }
+.pager { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 12px; }
+.pager-status { color: var(--muted); font-size: 13px; text-align: center; }
+.pager-actions { display: flex; gap: 8px; }
+button:disabled { cursor: not-allowed; opacity: 0.45; }
 .results { border: 1px solid var(--border); border-radius: 8px; overflow: hidden; background: var(--panel); }
 .row {
     width: 100%;
@@ -106,6 +110,8 @@ button { padding: 0 14px; cursor: pointer; white-space: nowrap; }
     .primary { grid-column: 1 / -1; }
     .row { grid-template-columns: 1fr; gap: 6px; }
     .actions { justify-content: flex-start; }
+    .pager { align-items: stretch; flex-direction: column; }
+    .pager-status { text-align: left; }
     .detail-grid, .file-row { grid-template-columns: 1fr; }
 }
 </style>
@@ -143,6 +149,13 @@ button { padding: 0 14px; cursor: pointer; white-space: nowrap; }
     </form>
 
     <div class="status" id="status"></div>
+    <nav class="pager" id="pager" aria-label="Search results pagination" hidden>
+        <div class="pager-status" id="pager-status"></div>
+        <div class="pager-actions">
+            <button class="ghost" id="prev-page" type="button">Previous</button>
+            <button class="ghost" id="next-page" type="button">Next</button>
+        </div>
+    </nav>
     <section class="results" id="results" aria-live="polite"></section>
 </main>
 
@@ -151,6 +164,10 @@ const state = {
     results: [],
     expandedHash: null,
     details: new Map(),
+    total: 0,
+    limit: 50,
+    offset: 0,
+    hasNext: false,
 };
 
 const els = {
@@ -162,6 +179,10 @@ const els = {
     minSize: document.getElementById('min-size'),
     maxSize: document.getElementById('max-size'),
     status: document.getElementById('status'),
+    pager: document.getElementById('pager'),
+    pagerStatus: document.getElementById('pager-status'),
+    prevPage: document.getElementById('prev-page'),
+    nextPage: document.getElementById('next-page'),
     results: document.getElementById('results'),
     refresh: document.getElementById('refresh'),
 };
@@ -187,8 +208,9 @@ function statCard(label, value) {
     return `<div class="stat-card"><div class="label">${escapeHtml(label)}</div><div class="value">${escapeHtml(value)}</div></div>`;
 }
 
-async function search() {
+async function search(resetPage = false) {
     clearStatus();
+    if (resetPage) state.offset = 0;
     state.expandedHash = null;
     state.results = [];
     renderEmpty('Searching...');
@@ -209,11 +231,19 @@ async function search() {
             throw new Error(message);
         }
         const data = await resp.json();
-        state.results = data.filter(t => t.name);
+        state.results = data.results;
+        state.total = data.total;
+        state.limit = data.limit;
+        state.offset = data.offset;
+        state.hasNext = data.has_next;
         renderResults();
-        setStatus(`${formatNumber(state.results.length)} complete torrents`);
+        renderPager();
+        setStatus(resultStatus());
     } catch (e) {
         showError(`Search failed: ${e.message}`);
+        state.total = 0;
+        state.hasNext = false;
+        renderPager();
         renderEmpty('No results to display.');
     }
 }
@@ -230,6 +260,7 @@ function searchParams() {
     if (query) params.set('q', query);
     params.set('sort', els.sort.value);
     params.set('limit', els.limit.value);
+    params.set('offset', String(state.offset));
     params.set('complete_only', 'true');
     if (minSize !== null) params.set('min_size', String(minSize));
     if (maxSize !== null) params.set('max_size', String(maxSize));
@@ -260,8 +291,9 @@ function renderResults() {
 }
 
 function resultRow(t, expanded) {
+    const name = t.name || '(unknown)';
     return `<div class="row ${expanded ? 'expanded' : ''}" role="button" tabindex="0" data-hash="${escapeAttr(t.info_hash)}">
-        <div class="name">${escapeHtml(t.name)}<span class="hash">${escapeHtml(t.info_hash)}</span></div>
+        <div class="name">${escapeHtml(name)}<span class="hash">${escapeHtml(t.info_hash)}</span></div>
         <div class="cell">${formatSize(t.total_size)}</div>
         <div class="cell">${formatNumber(t.file_count)} files</div>
         <div class="cell">${formatDate(t.last_seen)}</div>
@@ -326,6 +358,27 @@ async function loadDetail(infoHash) {
 
 function renderEmpty(message) {
     els.results.innerHTML = `<div class="empty">${escapeHtml(message)}</div>`;
+}
+
+function renderPager() {
+    if (state.total === 0) {
+        els.pager.hidden = true;
+        return;
+    }
+
+    const start = state.offset + 1;
+    const end = state.offset + state.results.length;
+    els.pager.hidden = false;
+    els.pagerStatus.textContent = `Showing ${formatNumber(start)}-${formatNumber(end)} of ${formatNumber(state.total)}`;
+    els.prevPage.disabled = state.offset === 0;
+    els.nextPage.disabled = !state.hasNext;
+}
+
+function resultStatus() {
+    if (state.total === 0) return 'No complete torrents';
+    const currentPage = Math.floor(state.offset / state.limit) + 1;
+    const pageCount = Math.max(1, Math.ceil(state.total / state.limit));
+    return `Page ${formatNumber(currentPage)} of ${formatNumber(pageCount)}`;
 }
 
 async function errorMessage(resp) {
@@ -399,11 +452,22 @@ function escapeAttr(value) {
 
 els.form.addEventListener('submit', event => {
     event.preventDefault();
-    search();
+    search(true);
 });
 
 els.refresh.addEventListener('click', () => {
     loadStats();
+    search();
+});
+
+els.prevPage.addEventListener('click', () => {
+    state.offset = Math.max(0, state.offset - state.limit);
+    search();
+});
+
+els.nextPage.addEventListener('click', () => {
+    if (!state.hasNext) return;
+    state.offset += state.limit;
     search();
 });
 
@@ -429,7 +493,7 @@ els.results.addEventListener('keydown', event => {
 });
 
 loadStats();
-search();
+search(true);
 </script>
 </body>
 </html>

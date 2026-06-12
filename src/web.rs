@@ -67,6 +67,8 @@ struct SearchQuery {
     q: Option<String>,
     #[serde(default = "default_limit")]
     limit: usize,
+    #[serde(default)]
+    offset: usize,
     sort: Option<String>,
     complete_only: Option<bool>,
     min_size: Option<i64>,
@@ -86,6 +88,15 @@ struct SearchResult {
     first_seen: i64,
     last_seen: i64,
     magnet: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct SearchResponse {
+    results: Vec<SearchResult>,
+    total: i64,
+    limit: usize,
+    offset: usize,
+    has_next: bool,
 }
 
 fn torrent_to_search_result(t: &TorrentRecord) -> SearchResult {
@@ -111,6 +122,10 @@ fn validate_sort(sort: &str) -> Result<(), ApiError> {
 
 fn clamp_limit(limit: usize) -> usize {
     limit.clamp(1, 500)
+}
+
+fn clamp_offset(offset: usize) -> usize {
+    offset.min(i64::MAX as usize)
 }
 
 fn validate_search_filters(params: &SearchQuery) -> Result<TorrentSearchFilters, ApiError> {
@@ -159,8 +174,9 @@ async fn api_stats(State(state): State<AppState>) -> Result<Json<CrawlStats>, Ap
 async fn api_search(
     State(state): State<AppState>,
     Query(params): Query<SearchQuery>,
-) -> Result<Json<Vec<SearchResult>>, ApiError> {
+) -> Result<Json<SearchResponse>, ApiError> {
     let limit = clamp_limit(params.limit);
+    let offset = clamp_offset(params.offset);
     let filters = validate_search_filters(&params)?;
 
     if let Some(ref sort) = params.sort {
@@ -168,7 +184,7 @@ async fn api_search(
     }
 
     let db_path = state.db_path.clone();
-    let results = tokio::task::spawn_blocking(move || -> Result<Vec<TorrentRecord>, ApiError> {
+    let page = tokio::task::spawn_blocking(move || -> Result<_, ApiError> {
         let store = Store::open(&db_path)?;
         let query = params.q.as_deref().unwrap_or("");
         let sort = params.sort.as_deref().unwrap_or(if query.is_empty() {
@@ -176,13 +192,23 @@ async fn api_search(
         } else {
             "rank"
         });
-        Ok(store.search_torrents_filtered(query, limit, sort, filters)?)
+        Ok(store.search_torrents_filtered_page(query, limit, offset, sort, filters)?)
     })
     .await
     .map_err(|e| ApiError::Join(e.to_string()))??;
 
-    let results: Vec<SearchResult> = results.iter().map(torrent_to_search_result).collect();
-    Ok(Json(results))
+    let results: Vec<SearchResult> = page.results.iter().map(torrent_to_search_result).collect();
+    let has_next = match i64::try_from(offset.saturating_add(results.len())) {
+        Ok(next_offset) => next_offset < page.total,
+        Err(_) => false,
+    };
+    Ok(Json(SearchResponse {
+        results,
+        total: page.total,
+        limit,
+        offset,
+        has_next,
+    }))
 }
 
 #[derive(serde::Serialize)]
@@ -318,13 +344,14 @@ mod tests {
         let db_path = temp_db_path("complete-only");
         seed_web_search_db(&db_path);
 
-        let Json(results) = api_search(
+        let Json(response) = api_search(
             State(AppState {
                 db_path: db_path.clone(),
             }),
             Query(SearchQuery {
                 q: Some("ubuntu".into()),
                 limit: 10,
+                offset: 0,
                 sort: Some("last_seen".into()),
                 complete_only: Some(true),
                 min_size: None,
@@ -334,7 +361,10 @@ mod tests {
         .await
         .unwrap();
 
+        let results = response.results;
         assert_eq!(results.len(), 1);
+        assert_eq!(response.total, 1);
+        assert!(!response.has_next);
         assert_eq!(results[0].name.as_deref(), Some("ubuntu complete"));
         let _ = fs::remove_file(db_path);
     }
@@ -351,6 +381,7 @@ mod tests {
             Query(SearchQuery {
                 q: Some("ubuntu".into()),
                 limit: 10,
+                offset: 0,
                 sort: Some("last_seen".into()),
                 complete_only: Some(true),
                 min_size: Some(5_000),
