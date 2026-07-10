@@ -4,151 +4,70 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>btfind dashboard</title>
-<style>
-*, *::before, *::after { box-sizing: border-box; }
-:root {
-    color-scheme: dark;
-    --bg: #0d1117;
-    --panel: #161b22;
-    --panel-2: #1c2128;
-    --border: #30363d;
-    --text: #c9d1d9;
-    --muted: #8b949e;
-    --accent: #58a6ff;
-    --accent-2: #238636;
-    --danger: #f85149;
-}
-body {
-    margin: 0;
-    padding: 24px;
-    background: var(--bg);
-    color: var(--text);
-    font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-}
-.shell { max-width: 1180px; margin: 0 auto; }
-.topbar { display: flex; justify-content: space-between; gap: 16px; align-items: flex-end; margin-bottom: 18px; }
-h1 { margin: 0; color: var(--accent); font-size: 1.6rem; letter-spacing: 0; }
-.subtitle { margin-top: 4px; color: var(--muted); font-size: 13px; }
-.stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin-bottom: 16px; }
-.stat-card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; }
-.stat-card .label { font-size: 12px; color: var(--muted); }
-.stat-card .value { margin-top: 2px; font-size: 20px; font-weight: 700; color: var(--text); }
-.toolbar {
-    display: grid;
-    grid-template-columns: minmax(220px, 1fr) 150px 110px 120px 120px auto;
-    gap: 10px;
-    align-items: center;
-    margin-bottom: 12px;
-}
-input, select, button {
-    height: 38px;
-    border-radius: 6px;
-    border: 1px solid var(--border);
-    background: var(--panel);
-    color: var(--text);
-    font: inherit;
-    font-size: 14px;
-}
-input, select { width: 100%; padding: 0 10px; }
-input:focus, select:focus, button:focus-visible { outline: 2px solid rgba(88, 166, 255, 0.35); outline-offset: 1px; border-color: var(--accent); }
-button { padding: 0 14px; cursor: pointer; white-space: nowrap; }
-.primary { background: var(--accent-2); border-color: var(--accent-2); color: white; font-weight: 600; }
-.primary:hover { background: #2ea043; }
-.ghost:hover, .row:hover { background: var(--panel-2); }
-.status { min-height: 22px; margin-bottom: 8px; color: var(--muted); font-size: 13px; }
-.status.error { color: var(--danger); }
-.pager { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 12px; }
-.pager-status { color: var(--muted); font-size: 13px; text-align: center; }
-.pager-actions { display: flex; gap: 8px; }
-button:disabled { cursor: not-allowed; opacity: 0.45; }
-.results { border: 1px solid var(--border); border-radius: 8px; overflow: hidden; background: var(--panel); }
-.row {
-    width: 100%;
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) 110px 86px 118px 150px;
-    gap: 14px;
-    align-items: center;
-    padding: 12px 14px;
-    border-bottom: 1px solid var(--border);
-    text-align: left;
-    background: var(--panel);
-}
-.row:last-child { border-bottom: none; }
-.row.expanded { background: var(--panel-2); }
-.name { min-width: 0; font-weight: 650; word-break: break-word; }
-.hash { display: block; margin-top: 3px; color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11px; overflow-wrap: anywhere; }
-.cell { color: var(--muted); font-size: 13px; }
-.actions { display: flex; justify-content: flex-end; gap: 8px; }
-.mini {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    height: 30px;
-    padding: 0 10px;
-    font-size: 12px;
-    background: #21262d;
-    color: var(--text);
-    text-decoration: none;
-}
-.detail {
-    border-bottom: 1px solid var(--border);
-    padding: 0 14px 14px;
-    background: var(--panel-2);
-}
-.detail-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 4px 0 12px; color: var(--muted); font-size: 13px; }
-.file-list { border: 1px solid var(--border); border-radius: 6px; overflow: hidden; background: var(--panel); }
-.file-row { display: grid; grid-template-columns: minmax(0, 1fr) 110px; gap: 10px; padding: 8px 10px; border-bottom: 1px solid var(--border); font-size: 13px; }
-.file-row:last-child { border-bottom: none; }
-.file-path { min-width: 0; overflow-wrap: anywhere; }
-.empty { padding: 28px 14px; color: var(--muted); text-align: center; }
-@media (max-width: 860px) {
-    body { padding: 14px; }
-    .topbar { display: block; }
-    .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-    .toolbar { grid-template-columns: 1fr 1fr; }
-    .toolbar input:first-child { grid-column: 1 / -1; }
-    .primary { grid-column: 1 / -1; }
-    .row { grid-template-columns: 1fr; gap: 6px; }
-    .actions { justify-content: flex-start; }
-    .pager { align-items: stretch; flex-direction: column; }
-    .pager-status { text-align: left; }
-    .detail-grid, .file-row { grid-template-columns: 1fr; }
-}
-</style>
+<link rel="stylesheet" href="/dashboard.css">
 </head>
 <body>
 <main class="shell">
-    <div class="topbar">
+    <header class="topbar">
         <div>
             <h1>btfind dashboard</h1>
-            <div class="subtitle">Search complete torrent metadata. Unknown hashes are hidden.</div>
+            <p class="subtitle">Search torrents with complete metadata.</p>
         </div>
         <button class="ghost" id="refresh" type="button">Refresh</button>
-    </div>
+    </header>
 
-    <section class="stats" id="stats" aria-label="Database statistics"></section>
+    <section class="stats" id="stats" aria-label="Database statistics" aria-busy="true">
+        <div class="stat-card skeleton"></div>
+        <div class="stat-card skeleton"></div>
+        <div class="stat-card skeleton"></div>
+        <div class="stat-card skeleton"></div>
+    </section>
 
-    <form class="toolbar" id="search-form">
-        <input type="search" id="query" placeholder="Search torrent names and files" autocomplete="off" autofocus>
-        <select id="sort" aria-label="Sort results">
-            <option value="rank">Relevance</option>
-            <option value="last_seen">Recently seen</option>
-            <option value="first_seen">Recently added</option>
-            <option value="total_size">Largest</option>
-            <option value="name">Name</option>
-        </select>
-        <select id="limit" aria-label="Result limit">
-            <option value="25">25</option>
-            <option value="50" selected>50</option>
-            <option value="100">100</option>
-            <option value="250">250</option>
-        </select>
-        <input type="text" id="min-size" placeholder="Min size">
-        <input type="text" id="max-size" placeholder="Max size">
-        <button class="primary" type="submit">Search</button>
+    <form class="search-panel" id="search-form">
+        <div class="field query-field">
+            <label for="query">Search</label>
+            <input type="search" id="query" placeholder="Torrent names and file paths" autocomplete="off" autofocus>
+        </div>
+        <div class="field">
+            <label for="sort">Sort by</label>
+            <select id="sort">
+                <option value="rank">Relevance</option>
+                <option value="last_seen">Recently seen</option>
+                <option value="first_seen">Recently added</option>
+                <option value="total_size">Largest</option>
+                <option value="name">Name</option>
+            </select>
+        </div>
+        <div class="field">
+            <label for="limit">Results per page</label>
+            <select id="limit">
+                <option value="25">25</option>
+                <option value="50" selected>50</option>
+                <option value="100">100</option>
+                <option value="250">250</option>
+            </select>
+        </div>
+        <button class="filter-toggle ghost" id="filter-toggle" type="button" aria-expanded="false" aria-controls="size-filters">Filters</button>
+        <div class="size-filters" id="size-filters">
+            <div class="field">
+                <label for="min-size">Minimum size</label>
+                <input type="text" id="min-size" inputmode="decimal" placeholder="e.g. 700 MB" aria-describedby="size-help">
+            </div>
+            <div class="field">
+                <label for="max-size">Maximum size</label>
+                <input type="text" id="max-size" inputmode="decimal" placeholder="e.g. 4 GB" aria-describedby="size-help">
+            </div>
+            <p class="field-help" id="size-help">Use B, KB, MB, GB, or TB.</p>
+        </div>
+        <div class="search-actions">
+            <button class="primary" id="search-button" type="submit">Search</button>
+            <button class="ghost" id="clear-filters" type="button">Clear filters</button>
+        </div>
     </form>
 
-    <div class="status" id="status"></div>
+    <div class="filter-chips" id="filter-chips" aria-label="Active filters"></div>
+    <div class="status" id="status" role="status" aria-live="polite"></div>
+
     <nav class="pager" id="pager" aria-label="Search results pagination" hidden>
         <div class="pager-status" id="pager-status"></div>
         <div class="pager-actions">
@@ -156,344 +75,17 @@ button:disabled { cursor: not-allowed; opacity: 0.45; }
             <button class="ghost" id="next-page" type="button">Next</button>
         </div>
     </nav>
-    <section class="results" id="results" aria-live="polite"></section>
+
+    <section class="results-shell" aria-labelledby="results-heading">
+        <h2 class="visually-hidden" id="results-heading">Search results</h2>
+        <div class="result-headings" aria-hidden="true">
+            <span>Torrent</span><span>Size</span><span>Files</span><span>Last seen</span><span>Actions</span>
+        </div>
+        <div class="results" id="results" aria-live="polite"></div>
+    </section>
 </main>
 
-<script>
-const state = {
-    results: [],
-    expandedHash: null,
-    details: new Map(),
-    total: 0,
-    limit: 50,
-    offset: 0,
-    hasNext: false,
-};
-
-const els = {
-    stats: document.getElementById('stats'),
-    form: document.getElementById('search-form'),
-    query: document.getElementById('query'),
-    sort: document.getElementById('sort'),
-    limit: document.getElementById('limit'),
-    minSize: document.getElementById('min-size'),
-    maxSize: document.getElementById('max-size'),
-    status: document.getElementById('status'),
-    pager: document.getElementById('pager'),
-    pagerStatus: document.getElementById('pager-status'),
-    prevPage: document.getElementById('prev-page'),
-    nextPage: document.getElementById('next-page'),
-    results: document.getElementById('results'),
-    refresh: document.getElementById('refresh'),
-};
-
-async function loadStats() {
-    try {
-        const resp = await fetch('/api/stats');
-        if (!resp.ok) throw new Error('stats request failed');
-        const data = await resp.json();
-        els.stats.innerHTML = [
-            statCard('Torrents', formatNumber(data.total_torrents)),
-            statCard('With metadata', formatNumber(data.total_metadata_complete)),
-            statCard('Files', formatNumber(data.total_files)),
-            statCard('Total size', formatSize(data.total_size)),
-        ].join('');
-    } catch (e) {
-        els.stats.innerHTML = statCard('Stats', 'Unavailable');
-        console.error(e);
-    }
-}
-
-function statCard(label, value) {
-    return `<div class="stat-card"><div class="label">${escapeHtml(label)}</div><div class="value">${escapeHtml(value)}</div></div>`;
-}
-
-async function search(resetPage = false) {
-    clearStatus();
-    if (resetPage) state.offset = 0;
-    state.expandedHash = null;
-    state.results = [];
-    renderEmpty('Searching...');
-
-    let params;
-    try {
-        params = searchParams();
-    } catch (e) {
-        showError(e.message);
-        renderEmpty('Fix the filters and search again.');
-        return;
-    }
-
-    try {
-        const resp = await fetch(`/api/search?${params}`);
-        if (!resp.ok) {
-            const message = await errorMessage(resp);
-            throw new Error(message);
-        }
-        const data = await resp.json();
-        state.results = data.results;
-        state.total = data.total;
-        state.limit = data.limit;
-        state.offset = data.offset;
-        state.hasNext = data.has_next;
-        renderResults();
-        renderPager();
-        setStatus(resultStatus());
-    } catch (e) {
-        showError(`Search failed: ${e.message}`);
-        state.total = 0;
-        state.hasNext = false;
-        renderPager();
-        renderEmpty('No results to display.');
-    }
-}
-
-function searchParams() {
-    const params = new URLSearchParams();
-    const query = els.query.value.trim();
-    const minSize = parseSizeInput(els.minSize.value.trim(), 'min size');
-    const maxSize = parseSizeInput(els.maxSize.value.trim(), 'max size');
-
-    if (minSize !== null && maxSize !== null && maxSize < minSize) {
-        throw new Error('Max size must be greater than or equal to min size.');
-    }
-    if (query) params.set('q', query);
-    params.set('sort', els.sort.value);
-    params.set('limit', els.limit.value);
-    params.set('offset', String(state.offset));
-    params.set('complete_only', 'true');
-    if (minSize !== null) params.set('min_size', String(minSize));
-    if (maxSize !== null) params.set('max_size', String(maxSize));
-    return params;
-}
-
-function parseSizeInput(value, label) {
-    if (!value) return null;
-    const match = value.match(/^(\d+(?:\.\d+)?)\s*(b|kb|mb|gb|tb)?$/i);
-    if (!match) {
-        throw new Error(`Use a number with an optional unit for ${label}, such as 700 MB or 4GB.`);
-    }
-    const amount = Number(match[1]);
-    const unit = (match[2] || 'b').toLowerCase();
-    const multipliers = { b: 1, kb: 1024, mb: 1024 ** 2, gb: 1024 ** 3, tb: 1024 ** 4 };
-    return Math.round(amount * multipliers[unit]);
-}
-
-function renderResults() {
-    if (state.results.length === 0) {
-        renderEmpty('No complete metadata results.');
-        return;
-    }
-    els.results.innerHTML = state.results.map(t => {
-        const expanded = t.info_hash === state.expandedHash;
-        return resultRow(t, expanded) + (expanded ? detailPanel(t.info_hash) : '');
-    }).join('');
-}
-
-function resultRow(t, expanded) {
-    const name = t.name || '(unknown)';
-    return `<div class="row ${expanded ? 'expanded' : ''}" role="button" tabindex="0" data-hash="${escapeAttr(t.info_hash)}">
-        <div class="name">${escapeHtml(name)}<span class="hash">${escapeHtml(t.info_hash)}</span></div>
-        <div class="cell">${formatSize(t.total_size)}</div>
-        <div class="cell">${formatNumber(t.file_count)} files</div>
-        <div class="cell">${formatDate(t.last_seen)}</div>
-        <div class="actions">
-            <a class="mini" href="${escapeAttr(t.magnet)}" onclick="event.stopPropagation()">Magnet</a>
-            <button class="mini" type="button" data-copy="${escapeAttr(t.info_hash)}" onclick="event.stopPropagation()">Copy hash</button>
-        </div>
-    </div>`;
-}
-
-function detailPanel(infoHash) {
-    const detail = state.details.get(infoHash);
-    if (!detail) {
-        loadDetail(infoHash);
-        return `<div class="detail"><div class="status">Loading files...</div></div>`;
-    }
-    if (detail.loading) {
-        return `<div class="detail"><div class="status">Loading files...</div></div>`;
-    }
-    if (detail.error) {
-        return `<div class="detail"><div class="status error">${escapeHtml(detail.error)}</div></div>`;
-    }
-
-    const files = detail.files.slice(0, 80);
-    const hidden = detail.files.length - files.length;
-    return `<div class="detail">
-        <div class="detail-grid">
-            <div>First seen: ${escapeHtml(formatDate(detail.first_seen))}</div>
-            <div>Last seen: ${escapeHtml(formatDate(detail.last_seen))}</div>
-            <div>Total size: ${escapeHtml(formatSize(detail.total_size))}</div>
-            <div>Files: ${escapeHtml(formatNumber(detail.file_count))}</div>
-        </div>
-        <div class="actions" style="justify-content:flex-start;margin-bottom:10px">
-            <a class="mini" href="${escapeAttr(detail.magnet)}">Open magnet</a>
-            <button class="mini" type="button" data-copy="${escapeAttr(detail.magnet)}">Copy magnet</button>
-        </div>
-        <div class="file-list">
-            ${files.map(fileRow).join('') || '<div class="empty">No files indexed.</div>'}
-            ${hidden > 0 ? `<div class="file-row"><div class="file-path">${formatNumber(hidden)} more files not shown</div><div></div></div>` : ''}
-        </div>
-    </div>`;
-}
-
-function fileRow(file) {
-    return `<div class="file-row"><div class="file-path">${escapeHtml(file.path)}</div><div class="cell">${escapeHtml(formatSize(file.size))}</div></div>`;
-}
-
-async function loadDetail(infoHash) {
-    state.details.set(infoHash, { loading: true, error: null, files: [] });
-    try {
-        const resp = await fetch(`/api/torrents/${encodeURIComponent(infoHash)}`);
-        if (!resp.ok) {
-            const message = await errorMessage(resp);
-            throw new Error(message);
-        }
-        state.details.set(infoHash, await resp.json());
-    } catch (e) {
-        state.details.set(infoHash, { error: `Could not load torrent details: ${e.message}`, files: [] });
-    }
-    if (state.expandedHash === infoHash) renderResults();
-}
-
-function renderEmpty(message) {
-    els.results.innerHTML = `<div class="empty">${escapeHtml(message)}</div>`;
-}
-
-function renderPager() {
-    if (state.total === 0) {
-        els.pager.hidden = true;
-        return;
-    }
-
-    const start = state.offset + 1;
-    const end = state.offset + state.results.length;
-    els.pager.hidden = false;
-    els.pagerStatus.textContent = `Showing ${formatNumber(start)}-${formatNumber(end)} of ${formatNumber(state.total)}`;
-    els.prevPage.disabled = state.offset === 0;
-    els.nextPage.disabled = !state.hasNext;
-}
-
-function resultStatus() {
-    if (state.total === 0) return 'No complete torrents';
-    const currentPage = Math.floor(state.offset / state.limit) + 1;
-    const pageCount = Math.max(1, Math.ceil(state.total / state.limit));
-    return `Page ${formatNumber(currentPage)} of ${formatNumber(pageCount)}`;
-}
-
-async function errorMessage(resp) {
-    try {
-        const data = await resp.json();
-        return data.error || resp.statusText;
-    } catch (_) {
-        return resp.statusText;
-    }
-}
-
-function setStatus(message) {
-    els.status.className = 'status';
-    els.status.textContent = message;
-}
-
-function showError(message) {
-    els.status.className = 'status error';
-    els.status.textContent = message;
-}
-
-function clearStatus() {
-    els.status.className = 'status';
-    els.status.textContent = '';
-}
-
-async function copyText(text, button) {
-    try {
-        await navigator.clipboard.writeText(text);
-        const old = button.textContent;
-        button.textContent = 'Copied';
-        setTimeout(() => { button.textContent = old; }, 1200);
-    } catch (e) {
-        showError(`Copy failed: ${e.message}`);
-    }
-}
-
-function formatSize(bytes) {
-    if (!Number.isFinite(bytes) || bytes <= 0) return '0 B';
-    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-    let size = bytes;
-    let unit = 0;
-    while (size >= 1024 && unit < units.length - 1) {
-        size /= 1024;
-        unit += 1;
-    }
-    return unit === 0 ? `${bytes} B` : `${size.toFixed(1)} ${units[unit]}`;
-}
-
-function formatDate(seconds) {
-    if (!seconds) return 'Unknown';
-    return new Date(seconds * 1000).toLocaleString();
-}
-
-function formatNumber(value) {
-    return new Intl.NumberFormat().format(value || 0);
-}
-
-function escapeHtml(value) {
-    return String(value)
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;')
-        .replace(/'/g, '&#39;');
-}
-
-function escapeAttr(value) {
-    return escapeHtml(value);
-}
-
-els.form.addEventListener('submit', event => {
-    event.preventDefault();
-    search(true);
-});
-
-els.refresh.addEventListener('click', () => {
-    loadStats();
-    search();
-});
-
-els.prevPage.addEventListener('click', () => {
-    state.offset = Math.max(0, state.offset - state.limit);
-    search();
-});
-
-els.nextPage.addEventListener('click', () => {
-    if (!state.hasNext) return;
-    state.offset += state.limit;
-    search();
-});
-
-els.results.addEventListener('click', event => {
-    const copyButton = event.target.closest('[data-copy]');
-    if (copyButton) {
-        copyText(copyButton.dataset.copy, copyButton);
-        return;
-    }
-    const row = event.target.closest('.row');
-    if (!row) return;
-    state.expandedHash = state.expandedHash === row.dataset.hash ? null : row.dataset.hash;
-    renderResults();
-});
-
-els.results.addEventListener('keydown', event => {
-    if (event.key !== 'Enter' && event.key !== ' ') return;
-    const row = event.target.closest('.row');
-    if (!row) return;
-    event.preventDefault();
-    state.expandedHash = state.expandedHash === row.dataset.hash ? null : row.dataset.hash;
-    renderResults();
-});
-
-loadStats();
-search(true);
-</script>
+<div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+<script src="/dashboard.js" defer></script>
 </body>
 </html>

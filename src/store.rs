@@ -62,6 +62,12 @@ pub struct TorrentSearchPage {
     pub total: i64,
 }
 
+#[derive(Debug)]
+pub struct FileSearchPage {
+    pub results: Vec<(String, i64)>,
+    pub total: i64,
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TorrentSearchFilters {
     pub complete_only: bool,
@@ -850,6 +856,74 @@ impl Store {
             results.push(row?);
         }
         Ok(results)
+    }
+
+    pub fn search_files_page(
+        &self,
+        info_hash: &InfoHash,
+        query: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<FileSearchPage, rusqlite::Error> {
+        let conn = self.conn.lock().expect("store connection mutex poisoned");
+        let hash_hex = hex::encode(info_hash);
+        let query_trimmed = query.trim();
+
+        let (total, mut stmt, params) = if query_trimmed.is_empty() {
+            let total = conn.query_row(
+                "SELECT COUNT(*) FROM files WHERE torrent_id = ?1",
+                params![hash_hex],
+                |row| row.get(0),
+            )?;
+            let stmt = conn.prepare(
+                "SELECT path, size FROM files
+                 WHERE torrent_id = ?1
+                 ORDER BY path COLLATE NOCASE, path, id
+                 LIMIT ?2 OFFSET ?3",
+            )?;
+            (
+                total,
+                stmt,
+                vec![
+                    Value::from(hash_hex),
+                    Value::from(limit as i64),
+                    Value::from(offset as i64),
+                ],
+            )
+        } else {
+            let pattern = format!("%{}%", escape_like_literal(query_trimmed));
+            let total = conn.query_row(
+                "SELECT COUNT(*) FROM files
+                 WHERE torrent_id = ?1 AND path LIKE ?2 ESCAPE '\\' COLLATE NOCASE",
+                params![hash_hex, pattern],
+                |row| row.get(0),
+            )?;
+            let stmt = conn.prepare(
+                "SELECT path, size FROM files
+                 WHERE torrent_id = ?1 AND path LIKE ?2 ESCAPE '\\' COLLATE NOCASE
+                 ORDER BY path COLLATE NOCASE, path, id
+                 LIMIT ?3 OFFSET ?4",
+            )?;
+            (
+                total,
+                stmt,
+                vec![
+                    Value::from(hash_hex),
+                    Value::from(pattern),
+                    Value::from(limit as i64),
+                    Value::from(offset as i64),
+                ],
+            )
+        };
+
+        let rows = stmt.query_map(params_from_iter(params), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        let mut results = Vec::new();
+        for row in rows {
+            results.push(row?);
+        }
+        Ok(FileSearchPage { results, total })
     }
 
     #[allow(dead_code)]
@@ -1700,6 +1774,68 @@ mod tests {
         assert_eq!(files.len(), 2);
         assert_eq!(files[0].0, "a.txt");
         assert_eq!(files[1].0, "b.txt");
+    }
+
+    #[test]
+    fn test_search_files_page_paginates_and_orders_paths() {
+        let store = test_db();
+        let info_hash = [0xD2u8; 20];
+        store
+            .upsert_torrent(info_hash, Some("test".into()), 1000, 4, "dht")
+            .unwrap();
+        store
+            .insert_files(
+                &info_hash,
+                &[
+                    ("z-last.txt".into(), 4),
+                    ("Beta.txt".into(), 2),
+                    ("alpha.txt".into(), 1),
+                    ("beta.txt".into(), 3),
+                ],
+            )
+            .unwrap();
+
+        let first = store.search_files_page(&info_hash, "", 2, 0).unwrap();
+        assert_eq!(first.total, 4);
+        assert_eq!(first.results[0].0, "alpha.txt");
+        assert_eq!(first.results[1].0, "Beta.txt");
+
+        let second = store.search_files_page(&info_hash, "", 2, 2).unwrap();
+        assert_eq!(second.total, 4);
+        assert_eq!(second.results[0].0, "beta.txt");
+        assert_eq!(second.results[1].0, "z-last.txt");
+
+        let empty = store.search_files_page(&info_hash, "", 2, 8).unwrap();
+        assert_eq!(empty.total, 4);
+        assert!(empty.results.is_empty());
+    }
+
+    #[test]
+    fn test_search_files_page_uses_case_insensitive_literal_filter() {
+        let store = test_db();
+        let info_hash = [0xD3u8; 20];
+        store
+            .upsert_torrent(info_hash, Some("test".into()), 1000, 3, "dht")
+            .unwrap();
+        store
+            .insert_files(
+                &info_hash,
+                &[
+                    ("Video/EPISODE_100%.mkv".into(), 1),
+                    ("Video/episode_200.mkv".into(), 2),
+                    ("notes.txt".into(), 3),
+                ],
+            )
+            .unwrap();
+
+        let case_match = store
+            .search_files_page(&info_hash, "episode", 10, 0)
+            .unwrap();
+        assert_eq!(case_match.total, 2);
+
+        let literal = store.search_files_page(&info_hash, "_100%", 10, 0).unwrap();
+        assert_eq!(literal.total, 1);
+        assert_eq!(literal.results[0].0, "Video/EPISODE_100%.mkv");
     }
 
     #[test]
