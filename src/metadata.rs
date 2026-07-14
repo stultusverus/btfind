@@ -1,4 +1,4 @@
-use crate::store::Store;
+use crate::store::{PeerRetryEligibility, Store};
 use crate::types::{CrawlStatsEvent, HashDiscovery, InfoHash, MetadataFailureReason, PeerContact};
 use crate::wire::{self, ExtendedHandshake, Handshake, WireMessage, HANDSHAKE_LEN};
 use rand::Rng;
@@ -602,39 +602,57 @@ fn get_bencode_int(
     }
 }
 
+struct PeerRetryFilter {
+    eligible: Vec<PeerContact>,
+    next_eligible_at: Option<i64>,
+}
+
 fn filter_peers_for_retry(
     store: &Store,
     info_hash: &InfoHash,
     peers: &[PeerContact],
     retry_after_hours: u32,
-) -> Vec<PeerContact> {
-    peers
-        .iter()
-        .filter_map(|peer| {
-            let peer_addr = peer.addr.to_string();
-            match store.should_skip_peer_retry(info_hash, &peer_addr, retry_after_hours) {
-                Ok(true) => {
-                    tracing::debug!(
-                        "skipping metadata fetch for {} from {} (attempted within {}h)",
-                        hex::encode(info_hash),
-                        peer_addr,
-                        retry_after_hours
-                    );
-                    None
-                }
-                Ok(false) => Some(peer.clone()),
-                Err(e) => {
-                    tracing::warn!(
-                        "should_skip_peer_retry database error for {} from {}: {}, skipping",
-                        hex::encode(info_hash),
-                        peer_addr,
-                        e
-                    );
-                    None
-                }
+) -> PeerRetryFilter {
+    let mut eligible = Vec::new();
+    let mut next_eligible_at: Option<i64> = None;
+    for peer in peers {
+        let peer_addr = peer.addr.to_string();
+        match store.peer_retry_eligibility(info_hash, &peer_addr, retry_after_hours) {
+            Ok(PeerRetryEligibility::Eligible) => eligible.push(peer.clone()),
+            Ok(PeerRetryEligibility::RetryAt(retry_at)) => {
+                next_eligible_at =
+                    Some(next_eligible_at.map_or(retry_at, |current| current.min(retry_at)));
+                tracing::debug!(
+                    "delaying metadata fetch for {} from {} until {}",
+                    hex::encode(info_hash),
+                    peer_addr,
+                    retry_at
+                );
             }
-        })
-        .collect()
+            Ok(PeerRetryEligibility::Rejected) => {
+                tracing::debug!(
+                    "rejecting metadata peer {} for {} after hash mismatch",
+                    peer_addr,
+                    hex::encode(info_hash),
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "peer retry eligibility database error for {} from {}: {}, delaying",
+                    hex::encode(info_hash),
+                    peer_addr,
+                    error
+                );
+                let retry_at = chrono::Utc::now().timestamp().saturating_add(300);
+                next_eligible_at =
+                    Some(next_eligible_at.map_or(retry_at, |current| current.min(retry_at)));
+            }
+        }
+    }
+    PeerRetryFilter {
+        eligible,
+        next_eligible_at,
+    }
 }
 
 fn emit_metadata_failure(stats_tx: &mpsc::Sender<CrawlStatsEvent>, reason: MetadataFailureReason) {
@@ -706,6 +724,7 @@ struct JobOutcome {
     attempts: u32,
     complete: bool,
     terminal: bool,
+    parked: bool,
 }
 
 struct FetchRoundConfig {
@@ -728,12 +747,16 @@ async fn process_hash_round(
         filter_peers_for_retry(&filter_store, &info_hash, &peers, config.retry_after_hours)
     })
     .await
-    .unwrap_or_default();
+    .unwrap_or(PeerRetryFilter {
+        eligible: Vec::new(),
+        next_eligible_at: Some(chrono::Utc::now().timestamp().saturating_add(300)),
+    });
     let mut attempts = 0u32;
     let mut last_error = "no eligible peers".to_string();
     let mut long_backoff = false;
+    let mut retryable_attempts = 0u32;
 
-    for peer in filtered {
+    for peer in filtered.eligible {
         attempts = attempts.saturating_add(1);
         let peer_addr = peer.addr.to_string();
         let attempt_store = store.clone();
@@ -746,6 +769,7 @@ async fn process_hash_round(
         .is_err()
         {
             last_error = "storage worker failed to record peer attempt".to_string();
+            retryable_attempts = retryable_attempts.saturating_add(1);
             continue;
         }
 
@@ -801,10 +825,17 @@ async fn process_hash_round(
                                 attempts,
                                 complete: true,
                                 terminal: false,
+                                parked: false,
                             };
                         }
-                        Ok(Err(error)) => last_error = format!("storage: {}", error),
-                        Err(error) => last_error = format!("storage worker: {}", error),
+                        Ok(Err(error)) => {
+                            last_error = format!("storage: {}", error);
+                            retryable_attempts = retryable_attempts.saturating_add(1);
+                        }
+                        Err(error) => {
+                            last_error = format!("storage worker: {}", error);
+                            retryable_attempts = retryable_attempts.saturating_add(1);
+                        }
                     }
                 }
                 Err(error) => {
@@ -833,10 +864,12 @@ async fn process_hash_round(
                         attempts,
                         complete: false,
                         terminal: true,
+                        parked: false,
                     };
                 }
             },
             Err(error) => {
+                retryable_attempts = retryable_attempts.saturating_add(1);
                 long_backoff |= error.long_backoff();
                 last_error = error.to_string();
                 let reason = error.reason();
@@ -859,13 +892,45 @@ async fn process_hash_round(
     }
 
     let attempt_count = config.prior_attempt_count.saturating_add(attempts);
+    let now = chrono::Utc::now().timestamp();
+    let mut next_peer_eligibility = filtered.next_eligible_at;
+    if retryable_attempts > 0 && config.retry_after_hours > 0 {
+        let retry_at = now.saturating_add(i64::from(config.retry_after_hours) * 3600);
+        next_peer_eligibility =
+            Some(next_peer_eligibility.map_or(retry_at, |current| current.min(retry_at)));
+    }
+    let has_retryable_peer = next_peer_eligibility.is_some()
+        || (retryable_attempts > 0 && config.retry_after_hours == 0);
+    if !has_retryable_peer {
+        let retry_store = store.clone();
+        let retry_error = last_error.clone();
+        let recorded = tokio::task::spawn_blocking(move || {
+            retry_store.update_hash_job_failure(
+                &info_hash,
+                "waiting_peers",
+                attempt_count,
+                0,
+                &retry_error,
+            )
+        })
+        .await;
+        log_storage_result("park metadata job", recorded);
+        return JobOutcome {
+            info_hash,
+            attempts,
+            complete: false,
+            terminal: false,
+            parked: true,
+        };
+    }
     let exponent = attempt_count.min(10);
     let base = if long_backoff { 900u64 } else { 30u64 };
     let delay = base.saturating_mul(1u64 << exponent).min(24 * 60 * 60);
     let jitter = rand::thread_rng().gen_range(0..=(delay / 4).max(1));
-    let next_attempt_at = chrono::Utc::now()
-        .timestamp()
-        .saturating_add(i64::try_from(delay.saturating_add(jitter)).unwrap_or(i64::MAX));
+    let backoff_at =
+        now.saturating_add(i64::try_from(delay.saturating_add(jitter)).unwrap_or(i64::MAX));
+    let next_attempt_at =
+        next_peer_eligibility.map_or(backoff_at, |peer_retry_at| backoff_at.max(peer_retry_at));
     let retry_store = store.clone();
     let retry_error = last_error.clone();
     let recorded = tokio::task::spawn_blocking(move || {
@@ -885,6 +950,7 @@ async fn process_hash_round(
         attempts,
         complete: false,
         terminal: false,
+        parked: false,
     }
 }
 
@@ -1038,7 +1104,7 @@ pub async fn run_metadata_fetcher(
             result = workers.join_next(), if !workers.is_empty() => {
                 match result {
                     Some(Ok(outcome)) => {
-                        if outcome.complete || outcome.terminal {
+                        if outcome.complete || outcome.terminal || outcome.parked {
                             jobs.remove(&outcome.info_hash);
                             ready_set.remove(&outcome.info_hash);
                         } else if let Some(job) = jobs.get_mut(&outcome.info_hash) {
@@ -1089,6 +1155,90 @@ mod tests {
         let info_dict = b"d6:lengthi42e4:name8:test.txte";
         let wrong_hash: InfoHash = [0xABu8; 20];
         assert!(!verify_metadata_hash(&wrong_hash, info_dict));
+    }
+
+    #[tokio::test]
+    async fn durable_retry_waits_until_peer_is_eligible() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let info_hash = [0xACu8; 20];
+        let peer = PeerContact {
+            addr: "8.8.8.8:6881".parse().unwrap(),
+        };
+        store
+            .persist_hash_discovery(&info_hash, "test", true)
+            .unwrap();
+        store
+            .persist_hash_job_peers(&info_hash, std::slice::from_ref(&peer), 8)
+            .unwrap();
+        store
+            .set_peer_attempt(&info_hash, &peer.addr.to_string(), Some("timeout"))
+            .unwrap();
+        let earliest_expected = chrono::Utc::now().timestamp() + 23 * 3600;
+        let (stats_tx, _stats_rx) = mpsc::channel(4);
+
+        let outcome = process_hash_round(
+            info_hash,
+            vec![peer],
+            store.clone(),
+            stats_tx,
+            FetchRoundConfig {
+                peer_timeout: Duration::from_millis(1),
+                retry_after_hours: 24,
+                max_metadata_size: 1024,
+                prior_attempt_count: 0,
+            },
+        )
+        .await;
+
+        assert_eq!(outcome.attempts, 0);
+        assert!(!outcome.parked);
+        let (status, attempt_count, next_attempt_at) =
+            store.hash_job_schedule_for_test(&info_hash).unwrap();
+        assert_eq!(status, "retry_at");
+        assert_eq!(attempt_count, 0);
+        assert!(next_attempt_at >= earliest_expected);
+    }
+
+    #[tokio::test]
+    async fn permanently_rejected_peer_parks_job_until_new_discovery() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let info_hash = [0xADu8; 20];
+        let peer = PeerContact {
+            addr: "8.8.4.4:6881".parse().unwrap(),
+        };
+        store
+            .persist_hash_discovery(&info_hash, "test", true)
+            .unwrap();
+        store
+            .set_peer_attempt(
+                &info_hash,
+                &peer.addr.to_string(),
+                Some("metadata hash mismatch"),
+            )
+            .unwrap();
+        let (stats_tx, _stats_rx) = mpsc::channel(4);
+
+        let outcome = process_hash_round(
+            info_hash,
+            vec![peer],
+            store.clone(),
+            stats_tx,
+            FetchRoundConfig {
+                peer_timeout: Duration::from_millis(1),
+                retry_after_hours: 24,
+                max_metadata_size: 1024,
+                prior_attempt_count: 1,
+            },
+        )
+        .await;
+
+        assert_eq!(outcome.attempts, 0);
+        assert!(outcome.parked);
+        let (status, attempt_count, next_attempt_at) =
+            store.hash_job_schedule_for_test(&info_hash).unwrap();
+        assert_eq!(status, "waiting_peers");
+        assert_eq!(attempt_count, 1);
+        assert_eq!(next_attempt_at, 0);
     }
 
     #[tokio::test]
@@ -1476,7 +1626,8 @@ mod tests {
             24,
         );
 
-        assert_eq!(peers, vec![new_peer]);
+        assert_eq!(peers.eligible, vec![new_peer]);
+        assert!(peers.next_eligible_at.is_some());
     }
 
     #[test]
@@ -1498,7 +1649,8 @@ mod tests {
         let peers =
             filter_peers_for_retry(&store, &info_hash, std::slice::from_ref(&attempted_peer), 0);
 
-        assert_eq!(peers, vec![attempted_peer]);
+        assert_eq!(peers.eligible, vec![attempted_peer]);
+        assert_eq!(peers.next_eligible_at, None);
     }
 
     #[test]

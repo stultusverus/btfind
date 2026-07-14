@@ -1,6 +1,6 @@
 use crate::types::{InfoHash, NodeContact, NodeId};
 use rusqlite::types::Value;
-use rusqlite::{params, params_from_iter, Connection};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use std::net::SocketAddrV4;
 use std::path::Path;
 use std::sync::Mutex;
@@ -61,6 +61,13 @@ pub struct HashJobRecord {
     pub attempt_count: u32,
     pub next_attempt_at: i64,
     pub last_failure: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerRetryEligibility {
+    Eligible,
+    RetryAt(i64),
+    Rejected,
 }
 
 pub struct Store {
@@ -1059,21 +1066,61 @@ impl Store {
         peer_addr: &str,
         retry_after_hours: u32,
     ) -> Result<bool, rusqlite::Error> {
-        if retry_after_hours == 0 {
-            return Ok(false);
-        }
+        Ok(!matches!(
+            self.peer_retry_eligibility(info_hash, peer_addr, retry_after_hours)?,
+            PeerRetryEligibility::Eligible
+        ))
+    }
 
+    pub fn peer_retry_eligibility(
+        &self,
+        info_hash: &InfoHash,
+        peer_addr: &str,
+        retry_after_hours: u32,
+    ) -> Result<PeerRetryEligibility, rusqlite::Error> {
         let conn = self.conn.lock().expect("store connection mutex poisoned");
-        let hash_hex = hex::encode(info_hash);
-        let cutoff = chrono::Utc::now().timestamp() - (retry_after_hours as i64) * 3600;
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM metadata_peer_attempts
-             WHERE info_hash = ?1 AND peer_addr = ?2
-               AND (last_error = 'metadata hash mismatch' OR last_attempt > ?3)",
-            params![hash_hex, peer_addr, cutoff],
-            |row| row.get(0),
-        )?;
-        Ok(count > 0)
+        let attempt = conn
+            .query_row(
+                "SELECT last_attempt, last_error
+                 FROM metadata_peer_attempts
+                 WHERE info_hash = ?1 AND peer_addr = ?2",
+                params![hex::encode(info_hash), peer_addr],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .optional()?;
+        let Some((last_attempt, last_error)) = attempt else {
+            return Ok(PeerRetryEligibility::Eligible);
+        };
+        if last_error.as_deref() == Some("metadata hash mismatch") {
+            return Ok(PeerRetryEligibility::Rejected);
+        }
+        let retry_at = last_attempt.saturating_add(i64::from(retry_after_hours) * 3600);
+        if retry_after_hours > 0 && retry_at > chrono::Utc::now().timestamp() {
+            Ok(PeerRetryEligibility::RetryAt(retry_at))
+        } else {
+            Ok(PeerRetryEligibility::Eligible)
+        }
+    }
+
+    #[cfg(test)]
+    pub fn hash_job_schedule_for_test(
+        &self,
+        info_hash: &InfoHash,
+    ) -> Result<(String, u32, i64), rusqlite::Error> {
+        let conn = self.conn.lock().expect("store connection mutex poisoned");
+        conn.query_row(
+            "SELECT status, attempt_count, next_attempt_at
+             FROM hash_jobs WHERE info_hash = ?1",
+            params![hex::encode(info_hash)],
+            |row| {
+                let attempt_count: i64 = row.get(1)?;
+                Ok((
+                    row.get(0)?,
+                    u32::try_from(attempt_count).unwrap_or(u32::MAX),
+                    row.get(2)?,
+                ))
+            },
+        )
     }
 
     pub fn prune_stale_peer_attempts(&self, max_age: Duration) -> Result<i64, rusqlite::Error> {
