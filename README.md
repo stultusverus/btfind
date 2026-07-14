@@ -156,17 +156,17 @@ port = 8080
 
 CLI flags override config values.
 
-All queue, job, RPC, contact, peer, metadata, and sampling limits are validated before the runtime starts. Full discovery queues are coalesced into durable hash-job rows where admitted by the metadata scheduler; excess in-memory jobs remain in SQLite for the retry scan. `sampling_enabled` keeps BEP 51 active indexing opt-in while passive crawling remains available.
+All queue, job, RPC, contact, peer, metadata, and sampling limits are validated before the runtime starts. Full discovery queues are coalesced into durable hash-job rows where admitted by the metadata scheduler; excess in-memory jobs remain in SQLite for the retry scan. `sampling_enabled` enables bounded random BEP 51 probing of validated live nodes. It is an opt-in discovery aid, not a keyspace traversal or coverage-complete sweep.
 
 ## How It Works
 
 Three subsystems run on a Tokio async runtime:
 
-- **DHT Crawler** — Bootstraps into the BitTorrent DHT via Kademlia, validates every response against its outbound RPC, and discovers info_hashes passively or through optional BEP 51 sampling.
+- **DHT Crawler** — Bootstraps into the BitTorrent DHT via Kademlia, validates every response against its outbound RPC, and discovers info_hashes passively or through optional bounded random BEP 51 sampling.
 - **Metadata Fetcher** — Receives discovered info_hashes, connects to peers via TCP (BitTorrent wire protocol), negotiates BEP 9 extensions (`ut_metadata`), and downloads torrent metadata (name, size, file list).
 - **SQLite Store** — Persists torrents and files with deduplication by info_hash. Uses FTS5 full-text search (trigram tokenizer) over torrent names and file paths, provides statistics, and pruning.
 
-Data flows through bounded `tokio::sync::mpsc` channels. Metadata work is deduplicated per info hash, SQLite calls from async workers run through Tokio's bounded blocking pool, and retry state plus peer candidates survive process restarts.
+Data flows through bounded `tokio::sync::mpsc` channels. Metadata work is deduplicated per info hash, runtime persistence is coalesced and committed according to the configured database batch size and flush interval, and retry state plus peer candidates survive process restarts. Synchronous SQLite work runs outside async executor threads.
 
 ## Database
 

@@ -104,7 +104,7 @@ pub enum CrawlStatsEvent {
         info_hash: InfoHash,
         node_id: NodeId,
         addr: SocketAddrV4,
-        sweep_id: u64,
+        round_id: u64,
     },
     HashObserved {
         info_hash: InfoHash,

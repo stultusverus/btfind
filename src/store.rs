@@ -738,7 +738,7 @@ impl Store {
                     info_hash,
                     node_id,
                     addr,
-                    sweep_id,
+                    round_id,
                 } => {
                     merge_hash_observation(&mut hashes, info_hash, "sample_infohashes", false);
                     samples
@@ -746,10 +746,10 @@ impl Store {
                         .and_modify(|sample| {
                             sample.0 = node_id;
                             sample.1 = addr;
-                            sample.2 = sweep_id;
+                            sample.2 = round_id;
                             sample.3 += 1;
                         })
-                        .or_insert((node_id, addr, sweep_id, 1));
+                        .or_insert((node_id, addr, round_id, 1));
                 }
                 _ => {}
             }
@@ -780,7 +780,7 @@ impl Store {
         for (info_hash, source, has_peers) in hashes {
             persist_hash_discovery_tx(&tx, &info_hash, source, has_peers, now)?;
         }
-        for (info_hash, (node_id, addr, sweep_id, count)) in samples {
+        for (info_hash, (node_id, addr, round_id, count)) in samples {
             tx.execute(
                 "INSERT INTO sample_observations (
                     info_hash, first_seen, last_seen, sample_count,
@@ -798,7 +798,7 @@ impl Store {
                     count,
                     hex::encode(node_id),
                     addr.to_string(),
-                    i64::try_from(sweep_id).unwrap_or(i64::MAX)
+                    i64::try_from(round_id).unwrap_or(i64::MAX)
                 ],
             )?;
         }
@@ -2248,13 +2248,13 @@ mod tests {
                 info_hash,
                 node_id,
                 addr: first_addr,
-                sweep_id: 1,
+                round_id: 1,
             },
             CrawlStatsEvent::SampleObserved {
                 info_hash,
                 node_id,
                 addr: latest_addr,
-                sweep_id: 2,
+                round_id: 2,
             },
         ];
 

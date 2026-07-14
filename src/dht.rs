@@ -504,7 +504,7 @@ pub struct DhtCrawler {
     peer_cache: HashMap<InfoHash, Vec<CachedPeer>>,
     config: DhtConfig,
     queries_sent: usize,
-    sweep_id: u64,
+    sampling_round_id: u64,
 }
 
 impl DhtCrawler {
@@ -552,7 +552,7 @@ impl DhtCrawler {
             peer_cache: HashMap::new(),
             config,
             queries_sent: 0,
-            sweep_id: 0,
+            sampling_round_id: 0,
         }
     }
 
@@ -726,7 +726,7 @@ impl DhtCrawler {
                     }
                 }
                 _ = discovery_tick.tick() => self.discover_peers().await,
-                _ = sampling_tick.tick(), if self.config.sampling_enabled => self.sample_nodes().await,
+                _ = sampling_tick.tick(), if self.config.sampling_enabled => self.sample_random_nodes().await,
                 _ = refresh_tick.tick() => {
                     self.expire_pending();
                     self.expire_peer_cache();
@@ -991,7 +991,7 @@ impl DhtCrawler {
                         info_hash: *hash,
                         node_id: response.node_id,
                         addr: source,
-                        sweep_id: self.sweep_id,
+                        round_id: self.sampling_round_id,
                     });
                 }
                 self.emit_stat(CrawlStatsEvent::SamplingResponse {
@@ -1109,8 +1109,8 @@ impl DhtCrawler {
         }
     }
 
-    async fn sample_nodes(&mut self) {
-        self.sweep_id = self.sweep_id.wrapping_add(1);
+    async fn sample_random_nodes(&mut self) {
+        self.sampling_round_id = self.sampling_round_id.wrapping_add(1);
         let now = Instant::now();
         let nodes: Vec<NodeContact> = self
             .routing
