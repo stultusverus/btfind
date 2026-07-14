@@ -1,14 +1,125 @@
 use crate::store::Store;
-use crate::types::{CrawlStatsEvent, InfoHash, MetadataFailureReason, PeerContact};
+use crate::types::{CrawlStatsEvent, HashDiscovery, InfoHash, MetadataFailureReason, PeerContact};
 use crate::wire::{self, ExtendedHandshake, Handshake, WireMessage, HANDSHAKE_LEN};
+use rand::Rng;
 use sha1::{Digest, Sha1};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio::time::timeout;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimeoutStage {
+    Connect,
+    HandshakeRead,
+    HandshakeWrite,
+    ExtensionRead,
+    ExtensionWrite,
+    MetadataRead,
+    MetadataWrite,
+}
+
+#[derive(Debug)]
+pub enum MetadataFetchError {
+    Connect(String),
+    Timeout { stage: TimeoutStage },
+    InvalidHandshake,
+    ExtensionUnsupported,
+    MetadataRejected,
+    MalformedProtocol(String),
+}
+
+impl MetadataFetchError {
+    fn from_protocol_message(message: String) -> Self {
+        if message == "connect timeout" {
+            Self::Timeout {
+                stage: TimeoutStage::Connect,
+            }
+        } else if message.starts_with("connect error") {
+            Self::Connect(message)
+        } else if message.contains("handshake read timeout") {
+            Self::Timeout {
+                stage: TimeoutStage::HandshakeRead,
+            }
+        } else if message.contains("handshake write timeout") {
+            Self::Timeout {
+                stage: TimeoutStage::HandshakeWrite,
+            }
+        } else if message.contains("extended handshake") && message.contains("timeout") {
+            Self::Timeout {
+                stage: if message.contains("write") {
+                    TimeoutStage::ExtensionWrite
+                } else {
+                    TimeoutStage::ExtensionRead
+                },
+            }
+        } else if message.contains("metadata") && message.contains("write timeout") {
+            Self::Timeout {
+                stage: TimeoutStage::MetadataWrite,
+            }
+        } else if message.contains("timeout") {
+            Self::Timeout {
+                stage: TimeoutStage::MetadataRead,
+            }
+        } else if message.contains("invalid handshake") || message.contains("info_hash mismatch") {
+            Self::InvalidHandshake
+        } else if message.contains("extensions")
+            || message.contains("ut_metadata")
+            || message.contains("metadata_size")
+            || message.contains("extended handshake")
+        {
+            Self::ExtensionUnsupported
+        } else if message.contains("rejected metadata") {
+            Self::MetadataRejected
+        } else {
+            Self::MalformedProtocol(message)
+        }
+    }
+
+    fn reason(&self) -> MetadataFailureReason {
+        match self {
+            MetadataFetchError::Connect(_) => MetadataFailureReason::Connect,
+            MetadataFetchError::Timeout { .. } => MetadataFailureReason::Timeout,
+            MetadataFetchError::InvalidHandshake => MetadataFailureReason::Handshake,
+            MetadataFetchError::ExtensionUnsupported => MetadataFailureReason::Extension,
+            MetadataFetchError::MetadataRejected => MetadataFailureReason::Rejected,
+            MetadataFetchError::MalformedProtocol(_) => MetadataFailureReason::Protocol,
+        }
+    }
+
+    fn long_backoff(&self) -> bool {
+        matches!(
+            self,
+            MetadataFetchError::ExtensionUnsupported | MetadataFetchError::MetadataRejected
+        )
+    }
+}
+
+impl std::fmt::Display for MetadataFetchError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MetadataFetchError::Connect(message)
+            | MetadataFetchError::MalformedProtocol(message) => formatter.write_str(message),
+            MetadataFetchError::Timeout { stage } => {
+                write!(formatter, "timeout during {:?}", stage)
+            }
+            MetadataFetchError::InvalidHandshake => formatter.write_str("invalid handshake"),
+            MetadataFetchError::ExtensionUnsupported => {
+                formatter.write_str("metadata extension unsupported")
+            }
+            MetadataFetchError::MetadataRejected => formatter.write_str("metadata rejected"),
+        }
+    }
+}
+
+#[cfg(test)]
+fn classify_metadata_failure(message: &str) -> MetadataFailureReason {
+    MetadataFetchError::from_protocol_message(message.to_string()).reason()
+}
 
 pub fn metadata_piece_count(total_size: u32) -> u32 {
     total_size.div_ceil(16384)
@@ -22,24 +133,51 @@ fn metadata_piece_len(total_size: u32, total_pieces: u32, piece_idx: u32) -> usi
     }
 }
 
+#[allow(dead_code)]
 pub async fn fetch_from_peer(
     info_hash: &InfoHash,
     peer: &PeerContact,
     peer_timeout: Duration,
-) -> Result<Vec<u8>, String> {
+) -> Result<Vec<u8>, MetadataFetchError> {
+    fetch_from_peer_with_limit(info_hash, peer, peer_timeout, 8 * 1024 * 1024).await
+}
+
+pub async fn fetch_from_peer_with_limit(
+    info_hash: &InfoHash,
+    peer: &PeerContact,
+    peer_timeout: Duration,
+    max_metadata_size: u32,
+) -> Result<Vec<u8>, MetadataFetchError> {
     let addr = std::net::SocketAddr::V4(peer.addr);
     let stream = timeout(peer_timeout, TcpStream::connect(addr))
         .await
-        .map_err(|_| "connect timeout".to_string())?
-        .map_err(|e| format!("connect error: {}", e))?;
+        .map_err(|_| MetadataFetchError::Timeout {
+            stage: TimeoutStage::Connect,
+        })?
+        .map_err(|error| MetadataFetchError::Connect(format!("connect error: {}", error)))?;
 
-    fetch_from_stream(info_hash, stream, peer_timeout).await
+    fetch_from_stream_with_limit(info_hash, stream, peer_timeout, max_metadata_size)
+        .await
+        .map_err(MetadataFetchError::from_protocol_message)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 async fn fetch_from_stream<S>(
+    info_hash: &InfoHash,
+    stream: S,
+    peer_timeout: Duration,
+) -> Result<Vec<u8>, String>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    fetch_from_stream_with_limit(info_hash, stream, peer_timeout, 8 * 1024 * 1024).await
+}
+
+async fn fetch_from_stream_with_limit<S>(
     info_hash: &InfoHash,
     mut stream: S,
     peer_timeout: Duration,
+    max_metadata_size: u32,
 ) -> Result<Vec<u8>, String>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -47,10 +185,7 @@ where
     let our_peer_id = crate::types::random_node_id();
 
     let hs = Handshake::new(*info_hash, our_peer_id);
-    stream
-        .write_all(&hs.to_bytes())
-        .await
-        .map_err(|e| format!("write handshake: {}", e))?;
+    write_all_timeout(&mut stream, &hs.to_bytes(), peer_timeout, "handshake").await?;
 
     let mut handshake_buf = vec![0u8; HANDSHAKE_LEN];
     timeout(peer_timeout, stream.read_exact(&mut handshake_buf))
@@ -89,10 +224,13 @@ where
         payload: ext_hs_bytes,
     };
 
-    stream
-        .write_all(&ext_msg.to_bytes())
-        .await
-        .map_err(|e| format!("write ext hs: {}", e))?;
+    write_all_timeout(
+        &mut stream,
+        &ext_msg.to_bytes(),
+        peer_timeout,
+        "extended handshake",
+    )
+    .await?;
 
     let peer_ext_hs = read_extended_handshake(&mut stream, peer_timeout).await?;
 
@@ -115,7 +253,7 @@ where
         return Err("peer advertised metadata_size = 0".to_string());
     }
 
-    if metadata_size > 64 * 1024 * 1024 {
+    if metadata_size > max_metadata_size {
         return Err("metadata too large".to_string());
     }
 
@@ -134,10 +272,13 @@ where
             id: ut_metadata_id,
             payload: req,
         };
-        stream
-            .write_all(&req_msg.to_bytes())
-            .await
-            .map_err(|e| format!("write metadata request: {}", e))?;
+        write_all_timeout(
+            &mut stream,
+            &req_msg.to_bytes(),
+            peer_timeout,
+            "metadata request",
+        )
+        .await?;
         requested.insert(next_to_request);
         next_to_request += 1;
         in_flight += 1;
@@ -196,10 +337,13 @@ where
                 id: ut_metadata_id,
                 payload: req,
             };
-            stream
-                .write_all(&req_msg.to_bytes())
-                .await
-                .map_err(|e| format!("write metadata request: {}", e))?;
+            write_all_timeout(
+                &mut stream,
+                &req_msg.to_bytes(),
+                peer_timeout,
+                "metadata request",
+            )
+            .await?;
             requested.insert(next_to_request);
             next_to_request += 1;
             in_flight += 1;
@@ -227,6 +371,21 @@ where
     }
 
     Ok(all_data)
+}
+
+async fn write_all_timeout<S>(
+    stream: &mut S,
+    bytes: &[u8],
+    timeout_dur: Duration,
+    stage: &str,
+) -> Result<(), String>
+where
+    S: AsyncWrite + Unpin,
+{
+    timeout(timeout_dur, stream.write_all(bytes))
+        .await
+        .map_err(|_| format!("{} write timeout", stage))?
+        .map_err(|error| format!("write {}: {}", stage, error))
 }
 
 async fn read_extended_handshake<S>(
@@ -310,6 +469,12 @@ pub struct TorrentInfo {
     pub files: Vec<(String, i64)>,
 }
 
+const MAX_FILE_COUNT: usize = 100_000;
+const MAX_PATH_COMPONENTS: usize = 64;
+const MAX_PATH_COMPONENT_BYTES: usize = 1024;
+const MAX_NAME_BYTES: usize = 4096;
+const MAX_PIECE_LENGTH: i64 = 64 * 1024 * 1024;
+
 pub fn verify_metadata_hash(info_hash: &InfoHash, data: &[u8]) -> bool {
     let mut hasher = Sha1::new();
     hasher.update(data);
@@ -326,34 +491,75 @@ pub fn parse_torrent_info(data: &[u8]) -> Result<TorrentInfo, String> {
         _ => return Err("not a dict".to_string()),
     };
 
-    let name = get_bencode_str(&dict, "name").unwrap_or_else(|| "unknown".to_string());
-    let piece_length = get_bencode_int(&dict, "piece length").unwrap_or(0);
+    let name = get_bencode_preferred_str(&dict, "name.utf-8", "name")
+        .unwrap_or_else(|| "unknown".to_string());
+    if name.len() > MAX_NAME_BYTES {
+        return Err("torrent name exceeds limit".to_string());
+    }
+    let piece_length =
+        get_bencode_int(&dict, "piece length").ok_or_else(|| "missing piece length".to_string())?;
+    if !(1..=MAX_PIECE_LENGTH).contains(&piece_length) {
+        return Err("invalid piece length".to_string());
+    }
+
+    if get_bencode_int(&dict, "meta version").is_some_and(|version| version != 2) {
+        return Err("unsupported torrent meta version".to_string());
+    }
+    if get_bencode_int(&dict, "meta version") == Some(2) && !dict.contains_key(b"pieces".as_slice())
+    {
+        return Err("pure v2 torrents are unsupported".to_string());
+    }
 
     let (total_size, files) =
         if let Some(serde_bencode::value::Value::List(file_list)) = dict.get(b"files".as_slice()) {
             let mut files_out = Vec::new();
             let mut total = 0i64;
+            if file_list.is_empty() || file_list.len() > MAX_FILE_COUNT {
+                return Err("invalid file count".to_string());
+            }
             for file_val in file_list {
-                if let serde_bencode::value::Value::Dict(file_dict) = file_val {
-                    let file_size = get_bencode_int(file_dict, "length").unwrap_or(0);
-                    total += file_size;
-
-                    let mut path_parts = Vec::new();
-                    if let Some(serde_bencode::value::Value::List(parts)) =
-                        file_dict.get(b"path".as_slice())
-                    {
-                        for part in parts {
-                            if let serde_bencode::value::Value::Bytes(b) = part {
-                                path_parts.push(String::from_utf8_lossy(b).to_string());
-                            }
-                        }
-                    }
-                    let file_path = path_parts.join("/");
-                    files_out.push((file_path, file_size));
+                let serde_bencode::value::Value::Dict(file_dict) = file_val else {
+                    return Err("invalid file entry".to_string());
+                };
+                let file_size = get_bencode_int(file_dict, "length")
+                    .ok_or_else(|| "missing file length".to_string())?;
+                if file_size < 0 {
+                    return Err("negative file length".to_string());
                 }
+                total = total
+                    .checked_add(file_size)
+                    .ok_or_else(|| "torrent total size overflow".to_string())?;
+
+                let path_value = file_dict
+                    .get(b"path.utf-8".as_slice())
+                    .or_else(|| file_dict.get(b"path".as_slice()));
+                let Some(serde_bencode::value::Value::List(parts)) = path_value else {
+                    return Err("missing file path".to_string());
+                };
+                if parts.is_empty() || parts.len() > MAX_PATH_COMPONENTS {
+                    return Err("invalid file path component count".to_string());
+                }
+                let mut path_parts = Vec::with_capacity(parts.len());
+                for part in parts {
+                    let serde_bencode::value::Value::Bytes(bytes) = part else {
+                        return Err("invalid file path component".to_string());
+                    };
+                    if bytes.is_empty() || bytes.len() > MAX_PATH_COMPONENT_BYTES {
+                        return Err("invalid file path component length".to_string());
+                    }
+                    let component = String::from_utf8_lossy(bytes).to_string();
+                    if component == "." || component == ".." || component.contains('/') {
+                        return Err("invalid file path component".to_string());
+                    }
+                    path_parts.push(component);
+                }
+                files_out.push((path_parts.join("/"), file_size));
             }
             (total, files_out)
         } else if let Some(length) = get_bencode_int(&dict, "length") {
+            if length < 0 {
+                return Err("negative torrent length".to_string());
+            }
             (length, vec![(name.clone(), length)])
         } else {
             return Err("no files or length in info dict".to_string());
@@ -366,6 +572,14 @@ pub fn parse_torrent_info(data: &[u8]) -> Result<TorrentInfo, String> {
         file_count: files.len() as i64,
         files,
     })
+}
+
+fn get_bencode_preferred_str(
+    dict: &std::collections::HashMap<Vec<u8>, serde_bencode::value::Value>,
+    preferred: &str,
+    fallback: &str,
+) -> Option<String> {
+    get_bencode_str(dict, preferred).or_else(|| get_bencode_str(dict, fallback))
 }
 
 fn get_bencode_str(
@@ -423,240 +637,420 @@ fn filter_peers_for_retry(
         .collect()
 }
 
-fn classify_metadata_failure(error: &str) -> MetadataFailureReason {
-    if error.contains("timeout") {
-        MetadataFailureReason::Timeout
-    } else if error.starts_with("connect") {
-        MetadataFailureReason::Connect
-    } else if error.contains("handshake") {
-        MetadataFailureReason::Handshake
-    } else if error.contains("ut_metadata")
-        || error.contains("metadata_size")
-        || error.contains("extended handshake")
-        || error.contains("extensions")
-    {
-        MetadataFailureReason::Extension
-    } else if error.contains("rejected") {
-        MetadataFailureReason::Rejected
-    } else if error.contains("metadata")
-        || error.contains("piece")
-        || error.contains("frame")
-        || error.contains("bencode")
-    {
-        MetadataFailureReason::Protocol
-    } else {
-        MetadataFailureReason::Other
-    }
-}
-
-fn emit_metadata_failure(
-    stats_tx: &mpsc::UnboundedSender<CrawlStatsEvent>,
-    reason: MetadataFailureReason,
-) {
+fn emit_metadata_failure(stats_tx: &mpsc::Sender<CrawlStatsEvent>, reason: MetadataFailureReason) {
     if stats_tx
-        .send(CrawlStatsEvent::MetadataFetchFailed { reason })
+        .try_send(CrawlStatsEvent::MetadataFetchFailed { reason })
         .is_err()
     {
         tracing::warn!("stats_tx send failed after metadata fetch failure");
     }
 }
 
+fn log_storage_result(
+    operation: &str,
+    result: Result<Result<(), rusqlite::Error>, tokio::task::JoinError>,
+) {
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::warn!("{} failed: {}", operation, error),
+        Err(error) => tracing::warn!("{} worker failed: {}", operation, error),
+    }
+}
+
+struct HashJob {
+    peers: VecDeque<PeerContact>,
+    peer_set: HashSet<std::net::SocketAddrV4>,
+    running: bool,
+    attempt_count: u32,
+}
+
+impl HashJob {
+    fn new(attempt_count: u32) -> Self {
+        Self {
+            peers: VecDeque::new(),
+            peer_set: HashSet::new(),
+            running: false,
+            attempt_count,
+        }
+    }
+
+    fn merge_peers(&mut self, peers: Vec<PeerContact>, limit: usize) -> usize {
+        let mut added = 0;
+        for peer in peers {
+            if self.peers.len() >= limit {
+                break;
+            }
+            if self.peer_set.insert(peer.addr) {
+                self.peers.push_back(peer);
+                added += 1;
+            }
+        }
+        added
+    }
+
+    fn take_round(&mut self, limit: usize) -> Vec<PeerContact> {
+        let mut peers = Vec::new();
+        while peers.len() < limit {
+            let Some(peer) = self.peers.pop_front() else {
+                break;
+            };
+            self.peer_set.remove(&peer.addr);
+            peers.push(peer);
+        }
+        peers
+    }
+}
+
+struct JobOutcome {
+    info_hash: InfoHash,
+    attempts: u32,
+    complete: bool,
+    terminal: bool,
+}
+
+struct FetchRoundConfig {
+    peer_timeout: Duration,
+    retry_after_hours: u32,
+    max_metadata_size: u32,
+    prior_attempt_count: u32,
+}
+
+async fn process_hash_round(
+    info_hash: InfoHash,
+    peers: Vec<PeerContact>,
+    store: Arc<Store>,
+    stats_tx: mpsc::Sender<CrawlStatsEvent>,
+    config: FetchRoundConfig,
+) -> JobOutcome {
+    let hash_hex = hex::encode(info_hash);
+    let filter_store = store.clone();
+    let filtered = tokio::task::spawn_blocking(move || {
+        filter_peers_for_retry(&filter_store, &info_hash, &peers, config.retry_after_hours)
+    })
+    .await
+    .unwrap_or_default();
+    let mut attempts = 0u32;
+    let mut last_error = "no eligible peers".to_string();
+    let mut long_backoff = false;
+
+    for peer in filtered {
+        attempts = attempts.saturating_add(1);
+        let peer_addr = peer.addr.to_string();
+        let attempt_store = store.clone();
+        let attempt_hash = info_hash;
+        let attempt_addr = peer_addr.clone();
+        if tokio::task::spawn_blocking(move || {
+            attempt_store.set_peer_attempt(&attempt_hash, &attempt_addr, None)
+        })
+        .await
+        .is_err()
+        {
+            last_error = "storage worker failed to record peer attempt".to_string();
+            continue;
+        }
+
+        match fetch_from_peer_with_limit(
+            &info_hash,
+            &peer,
+            config.peer_timeout,
+            config.max_metadata_size,
+        )
+        .await
+        {
+            Ok(bytes) if !verify_metadata_hash(&info_hash, &bytes) => {
+                last_error = "metadata hash mismatch".to_string();
+                let failure_store = store.clone();
+                let failure_hash = info_hash;
+                let failure_addr = peer_addr.clone();
+                let recorded = tokio::task::spawn_blocking(move || {
+                    failure_store.set_peer_attempt(
+                        &failure_hash,
+                        &failure_addr,
+                        Some("metadata hash mismatch"),
+                    )
+                })
+                .await;
+                log_storage_result("record metadata hash mismatch", recorded);
+                emit_metadata_failure(&stats_tx, MetadataFailureReason::HashMismatch);
+            }
+            Ok(bytes) => match parse_torrent_info(&bytes) {
+                Ok(info) => {
+                    tracing::info!(
+                        "validated metadata for {} with {} files",
+                        hash_hex,
+                        info.file_count
+                    );
+                    let commit_store = store.clone();
+                    let committed = tokio::task::spawn_blocking(move || {
+                        commit_store.commit_metadata(
+                            &info_hash,
+                            &info.name,
+                            info.piece_length,
+                            info.total_size,
+                            &info.files,
+                        )
+                    })
+                    .await;
+                    match committed {
+                        Ok(Ok(())) => {
+                            if stats_tx.try_send(CrawlStatsEvent::MetadataFetched).is_err() {
+                                tracing::warn!("metadata completion statistic was not accepted");
+                            }
+                            return JobOutcome {
+                                info_hash,
+                                attempts,
+                                complete: true,
+                                terminal: false,
+                            };
+                        }
+                        Ok(Err(error)) => last_error = format!("storage: {}", error),
+                        Err(error) => last_error = format!("storage worker: {}", error),
+                    }
+                }
+                Err(error) => {
+                    let unsupported = error.contains("unsupported");
+                    let status = if unsupported {
+                        "unsupported"
+                    } else {
+                        "invalid"
+                    };
+                    let terminal_store = store.clone();
+                    let terminal_error = error.clone();
+                    let recorded = tokio::task::spawn_blocking(move || {
+                        terminal_store.update_hash_job_failure(
+                            &info_hash,
+                            status,
+                            config.prior_attempt_count.saturating_add(attempts),
+                            0,
+                            &terminal_error,
+                        )
+                    })
+                    .await;
+                    log_storage_result("record terminal metadata state", recorded);
+                    emit_metadata_failure(&stats_tx, MetadataFailureReason::Parse);
+                    return JobOutcome {
+                        info_hash,
+                        attempts,
+                        complete: false,
+                        terminal: true,
+                    };
+                }
+            },
+            Err(error) => {
+                long_backoff |= error.long_backoff();
+                last_error = error.to_string();
+                let reason = error.reason();
+                let failure_store = store.clone();
+                let failure_hash = info_hash;
+                let failure_addr = peer_addr.clone();
+                let failure_text = last_error.clone();
+                let recorded = tokio::task::spawn_blocking(move || {
+                    failure_store.set_peer_attempt(
+                        &failure_hash,
+                        &failure_addr,
+                        Some(&failure_text),
+                    )
+                })
+                .await;
+                log_storage_result("record metadata peer failure", recorded);
+                emit_metadata_failure(&stats_tx, reason);
+            }
+        }
+    }
+
+    let attempt_count = config.prior_attempt_count.saturating_add(attempts);
+    let exponent = attempt_count.min(10);
+    let base = if long_backoff { 900u64 } else { 30u64 };
+    let delay = base.saturating_mul(1u64 << exponent).min(24 * 60 * 60);
+    let jitter = rand::thread_rng().gen_range(0..=(delay / 4).max(1));
+    let next_attempt_at = chrono::Utc::now()
+        .timestamp()
+        .saturating_add(i64::try_from(delay.saturating_add(jitter)).unwrap_or(i64::MAX));
+    let retry_store = store.clone();
+    let retry_error = last_error.clone();
+    let recorded = tokio::task::spawn_blocking(move || {
+        retry_store.update_hash_job_failure(
+            &info_hash,
+            "retry_at",
+            attempt_count,
+            next_attempt_at,
+            &retry_error,
+        )
+    })
+    .await;
+    log_storage_result("schedule metadata retry", recorded);
+    tracing::debug!("metadata round failed for {}: {}", hash_hex, last_error);
+    JobOutcome {
+        info_hash,
+        attempts,
+        complete: false,
+        terminal: false,
+    }
+}
+
+#[cfg(test)]
 fn mark_metadata_complete_and_emit(
     store: &Store,
     info_hash: &InfoHash,
     info: &TorrentInfo,
-    stats_tx: &mpsc::UnboundedSender<CrawlStatsEvent>,
+    stats_tx: &mpsc::Sender<CrawlStatsEvent>,
 ) -> Result<(), rusqlite::Error> {
-    store.mark_metadata_complete(
+    store.commit_metadata(
         info_hash,
         &info.name,
         info.piece_length,
         info.total_size,
-        info.file_count,
+        &info.files,
     )?;
-    if !info.files.is_empty() {
-        store.insert_files(info_hash, &info.files)?;
-    }
-    store.refresh_torrent_fts(info_hash)?;
-    if stats_tx.send(CrawlStatsEvent::MetadataFetched).is_err() {
+    if stats_tx.try_send(CrawlStatsEvent::MetadataFetched).is_err() {
         tracing::warn!("stats_tx send failed after metadata fetch");
     }
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_metadata_fetcher(
-    mut info_hash_rx: mpsc::UnboundedReceiver<(InfoHash, Vec<PeerContact>)>,
+    mut info_hash_rx: mpsc::Receiver<HashDiscovery>,
     store: Arc<Store>,
     max_concurrent: usize,
     peer_timeout_secs: u64,
     retry_after_hours: u32,
-    stats_tx: mpsc::UnboundedSender<CrawlStatsEvent>,
+    max_metadata_size: u32,
+    max_peer_attempts_per_round: usize,
+    max_active_hash_jobs: usize,
+    max_peers_per_hash: usize,
+    stats_tx: mpsc::Sender<CrawlStatsEvent>,
 ) {
-    let max_concurrent = if max_concurrent == 0 {
-        tracing::warn!("run_metadata_fetcher called with max_concurrent=0, clamping to 1");
-        1
-    } else {
-        max_concurrent
-    };
-    let semaphore = Arc::new(Semaphore::new(max_concurrent));
-    let mut workers = JoinSet::new();
+    let mut jobs: HashMap<InfoHash, HashJob> = HashMap::new();
+    let mut ready = VecDeque::new();
+    let mut ready_set = HashSet::new();
+    let mut workers: JoinSet<JobOutcome> = JoinSet::new();
+    let mut retry_tick = tokio::time::interval(Duration::from_secs(30));
 
     loop {
+        while workers.len() < max_concurrent {
+            let Some(info_hash) = ready.pop_front() else {
+                break;
+            };
+            ready_set.remove(&info_hash);
+            let Some(job) = jobs.get_mut(&info_hash) else {
+                continue;
+            };
+            if job.running {
+                continue;
+            }
+            let peers = job.take_round(max_peer_attempts_per_round);
+            if peers.is_empty() {
+                continue;
+            }
+            job.running = true;
+            let round_store = store.clone();
+            let round_stats = stats_tx.clone();
+            let round_config = FetchRoundConfig {
+                peer_timeout: Duration::from_secs(peer_timeout_secs),
+                retry_after_hours,
+                max_metadata_size,
+                prior_attempt_count: job.attempt_count,
+            };
+            workers.spawn(process_hash_round(
+                info_hash,
+                peers,
+                round_store,
+                round_stats,
+                round_config,
+            ));
+        }
+
         tokio::select! {
             message = info_hash_rx.recv() => {
-                let Some((info_hash, peers)) = message else {
+                let Some(discovery) = message else {
                     break;
                 };
-                let permit = match semaphore.clone().acquire_owned().await {
-                    Ok(p) => p,
-                    Err(_) => {
-                        tracing::warn!("metadata semaphore closed, shutting down fetcher");
-                        break;
+                let info_hash = discovery.info_hash;
+                let peers = discovery.peers;
+                let has_peers = !peers.is_empty();
+                let source = discovery.source;
+                let persist_store = store.clone();
+                let durable_peers = peers.clone();
+                let persistence = tokio::task::spawn_blocking(move || {
+                    persist_store.persist_hash_discovery(
+                        &info_hash,
+                        source.as_str(),
+                        has_peers,
+                    )?;
+                    persist_store.persist_hash_job_peers(
+                        &info_hash,
+                        &durable_peers,
+                        max_peers_per_hash,
+                    )
+                }).await;
+                if !matches!(persistence, Ok(Ok(()))) {
+                    tracing::warn!("failed to persist discovery for {}", hex::encode(info_hash));
+                }
+                if !jobs.contains_key(&info_hash) && jobs.len() >= max_active_hash_jobs {
+                    if stats_tx
+                        .try_send(CrawlStatsEvent::DiscoveryBackpressure)
+                        .is_err()
+                    {
+                        tracing::warn!("metadata backpressure statistic was not accepted");
                     }
-                };
-                let store = store.clone();
-                let stats_tx = stats_tx.clone();
-                let peer_timeout = Duration::from_secs(peer_timeout_secs);
-
-                workers.spawn(async move {
-                    let _permit = permit;
-
-                    let hash_hex = hex::encode(info_hash);
-
-                    match store.get_torrent(&info_hash) {
-                        Ok(Some(record)) => {
-                            if record.metadata_complete {
-                                return;
-                            }
+                    continue;
+                }
+                let job = jobs.entry(info_hash).or_insert_with(|| HashJob::new(0));
+                let added = job.merge_peers(peers, max_peers_per_hash);
+                if added > 0 && !job.running && ready_set.insert(info_hash) {
+                    ready.push_back(info_hash);
+                }
+            }
+            _ = retry_tick.tick() => {
+                let due_store = store.clone();
+                let due = tokio::task::spawn_blocking(move || {
+                    let records = due_store.due_hash_jobs(max_active_hash_jobs)?;
+                    let mut loaded = Vec::with_capacity(records.len());
+                    for record in records {
+                        let peers = due_store.hash_job_peers(&record.info_hash, max_peers_per_hash)?;
+                        loaded.push((record, peers));
+                    }
+                    Ok::<_, rusqlite::Error>(loaded)
+                }).await;
+                if let Ok(Ok(records)) = due {
+                    for (record, peers) in records {
+                        if jobs.len() >= max_active_hash_jobs && !jobs.contains_key(&record.info_hash) {
+                            break;
                         }
-                        Ok(None) => {}
-                        Err(e) => {
-                            tracing::warn!(
-                                "get_torrent database error for {}: {}, skipping",
-                                hash_hex,
-                                e
-                            );
-                            return;
-                        }
-                    }
-
-                    if let Err(e) = store.upsert_torrent(info_hash, None, 0, 0, "dht") {
-                        tracing::warn!("failed to upsert torrent sighting for {}: {}", hash_hex, e);
-                    }
-                    tracing::info!("saw info_hash: {} with {} peers", hash_hex, peers.len());
-
-                    if peers.is_empty() {
-                        return;
-                    }
-
-                    let peers = filter_peers_for_retry(&store, &info_hash, &peers, retry_after_hours);
-                    if peers.is_empty() {
-                        return;
-                    }
-
-                    for peer in &peers {
-                        let peer_addr = peer.addr.to_string();
-                        if let Err(e) = store.set_peer_attempt(&info_hash, &peer_addr, None) {
-                            tracing::warn!(
-                                "failed to set peer attempt for {} from {}: {}",
-                                hash_hex,
-                                peer_addr,
-                                e
-                            );
-                            continue;
-                        }
-                        match fetch_from_peer(&info_hash, peer, peer_timeout).await {
-                            Ok(metadata_bytes) => {
-                                if !verify_metadata_hash(&info_hash, &metadata_bytes) {
-                                    tracing::warn!(
-                                        "metadata hash mismatch for {}: got {} bytes that don't match info_hash",
-                                        hash_hex, metadata_bytes.len()
-                                    );
-                                    if let Err(e) = store.set_peer_attempt(
-                                        &info_hash,
-                                        &peer_addr,
-                                        Some("metadata hash mismatch"),
-                                    ) {
-                                        tracing::warn!(
-                                            "failed to record peer failure for {} from {}: {}",
-                                            hash_hex,
-                                            peer_addr,
-                                            e
-                                        );
-                                    }
-                                    emit_metadata_failure(
-                                        &stats_tx,
-                                        MetadataFailureReason::HashMismatch,
-                                    );
-                                } else {
-                                    match parse_torrent_info(&metadata_bytes) {
-                                        Ok(info) => {
-                                            tracing::info!(
-                                                "got metadata for {}: name={}, size={}, files={}",
-                                                hash_hex,
-                                                info.name,
-                                                info.total_size,
-                                                info.file_count
-                                            );
-                                            if let Err(e) = mark_metadata_complete_and_emit(
-                                                &store, &info_hash, &info, &stats_tx,
-                                            ) {
-                                                tracing::warn!("failed to mark metadata complete: {}", e);
-                                            }
-                                            return;
-                                        }
-                                        Err(e) => {
-                                            tracing::debug!(
-                                                "parse_torrent_info failed for {}: {}",
-                                                hash_hex,
-                                                e
-                                            );
-                                            if let Err(db_err) = store.set_peer_attempt(
-                                                &info_hash,
-                                                &peer_addr,
-                                                Some(&e),
-                                            ) {
-                                                tracing::warn!(
-                                                    "failed to record peer failure for {} from {}: {}",
-                                                    hash_hex,
-                                                    peer_addr,
-                                                    db_err
-                                                );
-                                            }
-                                            emit_metadata_failure(
-                                                &stats_tx,
-                                                MetadataFailureReason::Parse,
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                tracing::debug!("fetch_from_peer failed for {}: {}", hash_hex, e);
-                                if let Err(db_err) =
-                                    store.set_peer_attempt(&info_hash, &peer_addr, Some(&e))
-                                {
-                                    tracing::warn!(
-                                        "failed to record peer failure for {} from {}: {}",
-                                        hash_hex,
-                                        peer_addr,
-                                        db_err
-                                    );
-                                }
-                                emit_metadata_failure(&stats_tx, classify_metadata_failure(&e));
-                            }
+                        tracing::debug!(
+                            "restoring {} metadata job {} after {:?}",
+                            record.status,
+                            hex::encode(record.info_hash),
+                            (record.next_attempt_at, record.last_failure)
+                        );
+                        let job = jobs
+                            .entry(record.info_hash)
+                            .or_insert_with(|| HashJob::new(record.attempt_count));
+                        job.attempt_count = job.attempt_count.max(record.attempt_count);
+                        let added = job.merge_peers(peers, max_peers_per_hash);
+                        if added > 0 && !job.running && ready_set.insert(record.info_hash) {
+                            ready.push_back(record.info_hash);
                         }
                     }
-                    tracing::info!(
-                        "failed to fetch metadata for {} from {} peers",
-                        hash_hex,
-                        peers.len()
-                    );
-                });
+                }
             }
             result = workers.join_next(), if !workers.is_empty() => {
-                if let Some(Err(e)) = result {
-                    tracing::warn!("metadata worker join error: {}", e);
+                match result {
+                    Some(Ok(outcome)) => {
+                        if outcome.complete || outcome.terminal {
+                            jobs.remove(&outcome.info_hash);
+                            ready_set.remove(&outcome.info_hash);
+                        } else if let Some(job) = jobs.get_mut(&outcome.info_hash) {
+                            job.running = false;
+                            job.attempt_count = job.attempt_count.saturating_add(outcome.attempts);
+                            if !job.peers.is_empty() && ready_set.insert(outcome.info_hash) {
+                                ready.push_back(outcome.info_hash);
+                            }
+                        }
+                    }
+                    Some(Err(error)) => tracing::warn!("metadata worker join error: {}", error),
+                    None => {}
                 }
             }
         }
@@ -699,7 +1093,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fetch_from_stream_success() {
-        let info_dict = b"d6:lengthi42e4:name8:test.txte";
+        let info_dict = b"d6:lengthi42e4:name8:test.txt12:piece lengthi16384ee";
         let info_hash: InfoHash = {
             let mut hasher = Sha1::new();
             hasher.update(info_dict);
@@ -1147,7 +1541,7 @@ mod tests {
             file_count: 1,
             files: vec![("test".to_string(), 42)],
         };
-        let (stats_tx, mut stats_rx) = mpsc::unbounded_channel();
+        let (stats_tx, mut stats_rx) = mpsc::channel(8);
 
         mark_metadata_complete_and_emit(&store, &info_hash, &info, &stats_tx).unwrap();
 
@@ -1180,7 +1574,7 @@ mod tests {
             file_count: 1,
             files: vec![("test".to_string(), 42)],
         };
-        let (stats_tx, mut stats_rx) = mpsc::unbounded_channel();
+        let (stats_tx, mut stats_rx) = mpsc::channel(8);
 
         let result = mark_metadata_complete_and_emit(&store, &info_hash, &info, &stats_tx);
 

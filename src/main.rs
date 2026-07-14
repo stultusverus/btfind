@@ -105,7 +105,17 @@ fn main() {
         .init();
 
     let cli = Cli::parse();
-    let config = config::Config::load();
+    let config = match config::Config::load() {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("configuration error: {}", error);
+            std::process::exit(2);
+        }
+    };
+    if let Err(error) = config.validate() {
+        eprintln!("invalid configuration: {}", error);
+        std::process::exit(2);
+    }
 
     let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
     rt.block_on(async {
@@ -152,12 +162,10 @@ async fn cmd_run(
 
     let port = port.unwrap_or(config.network.port);
     let max_concurrent = max_concurrent.unwrap_or(config.metadata.max_concurrent);
-    let max_concurrent = if max_concurrent == 0 {
-        tracing::warn!("max_concurrent is 0, clamping to 1");
-        1
-    } else {
-        max_concurrent
-    };
+    if !(1..=4096).contains(&max_concurrent) {
+        tracing::error!("--max-concurrent must be between 1 and 4096");
+        return;
+    }
     let addr: SocketAddrV4 = format!("0.0.0.0:{}", port)
         .parse()
         .expect("0.0.0.0:<port> should parse to a valid IPv4 address");
@@ -170,18 +178,45 @@ async fn cmd_run(
     tracing::info!("bound to {}", addr);
 
     let (info_hash_tx, info_hash_rx) =
-        mpsc::unbounded_channel::<(types::InfoHash, Vec<types::PeerContact>)>();
-    let (stats_tx, stats_rx) = mpsc::unbounded_channel::<types::CrawlStatsEvent>();
+        mpsc::channel::<types::HashDiscovery>(config.crawl.info_hash_channel_capacity);
+    let (stats_tx, stats_rx) =
+        mpsc::channel::<types::CrawlStatsEvent>(config.crawl.stats_channel_capacity);
 
     let get_peers_interval = Duration::from_secs(config.crawl.get_peers_interval_secs);
     let bucket_refresh = Duration::from_secs(config.crawl.bucket_refresh_mins * 60);
 
     let bootstrap_nodes = config.network.bootstrap_nodes.clone();
-    let mut crawler = dht::DhtCrawler::new(
+    let node_id = match store.load_or_create_node_id() {
+        Ok(node_id) => node_id,
+        Err(error) => {
+            tracing::error!("failed to load stable DHT node identity: {}", error);
+            return;
+        }
+    };
+    let dht_config = dht::DhtConfig {
+        max_pending_rpcs: config.crawl.max_pending_rpcs,
+        max_discovery_hashes: config.crawl.max_discovery_hashes,
+        max_candidate_nodes: config.crawl.max_candidate_nodes,
+        max_peers_per_hash: config.metadata.max_peers_per_hash,
+        rpc_timeout: Duration::from_secs(config.crawl.rpc_timeout_secs),
+        sampling_enabled: config.crawl.sampling_enabled,
+        sampling_interval: Duration::from_secs(config.crawl.sampling_interval_secs),
+        sampling_min_remote_interval: Duration::from_secs(
+            config.crawl.sampling_min_remote_interval_secs,
+        ),
+        sampling_requests_per_tick: config.crawl.sampling_requests_per_tick,
+        max_samples_per_response: config.crawl.max_samples_per_response,
+        announced_peer_hash_capacity: config.crawl.announced_peer_hash_capacity,
+        announced_peers_per_hash: config.crawl.announced_peers_per_hash,
+        announced_peer_ttl: Duration::from_secs(config.crawl.announced_peer_ttl_secs),
+    };
+    let mut crawler = dht::DhtCrawler::with_config(
+        node_id,
         socket.clone(),
         info_hash_tx,
         stats_tx.clone(),
         bootstrap_nodes,
+        dht_config,
     );
     let resumed_hashes = crawler.seed_info_hashes(resume_state.info_hashes);
     let resumed_nodes = crawler.seed_nodes(resume_state.dht_nodes);
@@ -204,6 +239,10 @@ async fn cmd_run(
     let store_clone = store.clone();
     let peer_timeout = config.metadata.peer_timeout_secs;
     let retry_after_hours = config.metadata.retry_after_hours;
+    let max_metadata_size = config.metadata.max_metadata_size_bytes;
+    let max_peer_attempts_per_round = config.metadata.max_peer_attempts_per_round;
+    let max_active_hash_jobs = config.metadata.max_active_hash_jobs;
+    let max_peers_per_hash = config.metadata.max_peers_per_hash;
     let fetcher_handle = tokio::spawn(async move {
         metadata::run_metadata_fetcher(
             info_hash_rx,
@@ -211,6 +250,10 @@ async fn cmd_run(
             max_concurrent,
             peer_timeout,
             retry_after_hours,
+            max_metadata_size,
+            max_peer_attempts_per_round,
+            max_active_hash_jobs,
+            max_peers_per_hash,
             stats_tx,
         )
         .await;
@@ -233,7 +276,7 @@ async fn cmd_run(
         crawler_handle,
         fetcher_handle,
         stats_handle,
-        Duration::from_secs(5),
+        Duration::from_secs(config.crawl.shutdown_drain_secs),
     )
     .await;
 }
@@ -263,13 +306,22 @@ impl RuntimeStats {
             }
             types::CrawlStatsEvent::DhtNodeSeen { .. } => {}
             types::CrawlStatsEvent::MetadataFetchFailed { .. } => {}
+            types::CrawlStatsEvent::RpcAnswered
+            | types::CrawlStatsEvent::RpcTimedOut
+            | types::CrawlStatsEvent::RpcMalformed
+            | types::CrawlStatsEvent::RpcUnsolicited
+            | types::CrawlStatsEvent::RpcUnexpectedSource
+            | types::CrawlStatsEvent::DiscoveryBackpressure
+            | types::CrawlStatsEvent::SamplingResponse { .. }
+            | types::CrawlStatsEvent::SampleObserved { .. }
+            | types::CrawlStatsEvent::HashObserved { .. } => {}
         }
     }
 }
 
 async fn run_stats_persistence(
     store: Arc<store::Store>,
-    mut stats_rx: mpsc::UnboundedReceiver<types::CrawlStatsEvent>,
+    mut stats_rx: mpsc::Receiver<types::CrawlStatsEvent>,
 ) {
     let mut stats = RuntimeStats::default();
     while let Some(event) = stats_rx.recv().await {
@@ -282,26 +334,58 @@ async fn run_stats_persistence(
             types::CrawlStatsEvent::DhtNodeSeen { id, addr } => Some((id, addr)),
             _ => None,
         };
+        let sample = match event {
+            types::CrawlStatsEvent::SampleObserved {
+                info_hash,
+                node_id,
+                addr,
+                sweep_id,
+            } => Some((info_hash, node_id, addr, sweep_id)),
+            _ => None,
+        };
+        let observed_hash = match event {
+            types::CrawlStatsEvent::HashObserved {
+                info_hash,
+                source,
+                has_peers,
+            } => Some((info_hash, source, has_peers)),
+            _ => None,
+        };
         stats.apply(event);
-        if let Some(reason) = failure_reason {
-            if let Err(e) = store.increment_metadata_failure(reason.as_str()) {
-                tracing::warn!("failed to persist metadata failure count: {}", e);
+        let persistence_store = store.clone();
+        let nodes_known = stats.nodes_known;
+        let queries_sent = stats.queries_sent;
+        let info_hashes_found = stats.info_hashes_found;
+        let metadata_fetched = stats.metadata_fetched;
+        let persisted = tokio::task::spawn_blocking(move || -> Result<(), rusqlite::Error> {
+            if let Some(reason) = failure_reason {
+                persistence_store.increment_metadata_failure(reason.as_str())?;
             }
-        }
-        if let Some((id, addr)) = dht_node {
-            if let Err(e) = store.upsert_dht_node(&id, addr) {
-                tracing::warn!("failed to persist DHT node: {}", e);
+            if let Some((id, addr)) = dht_node {
+                persistence_store.upsert_dht_node(&id, addr)?;
             }
-        }
-        if should_persist {
-            if let Err(e) = store.insert_crawl_stat(
-                stats.nodes_known,
-                stats.queries_sent,
-                stats.info_hashes_found,
-                stats.metadata_fetched,
-            ) {
-                tracing::warn!("failed to persist crawl stats: {}", e);
+            if let Some((info_hash, node_id, addr, sweep_id)) = sample {
+                persistence_store
+                    .record_sample_observation(&info_hash, &node_id, addr, sweep_id)?;
             }
+            if let Some((info_hash, source, has_peers)) = observed_hash {
+                persistence_store.persist_hash_discovery(&info_hash, source.as_str(), has_peers)?;
+            }
+            if should_persist {
+                persistence_store.insert_crawl_stat(
+                    nodes_known,
+                    queries_sent,
+                    info_hashes_found,
+                    metadata_fetched,
+                )?;
+            }
+            Ok(())
+        })
+        .await;
+        match persisted {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => tracing::warn!("failed to persist runtime event: {}", error),
+            Err(error) => tracing::warn!("storage worker join error: {}", error),
         }
     }
 }
@@ -329,15 +413,25 @@ async fn join_aborted_task(name: &str, handle: JoinHandle<()>) -> bool {
 
 async fn shutdown_tasks(
     crawler_handle: JoinHandle<()>,
-    fetcher_handle: JoinHandle<()>,
+    mut fetcher_handle: JoinHandle<()>,
     mut stats_handle: JoinHandle<()>,
     stats_timeout: Duration,
 ) -> ShutdownReport {
     crawler_handle.abort();
-    fetcher_handle.abort();
-
     let crawler_join_error = join_aborted_task("crawler", crawler_handle).await;
-    let fetcher_join_error = join_aborted_task("metadata fetcher", fetcher_handle).await;
+    let fetcher_join_error = match tokio::time::timeout(stats_timeout, &mut fetcher_handle).await {
+        Ok(Ok(())) => false,
+        Ok(Err(error)) if error.is_cancelled() => false,
+        Ok(Err(error)) => {
+            tracing::warn!("metadata fetcher task join error: {}", error);
+            true
+        }
+        Err(_) => {
+            tracing::warn!("metadata fetcher did not drain within {:?}", stats_timeout);
+            fetcher_handle.abort();
+            join_aborted_task("metadata fetcher", fetcher_handle).await
+        }
+    };
 
     let mut report = ShutdownReport {
         crawler_join_error,
@@ -794,32 +888,32 @@ mod integration_tests {
     #[tokio::test]
     async fn test_stats_persistence_writes_snapshot_with_metadata_count() {
         let store = Arc::new(store::Store::open_in_memory().unwrap());
-        let (stats_tx, stats_rx) = mpsc::unbounded_channel();
+        let (stats_tx, stats_rx) = mpsc::channel(8);
         let handle = tokio::spawn(run_stats_persistence(store.clone(), stats_rx));
 
         stats_tx
-            .send(types::CrawlStatsEvent::MetadataFetched)
+            .try_send(types::CrawlStatsEvent::MetadataFetched)
             .unwrap();
         stats_tx
-            .send(types::CrawlStatsEvent::MetadataFetched)
+            .try_send(types::CrawlStatsEvent::MetadataFetched)
             .unwrap();
         stats_tx
-            .send(types::CrawlStatsEvent::MetadataFetchFailed {
+            .try_send(types::CrawlStatsEvent::MetadataFetchFailed {
                 reason: types::MetadataFailureReason::Connect,
             })
             .unwrap();
         stats_tx
-            .send(types::CrawlStatsEvent::MetadataFetchFailed {
+            .try_send(types::CrawlStatsEvent::MetadataFetchFailed {
                 reason: types::MetadataFailureReason::Connect,
             })
             .unwrap();
         stats_tx
-            .send(types::CrawlStatsEvent::MetadataFetchFailed {
+            .try_send(types::CrawlStatsEvent::MetadataFetchFailed {
                 reason: types::MetadataFailureReason::Timeout,
             })
             .unwrap();
         stats_tx
-            .send(types::CrawlStatsEvent::DhtSnapshot {
+            .try_send(types::CrawlStatsEvent::DhtSnapshot {
                 nodes_known: 12,
                 queries_sent: 34,
                 info_hashes_found: 5,

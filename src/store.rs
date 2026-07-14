@@ -6,6 +6,8 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+const CURRENT_SCHEMA_VERSION: i64 = 4;
+
 #[derive(Debug)]
 pub struct TorrentRecord {
     pub info_hash: InfoHash,
@@ -50,6 +52,15 @@ pub struct CrawlStatRecord {
 pub struct MetadataFailureCount {
     pub reason: String,
     pub count: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct HashJobRecord {
+    pub info_hash: InfoHash,
+    pub status: String,
+    pub attempt_count: u32,
+    pub next_attempt_at: i64,
+    pub last_failure: Option<String>,
 }
 
 pub struct Store {
@@ -97,7 +108,33 @@ impl Store {
     }
 
     fn init_schema(&self) -> Result<(), rusqlite::Error> {
-        let conn = self.conn.lock().expect("store connection mutex poisoned");
+        let mut conn = self.conn.lock().expect("store connection mutex poisoned");
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version > CURRENT_SCHEMA_VERSION {
+            return Err(rusqlite::Error::InvalidParameterName(format!(
+                "database schema version {} is newer than supported version {}",
+                version, CURRENT_SCHEMA_VERSION
+            )));
+        }
+
+        for target in (version + 1)..=CURRENT_SCHEMA_VERSION {
+            let tx = conn.transaction()?;
+            match target {
+                1 => Self::migration_1(&tx)?,
+                2 => Self::migration_2(&tx)?,
+                3 => Self::migration_3(&tx)?,
+                4 => Self::migration_4(&tx)?,
+                _ => unreachable!("migration target is bounded by CURRENT_SCHEMA_VERSION"),
+            }
+            tx.pragma_update(None, "user_version", target)?;
+            tx.commit()?;
+        }
+        Ok(())
+    }
+
+    fn migration_1(conn: &Connection) -> Result<(), rusqlite::Error> {
         conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS torrents (
@@ -164,9 +201,6 @@ impl Store {
                 paths,
                 tokenize = 'trigram'
             );
-
-            PRAGMA journal_mode=WAL;
-            PRAGMA foreign_keys=ON;
             ",
         )?;
 
@@ -193,6 +227,69 @@ impl Store {
         Ok(())
     }
 
+    fn migration_2(conn: &Connection) -> Result<(), rusqlite::Error> {
+        conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS hash_jobs (
+                info_hash             TEXT PRIMARY KEY REFERENCES torrents(info_hash) ON DELETE CASCADE,
+                status                TEXT NOT NULL DEFAULT 'queued',
+                attempt_count         INTEGER NOT NULL DEFAULT 0,
+                next_attempt_at       INTEGER NOT NULL DEFAULT 0,
+                last_failure          TEXT,
+                last_success_at       INTEGER,
+                last_new_peer_at      INTEGER,
+                discovery_sources     TEXT NOT NULL DEFAULT '',
+                updated_at            INTEGER NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS sample_observations (
+                info_hash        TEXT PRIMARY KEY REFERENCES torrents(info_hash) ON DELETE CASCADE,
+                first_seen       INTEGER NOT NULL,
+                last_seen        INTEGER NOT NULL,
+                sample_count     INTEGER NOT NULL DEFAULT 1,
+                sampling_node_id TEXT,
+                sampling_addr    TEXT,
+                sweep_id         INTEGER
+            );
+
+            CREATE TABLE IF NOT EXISTS app_state (
+                key   TEXT PRIMARY KEY,
+                value BLOB NOT NULL
+            );
+            ",
+        )?;
+        Ok(())
+    }
+
+    fn migration_3(conn: &Connection) -> Result<(), rusqlite::Error> {
+        conn.execute_batch(
+            "
+            CREATE INDEX IF NOT EXISTS idx_hash_jobs_schedule
+                ON hash_jobs(status, next_attempt_at);
+            CREATE INDEX IF NOT EXISTS idx_sample_observations_last_seen
+                ON sample_observations(last_seen);
+            ",
+        )?;
+        Ok(())
+    }
+
+    fn migration_4(conn: &Connection) -> Result<(), rusqlite::Error> {
+        conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS hash_job_peers (
+                info_hash TEXT NOT NULL REFERENCES torrents(info_hash) ON DELETE CASCADE,
+                peer_addr TEXT NOT NULL,
+                last_seen INTEGER NOT NULL,
+                PRIMARY KEY (info_hash, peer_addr)
+            );
+            CREATE INDEX IF NOT EXISTS idx_hash_job_peers_seen
+                ON hash_job_peers(info_hash, last_seen DESC);
+            ",
+        )?;
+        Ok(())
+    }
+
+    #[allow(dead_code)]
     pub fn upsert_torrent(
         &self,
         info_hash: InfoHash,
@@ -254,6 +351,7 @@ impl Store {
         Ok(rowid)
     }
 
+    #[allow(dead_code)]
     pub fn mark_metadata_complete(
         &self,
         info_hash: &InfoHash,
@@ -276,6 +374,65 @@ impl Store {
         Ok(())
     }
 
+    pub fn commit_metadata(
+        &self,
+        info_hash: &InfoHash,
+        name: &str,
+        piece_length: i64,
+        total_size: i64,
+        files: &[(String, i64)],
+    ) -> Result<(), rusqlite::Error> {
+        let mut conn = self.conn.lock().expect("store connection mutex poisoned");
+        let tx = conn.transaction()?;
+        let hash_hex = hex::encode(info_hash);
+        let now = chrono::Utc::now().timestamp();
+        let file_count = i64::try_from(files.len())
+            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, i64::MAX))?;
+
+        tx.execute(
+            "INSERT INTO torrents (
+                info_hash, name, piece_length, total_size, file_count, source,
+                first_seen, last_seen, last_attempt, metadata_complete
+             ) VALUES (?1, ?2, ?3, ?4, ?5, 'dht', ?6, ?6, ?6, 1)
+             ON CONFLICT(info_hash) DO UPDATE SET
+                name = excluded.name,
+                piece_length = excluded.piece_length,
+                total_size = excluded.total_size,
+                file_count = excluded.file_count,
+                last_seen = excluded.last_seen,
+                metadata_complete = 1",
+            params![hash_hex, name, piece_length, total_size, file_count, now],
+        )?;
+        tx.execute("DELETE FROM files WHERE torrent_id = ?1", params![hash_hex])?;
+        {
+            let mut stmt =
+                tx.prepare("INSERT INTO files (torrent_id, path, size) VALUES (?1, ?2, ?3)")?;
+            for (path, size) in files {
+                if path.is_empty() || *size < 0 {
+                    return Err(rusqlite::Error::InvalidParameterName(
+                        "metadata files require a non-empty path and non-negative size".to_string(),
+                    ));
+                }
+                stmt.execute(params![hash_hex, path, size])?;
+            }
+        }
+        Self::refresh_torrent_fts_locked(&tx, &hash_hex)?;
+        tx.execute(
+            "INSERT INTO hash_jobs (
+                info_hash, status, last_success_at, updated_at
+             ) VALUES (?1, 'complete', ?2, ?2)
+             ON CONFLICT(info_hash) DO UPDATE SET
+                status = 'complete',
+                last_failure = NULL,
+                last_success_at = excluded.last_success_at,
+                updated_at = excluded.updated_at",
+            params![hash_hex, now],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    #[allow(dead_code)]
     pub fn insert_files(
         &self,
         info_hash: &InfoHash,
@@ -300,6 +457,7 @@ impl Store {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn get_torrent(
         &self,
         info_hash: &InfoHash,
@@ -603,6 +761,223 @@ impl Store {
         Ok(hashes)
     }
 
+    pub fn persist_hash_discovery(
+        &self,
+        info_hash: &InfoHash,
+        source: &str,
+        has_new_peers: bool,
+    ) -> Result<(), rusqlite::Error> {
+        let mut conn = self.conn.lock().expect("store connection mutex poisoned");
+        let tx = conn.transaction()?;
+        let hash_hex = hex::encode(info_hash);
+        let now = chrono::Utc::now().timestamp();
+        tx.execute(
+            "INSERT INTO torrents (
+                info_hash, source, first_seen, last_seen, metadata_complete
+             ) VALUES (?1, ?2, ?3, ?3, 0)
+             ON CONFLICT(info_hash) DO UPDATE SET
+                source = excluded.source,
+                last_seen = excluded.last_seen",
+            params![hash_hex, source, now],
+        )?;
+        tx.execute(
+            "INSERT INTO hash_jobs (
+                info_hash, status, last_new_peer_at, discovery_sources, updated_at
+             ) VALUES (?1, 'queued', ?2, ?3, ?4)
+             ON CONFLICT(info_hash) DO UPDATE SET
+                status = CASE
+                    WHEN hash_jobs.status IN ('complete', 'invalid', 'unsupported')
+                    THEN hash_jobs.status
+                    ELSE 'queued'
+                END,
+                next_attempt_at = CASE WHEN ?2 IS NOT NULL THEN 0 ELSE hash_jobs.next_attempt_at END,
+                last_new_peer_at = COALESCE(?2, hash_jobs.last_new_peer_at),
+                discovery_sources = CASE
+                    WHEN instr(',' || hash_jobs.discovery_sources || ',', ',' || ?3 || ',') > 0
+                    THEN hash_jobs.discovery_sources
+                    WHEN hash_jobs.discovery_sources = '' THEN ?3
+                    ELSE hash_jobs.discovery_sources || ',' || ?3
+                END,
+                updated_at = excluded.updated_at",
+            params![hash_hex, has_new_peers.then_some(now), source, now],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn update_hash_job_failure(
+        &self,
+        info_hash: &InfoHash,
+        status: &str,
+        attempt_count: u32,
+        next_attempt_at: i64,
+        failure: &str,
+    ) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock().expect("store connection mutex poisoned");
+        conn.execute(
+            "UPDATE hash_jobs SET
+                status = ?2,
+                attempt_count = ?3,
+                next_attempt_at = ?4,
+                last_failure = ?5,
+                updated_at = unixepoch()
+             WHERE info_hash = ?1",
+            params![
+                hex::encode(info_hash),
+                status,
+                i64::from(attempt_count),
+                next_attempt_at,
+                failure
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn persist_hash_job_peers(
+        &self,
+        info_hash: &InfoHash,
+        peers: &[crate::types::PeerContact],
+        limit: usize,
+    ) -> Result<(), rusqlite::Error> {
+        if peers.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn.lock().expect("store connection mutex poisoned");
+        let tx = conn.transaction()?;
+        let hash_hex = hex::encode(info_hash);
+        let now = chrono::Utc::now().timestamp();
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO hash_job_peers (info_hash, peer_addr, last_seen)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(info_hash, peer_addr) DO UPDATE SET last_seen = excluded.last_seen",
+            )?;
+            for peer in peers.iter().take(limit) {
+                stmt.execute(params![hash_hex, peer.addr.to_string(), now])?;
+            }
+        }
+        tx.execute(
+            "DELETE FROM hash_job_peers
+             WHERE info_hash = ?1 AND peer_addr NOT IN (
+                 SELECT peer_addr FROM hash_job_peers
+                 WHERE info_hash = ?1
+                 ORDER BY last_seen DESC
+                 LIMIT ?2
+             )",
+            params![hash_hex, limit as i64],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn hash_job_peers(
+        &self,
+        info_hash: &InfoHash,
+        limit: usize,
+    ) -> Result<Vec<crate::types::PeerContact>, rusqlite::Error> {
+        let conn = self.conn.lock().expect("store connection mutex poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT peer_addr FROM hash_job_peers
+             WHERE info_hash = ?1
+             ORDER BY last_seen DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![hex::encode(info_hash), limit as i64], |row| {
+            let address: String = row.get(0)?;
+            let addr = address.parse::<SocketAddrV4>().map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+            Ok(crate::types::PeerContact { addr })
+        })?;
+        rows.collect()
+    }
+
+    pub fn due_hash_jobs(&self, limit: usize) -> Result<Vec<HashJobRecord>, rusqlite::Error> {
+        let conn = self.conn.lock().expect("store connection mutex poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT info_hash, status, attempt_count, next_attempt_at, last_failure
+             FROM hash_jobs
+             WHERE status IN ('queued', 'retry_at') AND next_attempt_at <= unixepoch()
+             ORDER BY next_attempt_at, updated_at
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |row| {
+            let hash_hex: String = row.get(0)?;
+            let attempt_count: i64 = row.get(2)?;
+            Ok(HashJobRecord {
+                info_hash: info_hash_from_db_hex(&hash_hex)?,
+                status: row.get(1)?,
+                attempt_count: u32::try_from(attempt_count).unwrap_or(u32::MAX),
+                next_attempt_at: row.get(3)?,
+                last_failure: row.get(4)?,
+            })
+        })?;
+        rows.collect()
+    }
+
+    pub fn record_sample_observation(
+        &self,
+        info_hash: &InfoHash,
+        sampling_node_id: &NodeId,
+        sampling_addr: SocketAddrV4,
+        sweep_id: u64,
+    ) -> Result<(), rusqlite::Error> {
+        self.persist_hash_discovery(info_hash, "sample_infohashes", false)?;
+        let conn = self.conn.lock().expect("store connection mutex poisoned");
+        let now = chrono::Utc::now().timestamp();
+        conn.execute(
+            "INSERT INTO sample_observations (
+                info_hash, first_seen, last_seen, sampling_node_id, sampling_addr, sweep_id
+             ) VALUES (?1, ?2, ?2, ?3, ?4, ?5)
+             ON CONFLICT(info_hash) DO UPDATE SET
+                last_seen = excluded.last_seen,
+                sample_count = sample_count + 1,
+                sampling_node_id = excluded.sampling_node_id,
+                sampling_addr = excluded.sampling_addr,
+                sweep_id = excluded.sweep_id",
+            params![
+                hex::encode(info_hash),
+                now,
+                hex::encode(sampling_node_id),
+                sampling_addr.to_string(),
+                i64::try_from(sweep_id).unwrap_or(i64::MAX)
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_or_create_node_id(&self) -> Result<NodeId, rusqlite::Error> {
+        let conn = self.conn.lock().expect("store connection mutex poisoned");
+        let existing = conn.query_row(
+            "SELECT value FROM app_state WHERE key = 'node_id'",
+            [],
+            |row| row.get::<_, Vec<u8>>(0),
+        );
+        match existing {
+            Ok(bytes) if bytes.len() == crate::types::NODE_ID_LEN => {
+                let mut id = [0u8; crate::types::NODE_ID_LEN];
+                id.copy_from_slice(&bytes);
+                Ok(id)
+            }
+            Ok(_) => Err(rusqlite::Error::InvalidParameterName(
+                "stored node_id has an invalid length".to_string(),
+            )),
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                let id = crate::types::random_node_id();
+                conn.execute(
+                    "INSERT INTO app_state (key, value) VALUES ('node_id', ?1)",
+                    params![id.as_slice()],
+                )?;
+                Ok(id)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     pub fn upsert_dht_node(
         &self,
         node_id: &NodeId,
@@ -629,7 +1004,7 @@ impl Store {
         let conn = self.conn.lock().expect("store connection mutex poisoned");
         let cutoff = chrono::Utc::now().timestamp() - max_age.as_secs() as i64;
         let mut stmt = conn.prepare(
-            "SELECT id, addr
+            "SELECT id, addr, last_seen
              FROM dht_nodes
              WHERE last_seen >= ?1
              ORDER BY last_seen DESC
@@ -693,7 +1068,8 @@ impl Store {
         let cutoff = chrono::Utc::now().timestamp() - (retry_after_hours as i64) * 3600;
         let count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM metadata_peer_attempts
-             WHERE info_hash = ?1 AND peer_addr = ?2 AND last_attempt > ?3",
+             WHERE info_hash = ?1 AND peer_addr = ?2
+               AND (last_error = 'metadata hash mismatch' OR last_attempt > ?3)",
             params![hash_hex, peer_addr, cutoff],
             |row| row.get(0),
         )?;
@@ -792,6 +1168,7 @@ impl Store {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn refresh_torrent_fts(&self, info_hash: &InfoHash) -> Result<(), rusqlite::Error> {
         let conn = self.conn.lock().expect("store connection mutex poisoned");
         let hash_hex = hex::encode(info_hash);
@@ -1085,17 +1462,106 @@ fn row_to_dht_node(row: &rusqlite::Row) -> rusqlite::Result<NodeContact> {
     let addr = addr_text.parse::<SocketAddrV4>().map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(e))
     })?;
+    let last_seen_unix: i64 = row.get(2)?;
+    let age_secs = chrono::Utc::now()
+        .timestamp()
+        .saturating_sub(last_seen_unix)
+        .unsigned_abs();
 
     Ok(NodeContact {
         id,
         addr,
-        last_seen: Instant::now(),
+        last_seen: Instant::now()
+            .checked_sub(Duration::from_secs(age_secs))
+            .unwrap_or_else(Instant::now),
+        last_seen_unix,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_schema_version_is_current_and_future_versions_are_rejected() {
+        let store = Store::open_in_memory().unwrap();
+        let version: i64 = store
+            .conn
+            .lock()
+            .unwrap()
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
+
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION + 1)
+            .unwrap();
+        let future = Store {
+            conn: Mutex::new(connection),
+        };
+        assert!(future.init_schema().is_err());
+    }
+
+    #[test]
+    fn test_commit_metadata_creates_and_atomically_replaces_files() {
+        let store = Store::open_in_memory().unwrap();
+        let hash = [0x91; 20];
+        store
+            .commit_metadata(
+                &hash,
+                "first",
+                16_384,
+                3,
+                &[("a".to_string(), 1), ("b".to_string(), 2)],
+            )
+            .unwrap();
+        assert!(store.get_torrent(&hash).unwrap().unwrap().metadata_complete);
+        assert_eq!(store.get_files(&hash).unwrap().len(), 2);
+
+        store
+            .commit_metadata(&hash, "second", 32_768, 4, &[("c".to_string(), 4)])
+            .unwrap();
+        assert_eq!(store.get_files(&hash).unwrap(), vec![("c".to_string(), 4)]);
+        assert_eq!(
+            store.get_torrent(&hash).unwrap().unwrap().name.as_deref(),
+            Some("second")
+        );
+    }
+
+    #[test]
+    fn test_commit_metadata_failure_rolls_back_torrent_and_files() {
+        let store = Store::open_in_memory().unwrap();
+        let hash = [0x92; 20];
+        store
+            .commit_metadata(&hash, "old", 16_384, 1, &[("old".to_string(), 1)])
+            .unwrap();
+        store
+            .execute_batch_for_test(
+                "CREATE TRIGGER reject_new_file BEFORE INSERT ON files
+                 WHEN NEW.path = 'reject'
+                 BEGIN SELECT RAISE(ABORT, 'forced failure'); END;",
+            )
+            .unwrap();
+        assert!(store
+            .commit_metadata(&hash, "new", 32_768, 2, &[("reject".to_string(), 2)],)
+            .is_err());
+        assert_eq!(
+            store.get_files(&hash).unwrap(),
+            vec![("old".to_string(), 1)]
+        );
+        assert_eq!(
+            store.get_torrent(&hash).unwrap().unwrap().name.as_deref(),
+            Some("old")
+        );
+    }
+
+    #[test]
+    fn test_stable_node_identity_is_reused() {
+        let store = Store::open_in_memory().unwrap();
+        let first = store.load_or_create_node_id().unwrap();
+        assert_eq!(store.load_or_create_node_id().unwrap(), first);
+    }
 
     fn test_db() -> Store {
         Store::open_in_memory().expect("should open in-memory db")

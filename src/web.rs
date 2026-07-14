@@ -415,7 +415,7 @@ mod tests {
         path
     }
 
-    fn seed_web_search_db(path: &PathBuf) {
+    fn seed_web_search_db(path: &std::path::Path) {
         let store = Store::open(path).unwrap();
         let incomplete = [0xD0u8; 20];
         let complete = [0xD1u8; 20];

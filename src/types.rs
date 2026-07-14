@@ -13,11 +13,40 @@ pub struct NodeContact {
     pub id: NodeId,
     pub addr: SocketAddrV4,
     pub last_seen: Instant,
+    pub last_seen_unix: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PeerContact {
     pub addr: SocketAddrV4,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiscoverySource {
+    InboundGetPeers,
+    AnnouncePeer,
+    Resume,
+    SampleInfohashes,
+    OutboundGetPeers,
+}
+
+impl DiscoverySource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DiscoverySource::InboundGetPeers => "inbound_get_peers",
+            DiscoverySource::AnnouncePeer => "announce_peer",
+            DiscoverySource::Resume => "resume",
+            DiscoverySource::SampleInfohashes => "sample_infohashes",
+            DiscoverySource::OutboundGetPeers => "outbound_get_peers",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct HashDiscovery {
+    pub info_hash: InfoHash,
+    pub peers: Vec<PeerContact>,
+    pub source: DiscoverySource,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,7 +59,6 @@ pub enum MetadataFailureReason {
     Protocol,
     HashMismatch,
     Parse,
-    Other,
 }
 
 impl MetadataFailureReason {
@@ -44,7 +72,6 @@ impl MetadataFailureReason {
             MetadataFailureReason::Protocol => "protocol",
             MetadataFailureReason::HashMismatch => "hash_mismatch",
             MetadataFailureReason::Parse => "parse",
-            MetadataFailureReason::Other => "other",
         }
     }
 }
@@ -63,6 +90,26 @@ pub enum CrawlStatsEvent {
     MetadataFetched,
     MetadataFetchFailed {
         reason: MetadataFailureReason,
+    },
+    RpcAnswered,
+    RpcTimedOut,
+    RpcMalformed,
+    RpcUnsolicited,
+    RpcUnexpectedSource,
+    DiscoveryBackpressure,
+    SamplingResponse {
+        samples: usize,
+    },
+    SampleObserved {
+        info_hash: InfoHash,
+        node_id: NodeId,
+        addr: SocketAddrV4,
+        sweep_id: u64,
+    },
+    HashObserved {
+        info_hash: InfoHash,
+        source: DiscoverySource,
+        has_peers: bool,
     },
 }
 

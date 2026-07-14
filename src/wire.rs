@@ -387,7 +387,8 @@ pub fn build_metadata_request(piece: u32) -> Vec<u8> {
 pub type MetadataResponse = Result<(u32, u32, Vec<u8>), ()>;
 
 pub fn parse_metadata_response(data: &[u8]) -> Option<MetadataResponse> {
-    let value: serde_bencode::value::Value = serde_bencode::from_bytes(data).ok()?;
+    let dict_end = find_bencode_end(data).ok()?;
+    let value: serde_bencode::value::Value = serde_bencode::from_bytes(&data[..dict_end]).ok()?;
     let dict = match &value {
         serde_bencode::value::Value::Dict(d) => d,
         _ => return None,
@@ -410,69 +411,117 @@ pub fn parse_metadata_response(data: &[u8]) -> Option<MetadataResponse> {
         Some(serde_bencode::value::Value::Int(i)) if *i >= 0 => u32::try_from(*i).ok()?,
         _ => return None,
     };
-    let dict_end = find_bencode_end(data)?;
     let meta_data = data[dict_end..].to_vec();
     Some(Ok((piece, total_size, meta_data)))
 }
 
-fn find_bencode_end(data: &[u8]) -> Option<usize> {
+const MAX_BENCODE_DEPTH: usize = 32;
+const MAX_BENCODE_ITEMS: usize = 1024;
+const MAX_BENCODE_STRING: usize = 1024 * 1024;
+
+fn find_bencode_end(data: &[u8]) -> Result<usize, String> {
     let mut pos = 0;
-    parse_one(data, &mut pos);
-    if pos > 0 && pos <= data.len() {
-        Some(pos)
-    } else {
-        None
-    }
+    let mut items = 0;
+    parse_one(data, &mut pos, 0, &mut items)?;
+    Ok(pos)
 }
 
-fn parse_one(data: &[u8], pos: &mut usize) {
+fn parse_one(data: &[u8], pos: &mut usize, depth: usize, items: &mut usize) -> Result<(), String> {
+    if depth > MAX_BENCODE_DEPTH {
+        return Err("bencode nesting exceeds limit".to_string());
+    }
     if *pos >= data.len() {
-        return;
+        return Err("truncated bencode value".to_string());
+    }
+    *items = items
+        .checked_add(1)
+        .ok_or_else(|| "bencode item count overflow".to_string())?;
+    if *items > MAX_BENCODE_ITEMS {
+        return Err("bencode item count exceeds limit".to_string());
     }
     match data[*pos] {
         b'd' => {
             *pos += 1;
-            while *pos < data.len() && data[*pos] != b'e' {
-                parse_one(data, pos);
+            loop {
                 if *pos >= data.len() {
-                    return;
+                    return Err("unterminated bencode dictionary".to_string());
                 }
-                parse_one(data, pos);
-            }
-            if *pos < data.len() {
-                *pos += 1;
+                if data[*pos] == b'e' {
+                    *pos += 1;
+                    break;
+                }
+                let key_start = *pos;
+                parse_string(data, pos)?;
+                if *pos == key_start {
+                    return Err("invalid bencode dictionary key".to_string());
+                }
+                parse_one(data, pos, depth + 1, items)?;
             }
         }
         b'l' => {
             *pos += 1;
-            while *pos < data.len() && data[*pos] != b'e' {
-                parse_one(data, pos);
-            }
-            if *pos < data.len() {
-                *pos += 1;
+            loop {
+                if *pos >= data.len() {
+                    return Err("unterminated bencode list".to_string());
+                }
+                if data[*pos] == b'e' {
+                    *pos += 1;
+                    break;
+                }
+                parse_one(data, pos, depth + 1, items)?;
             }
         }
         b'i' => {
             *pos += 1;
-            while *pos < data.len() && data[*pos] != b'e' {
+            let start = *pos;
+            if data.get(*pos) == Some(&b'-') {
                 *pos += 1;
             }
-            if *pos < data.len() {
+            let digits_start = *pos;
+            while data.get(*pos).is_some_and(u8::is_ascii_digit) {
                 *pos += 1;
             }
-        }
-        _ => {
-            let mut len_end = *pos;
-            while len_end < data.len() && data[len_end].is_ascii_digit() {
-                len_end += 1;
+            if digits_start == *pos || data.get(*pos) != Some(&b'e') {
+                return Err("invalid bencode integer".to_string());
             }
-            if len_end < data.len() && data[len_end] == b':' {
-                let len_str = std::str::from_utf8(&data[*pos..len_end]).ok();
-                let byte_len: usize = len_str.and_then(|s| s.parse().ok()).unwrap_or(0);
-                *pos = len_end + 1 + byte_len;
+            if data[start] == b'0' && *pos - start > 1 {
+                return Err("non-canonical bencode integer".to_string());
             }
+            *pos += 1;
         }
+        b'0'..=b'9' => parse_string(data, pos)?,
+        _ => return Err("invalid bencode type marker".to_string()),
     }
+    Ok(())
+}
+
+fn parse_string(data: &[u8], pos: &mut usize) -> Result<(), String> {
+    let start = *pos;
+    while data.get(*pos).is_some_and(u8::is_ascii_digit) {
+        *pos += 1;
+    }
+    if start == *pos || data.get(*pos) != Some(&b':') {
+        return Err("invalid bencode string length".to_string());
+    }
+    let length_text = std::str::from_utf8(&data[start..*pos])
+        .map_err(|_| "invalid bencode string length".to_string())?;
+    if length_text.len() > 1 && length_text.starts_with('0') {
+        return Err("non-canonical bencode string length".to_string());
+    }
+    let length = length_text
+        .parse::<usize>()
+        .map_err(|_| "bencode string length overflow".to_string())?;
+    if length > MAX_BENCODE_STRING {
+        return Err("bencode string exceeds limit".to_string());
+    }
+    *pos += 1;
+    *pos = pos
+        .checked_add(length)
+        .ok_or_else(|| "bencode string end overflow".to_string())?;
+    if *pos > data.len() {
+        return Err("truncated bencode string".to_string());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -572,6 +621,18 @@ mod tests {
 
         let result = parse_metadata_response(&payload);
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_parse_metadata_response_rejects_truncated_dictionary() {
+        assert!(parse_metadata_response(b"d8:msg_typei1e5:piecei0e").is_none());
+    }
+
+    #[test]
+    fn test_bencode_boundary_scanner_enforces_depth_limit() {
+        let mut payload = vec![b'l'; MAX_BENCODE_DEPTH + 2];
+        payload.extend(std::iter::repeat_n(b'e', MAX_BENCODE_DEPTH + 2));
+        assert!(find_bencode_end(&payload).is_err());
     }
 
     fn metadata_response_payload(msg_type: i64, piece: i64, total_size: i64) -> Vec<u8> {

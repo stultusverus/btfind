@@ -17,16 +17,19 @@ pub enum KrpcMessage {
         y: String,
         q: String,
         a: BTreeMap<String, KrpcValue>,
+        extra: BTreeMap<String, KrpcValue>,
     },
     Response {
         t: Vec<u8>,
         y: String,
         r: BTreeMap<String, KrpcValue>,
+        extra: BTreeMap<String, KrpcValue>,
     },
     Error {
         t: Vec<u8>,
         y: String,
         e: KrpcError,
+        extra: BTreeMap<String, KrpcValue>,
     },
 }
 
@@ -77,12 +80,13 @@ fn bencode_to_krpc(v: &serde_bencode::value::Value) -> KrpcValue {
 impl KrpcMessage {
     pub fn to_bytes(&self) -> Vec<u8> {
         match self {
-            KrpcMessage::Query { t, y, q, a } => {
+            KrpcMessage::Query { t, y, q, a, extra } => {
                 let mut dict = HashMap::new();
                 dict.insert(
                     "t".as_bytes().to_vec(),
                     serde_bencode::value::Value::Bytes(t.clone()),
                 );
+                insert_extra(&mut dict, extra);
                 dict.insert(
                     "y".as_bytes().to_vec(),
                     serde_bencode::value::Value::Bytes(y.as_bytes().to_vec()),
@@ -102,12 +106,13 @@ impl KrpcMessage {
                 serde_bencode::to_bytes(&serde_bencode::value::Value::Dict(dict))
                     .expect("serialization should not fail for constructed bencode values")
             }
-            KrpcMessage::Response { t, y, r } => {
+            KrpcMessage::Response { t, y, r, extra } => {
                 let mut dict = HashMap::new();
                 dict.insert(
                     "t".as_bytes().to_vec(),
                     serde_bencode::value::Value::Bytes(t.clone()),
                 );
+                insert_extra(&mut dict, extra);
                 dict.insert(
                     "y".as_bytes().to_vec(),
                     serde_bencode::value::Value::Bytes(y.as_bytes().to_vec()),
@@ -123,12 +128,13 @@ impl KrpcMessage {
                 serde_bencode::to_bytes(&serde_bencode::value::Value::Dict(dict))
                     .expect("serialization should not fail for constructed bencode values")
             }
-            KrpcMessage::Error { t, y, e } => {
+            KrpcMessage::Error { t, y, e, extra } => {
                 let mut dict = HashMap::new();
                 dict.insert(
                     "t".as_bytes().to_vec(),
                     serde_bencode::value::Value::Bytes(t.clone()),
                 );
+                insert_extra(&mut dict, extra);
                 dict.insert(
                     "y".as_bytes().to_vec(),
                     serde_bencode::value::Value::Bytes(y.as_bytes().to_vec()),
@@ -158,6 +164,7 @@ impl KrpcMessage {
 
         let t = get_bytes(dict, "t").ok_or("missing t")?;
         let y = get_string(dict, "y").ok_or("missing y")?;
+        let extra = collect_extra(dict);
 
         match y.as_str() {
             "q" => {
@@ -170,7 +177,13 @@ impl KrpcMessage {
                         }
                     }
                 }
-                Ok(KrpcMessage::Query { t, y, q, a: a_map })
+                Ok(KrpcMessage::Query {
+                    t,
+                    y,
+                    q,
+                    a: a_map,
+                    extra,
+                })
             }
             "r" => {
                 let mut r_map = BTreeMap::new();
@@ -181,7 +194,12 @@ impl KrpcMessage {
                         }
                     }
                 }
-                Ok(KrpcMessage::Response { t, y, r: r_map })
+                Ok(KrpcMessage::Response {
+                    t,
+                    y,
+                    r: r_map,
+                    extra,
+                })
             }
             "e" => {
                 let e_list = get_list(dict, "e").ok_or("missing e")?;
@@ -199,6 +217,7 @@ impl KrpcMessage {
                     t,
                     y,
                     e: KrpcError { code, description },
+                    extra,
                 })
             }
             _ => Err(format!("unknown message type: {}", y)),
@@ -223,6 +242,41 @@ impl KrpcMessage {
             | KrpcMessage::Error { t, .. } => t,
         }
     }
+
+    #[allow(dead_code)]
+    pub fn top_level(&self, key: &str) -> Option<&KrpcValue> {
+        match self {
+            KrpcMessage::Query { extra, .. }
+            | KrpcMessage::Response { extra, .. }
+            | KrpcMessage::Error { extra, .. } => extra.get(key),
+        }
+    }
+}
+
+fn insert_extra(
+    dict: &mut HashMap<Vec<u8>, serde_bencode::value::Value>,
+    extra: &BTreeMap<String, KrpcValue>,
+) {
+    for (key, value) in extra {
+        if !matches!(key.as_str(), "t" | "y" | "q" | "a" | "r" | "e") {
+            dict.insert(key.as_bytes().to_vec(), krpc_to_bencode(value));
+        }
+    }
+}
+
+fn collect_extra(
+    dict: &HashMap<Vec<u8>, serde_bencode::value::Value>,
+) -> BTreeMap<String, KrpcValue> {
+    dict.iter()
+        .filter_map(|(key, value)| {
+            let key = std::str::from_utf8(key).ok()?;
+            if matches!(key, "t" | "y" | "q" | "a" | "r" | "e") {
+                None
+            } else {
+                Some((key.to_string(), bencode_to_krpc(value)))
+            }
+        })
+        .collect()
 }
 
 fn get_bytes(dict: &HashMap<Vec<u8>, serde_bencode::value::Value>, key: &str) -> Option<Vec<u8>> {
@@ -278,6 +332,7 @@ mod tests {
             y: "q".to_string(),
             q: "find_node".to_string(),
             a,
+            extra: BTreeMap::new(),
         };
 
         let encoded = msg.to_bytes();
@@ -309,5 +364,17 @@ mod tests {
             }
             _ => panic!("expected query"),
         }
+    }
+
+    #[test]
+    fn test_top_level_extensions_round_trip() {
+        let raw = b"d1:rd2:id20:abcdefghij0123456789e1:t2:aa1:v4:UT011:y1:re";
+        let message = KrpcMessage::from_bytes(raw).unwrap();
+        assert_eq!(
+            message.top_level("v"),
+            Some(&KrpcValue::Bytes(b"UT01".to_vec()))
+        );
+        let reparsed = KrpcMessage::from_bytes(&message.to_bytes()).unwrap();
+        assert_eq!(reparsed.top_level("v"), message.top_level("v"));
     }
 }
