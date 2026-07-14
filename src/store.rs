@@ -1470,6 +1470,8 @@ fn persist_hash_discovery_tx(
             status = CASE
                 WHEN hash_jobs.status IN ('complete', 'invalid', 'unsupported')
                 THEN hash_jobs.status
+                WHEN hash_jobs.status = 'waiting_peers' AND ?2 IS NULL
+                THEN hash_jobs.status
                 ELSE 'queued'
             END,
             next_attempt_at = CASE WHEN ?2 IS NOT NULL THEN 0 ELSE hash_jobs.next_attempt_at END,

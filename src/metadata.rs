@@ -1239,6 +1239,18 @@ mod tests {
         assert_eq!(status, "waiting_peers");
         assert_eq!(attempt_count, 1);
         assert_eq!(next_attempt_at, 0);
+
+        store
+            .persist_hash_discovery(&info_hash, "sample_infohashes", false)
+            .unwrap();
+        let (status, _, _) = store.hash_job_schedule_for_test(&info_hash).unwrap();
+        assert_eq!(status, "waiting_peers");
+
+        store
+            .persist_hash_discovery(&info_hash, "announce_peer", true)
+            .unwrap();
+        let (status, _, _) = store.hash_job_schedule_for_test(&info_hash).unwrap();
+        assert_eq!(status, "queued");
     }
 
     #[tokio::test]
