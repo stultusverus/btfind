@@ -232,8 +232,16 @@ async fn cmd_run(
     });
 
     let store_stats = store.clone();
+    let database_batch_size = config.database.batch_size;
+    let database_flush_interval = Duration::from_millis(config.database.flush_interval_ms);
     let stats_handle = tokio::spawn(async move {
-        run_stats_persistence(store_stats, stats_rx).await;
+        run_stats_persistence(
+            store_stats,
+            stats_rx,
+            database_batch_size,
+            database_flush_interval,
+        )
+        .await;
     });
 
     let store_clone = store.clone();
@@ -317,76 +325,72 @@ impl RuntimeStats {
             | types::CrawlStatsEvent::HashObserved { .. } => {}
         }
     }
+
+    fn snapshot(&self) -> store::RuntimeSnapshot {
+        store::RuntimeSnapshot {
+            nodes_known: self.nodes_known,
+            queries_sent: self.queries_sent,
+            info_hashes_found: self.info_hashes_found,
+            metadata_fetched: self.metadata_fetched,
+        }
+    }
 }
 
 async fn run_stats_persistence(
     store: Arc<store::Store>,
     mut stats_rx: mpsc::Receiver<types::CrawlStatsEvent>,
+    batch_size: usize,
+    flush_interval: Duration,
 ) {
     let mut stats = RuntimeStats::default();
-    while let Some(event) = stats_rx.recv().await {
-        let should_persist = matches!(event, types::CrawlStatsEvent::DhtSnapshot { .. });
-        let failure_reason = match event {
-            types::CrawlStatsEvent::MetadataFetchFailed { reason } => Some(reason),
-            _ => None,
-        };
-        let dht_node = match event {
-            types::CrawlStatsEvent::DhtNodeSeen { id, addr } => Some((id, addr)),
-            _ => None,
-        };
-        let sample = match event {
-            types::CrawlStatsEvent::SampleObserved {
-                info_hash,
-                node_id,
-                addr,
-                sweep_id,
-            } => Some((info_hash, node_id, addr, sweep_id)),
-            _ => None,
-        };
-        let observed_hash = match event {
-            types::CrawlStatsEvent::HashObserved {
-                info_hash,
-                source,
-                has_peers,
-            } => Some((info_hash, source, has_peers)),
-            _ => None,
-        };
-        stats.apply(event);
-        let persistence_store = store.clone();
-        let nodes_known = stats.nodes_known;
-        let queries_sent = stats.queries_sent;
-        let info_hashes_found = stats.info_hashes_found;
-        let metadata_fetched = stats.metadata_fetched;
-        let persisted = tokio::task::spawn_blocking(move || -> Result<(), rusqlite::Error> {
-            if let Some(reason) = failure_reason {
-                persistence_store.increment_metadata_failure(reason.as_str())?;
+    let mut events = Vec::with_capacity(batch_size);
+    let mut snapshot = None;
+    let mut flush_tick = tokio::time::interval(flush_interval);
+    flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    flush_tick.tick().await;
+
+    loop {
+        tokio::select! {
+            event = stats_rx.recv() => {
+                let Some(event) = event else {
+                    flush_stats_batch(&store, &mut events, &mut snapshot).await;
+                    break;
+                };
+                stats.apply(event);
+                if matches!(event, types::CrawlStatsEvent::DhtSnapshot { .. }) {
+                    snapshot = Some(stats.snapshot());
+                }
+                events.push(event);
+                if events.len() >= batch_size {
+                    flush_stats_batch(&store, &mut events, &mut snapshot).await;
+                }
             }
-            if let Some((id, addr)) = dht_node {
-                persistence_store.upsert_dht_node(&id, addr)?;
+            _ = flush_tick.tick(), if !events.is_empty() => {
+                flush_stats_batch(&store, &mut events, &mut snapshot).await;
             }
-            if let Some((info_hash, node_id, addr, sweep_id)) = sample {
-                persistence_store
-                    .record_sample_observation(&info_hash, &node_id, addr, sweep_id)?;
-            }
-            if let Some((info_hash, source, has_peers)) = observed_hash {
-                persistence_store.persist_hash_discovery(&info_hash, source.as_str(), has_peers)?;
-            }
-            if should_persist {
-                persistence_store.insert_crawl_stat(
-                    nodes_known,
-                    queries_sent,
-                    info_hashes_found,
-                    metadata_fetched,
-                )?;
-            }
-            Ok(())
-        })
-        .await;
-        match persisted {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => tracing::warn!("failed to persist runtime event: {}", error),
-            Err(error) => tracing::warn!("storage worker join error: {}", error),
         }
+    }
+}
+
+async fn flush_stats_batch(
+    store: &Arc<store::Store>,
+    events: &mut Vec<types::CrawlStatsEvent>,
+    snapshot: &mut Option<store::RuntimeSnapshot>,
+) {
+    if events.is_empty() {
+        return;
+    }
+    let batch = std::mem::take(events);
+    let batch_snapshot = snapshot.take();
+    let persistence_store = store.clone();
+    let persisted = tokio::task::spawn_blocking(move || {
+        persistence_store.persist_runtime_batch(&batch, batch_snapshot)
+    })
+    .await;
+    match persisted {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => tracing::warn!("failed to persist runtime batch: {}", error),
+        Err(error) => tracing::warn!("storage worker join error: {}", error),
     }
 }
 
@@ -889,7 +893,12 @@ mod integration_tests {
     async fn test_stats_persistence_writes_snapshot_with_metadata_count() {
         let store = Arc::new(store::Store::open_in_memory().unwrap());
         let (stats_tx, stats_rx) = mpsc::channel(8);
-        let handle = tokio::spawn(run_stats_persistence(store.clone(), stats_rx));
+        let handle = tokio::spawn(run_stats_persistence(
+            store.clone(),
+            stats_rx,
+            128,
+            Duration::from_secs(60),
+        ));
 
         stats_tx
             .try_send(types::CrawlStatsEvent::MetadataFetched)
@@ -941,6 +950,41 @@ mod integration_tests {
                 },
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn test_stats_persistence_flushes_at_configured_batch_size() {
+        let store = Arc::new(store::Store::open_in_memory().unwrap());
+        let (stats_tx, stats_rx) = mpsc::channel(8);
+        let handle = tokio::spawn(run_stats_persistence(
+            store.clone(),
+            stats_rx,
+            3,
+            Duration::from_secs(60),
+        ));
+
+        for _ in 0..3 {
+            stats_tx
+                .send(types::CrawlStatsEvent::MetadataFetchFailed {
+                    reason: types::MetadataFailureReason::Connect,
+                })
+                .await
+                .unwrap();
+        }
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let counts = store.get_metadata_failure_counts().unwrap();
+                if counts.first().is_some_and(|count| count.count == 3) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(stats_tx);
+        handle.await.unwrap();
     }
 
     #[test]

@@ -1,6 +1,7 @@
-use crate::types::{InfoHash, NodeContact, NodeId};
+use crate::types::{CrawlStatsEvent, InfoHash, NodeContact, NodeId};
 use rusqlite::types::Value;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
+use std::collections::BTreeMap;
 use std::net::SocketAddrV4;
 use std::path::Path;
 use std::sync::Mutex;
@@ -61,6 +62,14 @@ pub struct HashJobRecord {
     pub attempt_count: u32,
     pub next_attempt_at: i64,
     pub last_failure: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RuntimeSnapshot {
+    pub nodes_known: i64,
+    pub queries_sent: i64,
+    pub info_hashes_found: i64,
+    pub metadata_fetched: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -702,6 +711,115 @@ impl Store {
         Ok(conn.last_insert_rowid())
     }
 
+    pub fn persist_runtime_batch(
+        &self,
+        events: &[CrawlStatsEvent],
+        snapshot: Option<RuntimeSnapshot>,
+    ) -> Result<(), rusqlite::Error> {
+        let mut failures = BTreeMap::<&str, i64>::new();
+        let mut nodes = BTreeMap::<NodeId, SocketAddrV4>::new();
+        let mut hashes = Vec::<(InfoHash, &'static str, bool)>::new();
+        let mut samples = BTreeMap::<InfoHash, (NodeId, SocketAddrV4, u64, i64)>::new();
+
+        for event in events {
+            match *event {
+                CrawlStatsEvent::MetadataFetchFailed { reason } => {
+                    *failures.entry(reason.as_str()).or_default() += 1;
+                }
+                CrawlStatsEvent::DhtNodeSeen { id, addr } => {
+                    nodes.insert(id, addr);
+                }
+                CrawlStatsEvent::HashObserved {
+                    info_hash,
+                    source,
+                    has_peers,
+                } => merge_hash_observation(&mut hashes, info_hash, source.as_str(), has_peers),
+                CrawlStatsEvent::SampleObserved {
+                    info_hash,
+                    node_id,
+                    addr,
+                    sweep_id,
+                } => {
+                    merge_hash_observation(&mut hashes, info_hash, "sample_infohashes", false);
+                    samples
+                        .entry(info_hash)
+                        .and_modify(|sample| {
+                            sample.0 = node_id;
+                            sample.1 = addr;
+                            sample.2 = sweep_id;
+                            sample.3 += 1;
+                        })
+                        .or_insert((node_id, addr, sweep_id, 1));
+                }
+                _ => {}
+            }
+        }
+
+        let mut conn = self.conn.lock().expect("store connection mutex poisoned");
+        let tx = conn.transaction()?;
+        let now = chrono::Utc::now().timestamp();
+
+        for (reason, count) in failures {
+            tx.execute(
+                "INSERT INTO metadata_failure_counts (reason, count)
+                 VALUES (?1, ?2)
+                 ON CONFLICT(reason) DO UPDATE SET count = count + excluded.count",
+                params![reason, count],
+            )?;
+        }
+        for (id, addr) in nodes {
+            tx.execute(
+                "INSERT INTO dht_nodes (id, addr, last_seen)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(id) DO UPDATE SET
+                    addr = excluded.addr,
+                    last_seen = excluded.last_seen",
+                params![hex::encode(id), addr.to_string(), now],
+            )?;
+        }
+        for (info_hash, source, has_peers) in hashes {
+            persist_hash_discovery_tx(&tx, &info_hash, source, has_peers, now)?;
+        }
+        for (info_hash, (node_id, addr, sweep_id, count)) in samples {
+            tx.execute(
+                "INSERT INTO sample_observations (
+                    info_hash, first_seen, last_seen, sample_count,
+                    sampling_node_id, sampling_addr, sweep_id
+                 ) VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(info_hash) DO UPDATE SET
+                    last_seen = excluded.last_seen,
+                    sample_count = sample_count + excluded.sample_count,
+                    sampling_node_id = excluded.sampling_node_id,
+                    sampling_addr = excluded.sampling_addr,
+                    sweep_id = excluded.sweep_id",
+                params![
+                    hex::encode(info_hash),
+                    now,
+                    count,
+                    hex::encode(node_id),
+                    addr.to_string(),
+                    i64::try_from(sweep_id).unwrap_or(i64::MAX)
+                ],
+            )?;
+        }
+        if let Some(snapshot) = snapshot {
+            tx.execute(
+                "INSERT INTO crawl_stats (
+                    timestamp, nodes_known, queries_sent, info_hashes_found, metadata_fetched
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    now,
+                    snapshot.nodes_known,
+                    snapshot.queries_sent,
+                    snapshot.info_hashes_found,
+                    snapshot.metadata_fetched
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     #[allow(dead_code)]
     pub fn get_crawl_history(&self, limit: usize) -> Result<Vec<CrawlStatRecord>, rusqlite::Error> {
         let conn = self.conn.lock().expect("store connection mutex poisoned");
@@ -776,38 +894,8 @@ impl Store {
     ) -> Result<(), rusqlite::Error> {
         let mut conn = self.conn.lock().expect("store connection mutex poisoned");
         let tx = conn.transaction()?;
-        let hash_hex = hex::encode(info_hash);
         let now = chrono::Utc::now().timestamp();
-        tx.execute(
-            "INSERT INTO torrents (
-                info_hash, source, first_seen, last_seen, metadata_complete
-             ) VALUES (?1, ?2, ?3, ?3, 0)
-             ON CONFLICT(info_hash) DO UPDATE SET
-                source = excluded.source,
-                last_seen = excluded.last_seen",
-            params![hash_hex, source, now],
-        )?;
-        tx.execute(
-            "INSERT INTO hash_jobs (
-                info_hash, status, last_new_peer_at, discovery_sources, updated_at
-             ) VALUES (?1, 'queued', ?2, ?3, ?4)
-             ON CONFLICT(info_hash) DO UPDATE SET
-                status = CASE
-                    WHEN hash_jobs.status IN ('complete', 'invalid', 'unsupported')
-                    THEN hash_jobs.status
-                    ELSE 'queued'
-                END,
-                next_attempt_at = CASE WHEN ?2 IS NOT NULL THEN 0 ELSE hash_jobs.next_attempt_at END,
-                last_new_peer_at = COALESCE(?2, hash_jobs.last_new_peer_at),
-                discovery_sources = CASE
-                    WHEN instr(',' || hash_jobs.discovery_sources || ',', ',' || ?3 || ',') > 0
-                    THEN hash_jobs.discovery_sources
-                    WHEN hash_jobs.discovery_sources = '' THEN ?3
-                    ELSE hash_jobs.discovery_sources || ',' || ?3
-                END,
-                updated_at = excluded.updated_at",
-            params![hash_hex, has_new_peers.then_some(now), source, now],
-        )?;
+        persist_hash_discovery_tx(&tx, info_hash, source, has_new_peers, now)?;
         tx.commit()?;
         Ok(())
     }
@@ -926,37 +1014,6 @@ impl Store {
         rows.collect()
     }
 
-    pub fn record_sample_observation(
-        &self,
-        info_hash: &InfoHash,
-        sampling_node_id: &NodeId,
-        sampling_addr: SocketAddrV4,
-        sweep_id: u64,
-    ) -> Result<(), rusqlite::Error> {
-        self.persist_hash_discovery(info_hash, "sample_infohashes", false)?;
-        let conn = self.conn.lock().expect("store connection mutex poisoned");
-        let now = chrono::Utc::now().timestamp();
-        conn.execute(
-            "INSERT INTO sample_observations (
-                info_hash, first_seen, last_seen, sampling_node_id, sampling_addr, sweep_id
-             ) VALUES (?1, ?2, ?2, ?3, ?4, ?5)
-             ON CONFLICT(info_hash) DO UPDATE SET
-                last_seen = excluded.last_seen,
-                sample_count = sample_count + 1,
-                sampling_node_id = excluded.sampling_node_id,
-                sampling_addr = excluded.sampling_addr,
-                sweep_id = excluded.sweep_id",
-            params![
-                hex::encode(info_hash),
-                now,
-                hex::encode(sampling_node_id),
-                sampling_addr.to_string(),
-                i64::try_from(sweep_id).unwrap_or(i64::MAX)
-            ],
-        )?;
-        Ok(())
-    }
-
     pub fn load_or_create_node_id(&self) -> Result<NodeId, rusqlite::Error> {
         let conn = self.conn.lock().expect("store connection mutex poisoned");
         let existing = conn.query_row(
@@ -985,6 +1042,7 @@ impl Store {
         }
     }
 
+    #[cfg(test)]
     pub fn upsert_dht_node(
         &self,
         node_id: &NodeId,
@@ -1060,6 +1118,7 @@ impl Store {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn should_skip_peer_retry(
         &self,
         info_hash: &InfoHash,
@@ -1133,6 +1192,7 @@ impl Store {
         Ok(removed as i64)
     }
 
+    #[cfg(test)]
     pub fn increment_metadata_failure(&self, reason: &str) -> Result<(), rusqlite::Error> {
         let conn = self.conn.lock().expect("store connection mutex poisoned");
         conn.execute(
@@ -1367,6 +1427,63 @@ impl Store {
             None => Ok(None),
         }
     }
+}
+
+fn merge_hash_observation(
+    hashes: &mut Vec<(InfoHash, &'static str, bool)>,
+    info_hash: InfoHash,
+    source: &'static str,
+    has_peers: bool,
+) {
+    if let Some(observation) = hashes
+        .iter_mut()
+        .find(|observation| observation.0 == info_hash && observation.1 == source)
+    {
+        observation.2 |= has_peers;
+    } else {
+        hashes.push((info_hash, source, has_peers));
+    }
+}
+
+fn persist_hash_discovery_tx(
+    tx: &rusqlite::Transaction<'_>,
+    info_hash: &InfoHash,
+    source: &str,
+    has_new_peers: bool,
+    now: i64,
+) -> Result<(), rusqlite::Error> {
+    let hash_hex = hex::encode(info_hash);
+    tx.execute(
+        "INSERT INTO torrents (
+            info_hash, source, first_seen, last_seen, metadata_complete
+         ) VALUES (?1, ?2, ?3, ?3, 0)
+         ON CONFLICT(info_hash) DO UPDATE SET
+            source = excluded.source,
+            last_seen = excluded.last_seen",
+        params![hash_hex, source, now],
+    )?;
+    tx.execute(
+        "INSERT INTO hash_jobs (
+            info_hash, status, last_new_peer_at, discovery_sources, updated_at
+         ) VALUES (?1, 'queued', ?2, ?3, ?4)
+         ON CONFLICT(info_hash) DO UPDATE SET
+            status = CASE
+                WHEN hash_jobs.status IN ('complete', 'invalid', 'unsupported')
+                THEN hash_jobs.status
+                ELSE 'queued'
+            END,
+            next_attempt_at = CASE WHEN ?2 IS NOT NULL THEN 0 ELSE hash_jobs.next_attempt_at END,
+            last_new_peer_at = COALESCE(?2, hash_jobs.last_new_peer_at),
+            discovery_sources = CASE
+                WHEN instr(',' || hash_jobs.discovery_sources || ',', ',' || ?3 || ',') > 0
+                THEN hash_jobs.discovery_sources
+                WHEN hash_jobs.discovery_sources = '' THEN ?3
+                ELSE hash_jobs.discovery_sources || ',' || ?3
+            END,
+            updated_at = excluded.updated_at",
+        params![hash_hex, has_new_peers.then_some(now), source, now],
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2103,6 +2220,80 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![("connect", 2), ("timeout", 1)]
         );
+    }
+
+    #[test]
+    fn test_runtime_batch_coalesces_events_in_one_commit() {
+        let store = test_db();
+        let node_id = [0x71u8; 20];
+        let info_hash = [0x72u8; 20];
+        let first_addr = "8.8.8.8:6881".parse().unwrap();
+        let latest_addr = "8.8.4.4:6881".parse().unwrap();
+        let events = vec![
+            CrawlStatsEvent::MetadataFetchFailed {
+                reason: crate::types::MetadataFailureReason::Connect,
+            },
+            CrawlStatsEvent::MetadataFetchFailed {
+                reason: crate::types::MetadataFailureReason::Connect,
+            },
+            CrawlStatsEvent::DhtNodeSeen {
+                id: node_id,
+                addr: first_addr,
+            },
+            CrawlStatsEvent::DhtNodeSeen {
+                id: node_id,
+                addr: latest_addr,
+            },
+            CrawlStatsEvent::SampleObserved {
+                info_hash,
+                node_id,
+                addr: first_addr,
+                sweep_id: 1,
+            },
+            CrawlStatsEvent::SampleObserved {
+                info_hash,
+                node_id,
+                addr: latest_addr,
+                sweep_id: 2,
+            },
+        ];
+
+        store
+            .persist_runtime_batch(
+                &events,
+                Some(RuntimeSnapshot {
+                    nodes_known: 3,
+                    queries_sent: 4,
+                    info_hashes_found: 5,
+                    metadata_fetched: 6,
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(store.get_metadata_failure_counts().unwrap()[0].count, 2);
+        assert_eq!(
+            store.recent_dht_nodes(Duration::from_secs(60), 1).unwrap()[0].addr,
+            latest_addr
+        );
+        let conn = store.conn.lock().unwrap();
+        let sample: (i64, String, i64) = conn
+            .query_row(
+                "SELECT sample_count, sampling_addr, sweep_id
+                 FROM sample_observations WHERE info_hash = ?1",
+                params![hex::encode(info_hash)],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(sample, (2, latest_addr.to_string(), 2));
+        let snapshot: (i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT nodes_known, queries_sent, info_hashes_found, metadata_fetched
+                 FROM crawl_stats",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(snapshot, (3, 4, 5, 6));
     }
 
     #[test]
