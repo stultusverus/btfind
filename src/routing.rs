@@ -219,9 +219,7 @@ impl RoutingTable {
         };
         if should_remove {
             self.buckets[index].nodes.remove(id);
-            if let Some(candidate) = self.buckets[index].replacements.pop_back() {
-                self.mark_validated(candidate.id, candidate.addr);
-            }
+            self.buckets[index].last_changed = Instant::now();
         }
     }
 
@@ -375,5 +373,36 @@ mod tests {
         );
         table.record_failure(&id);
         assert!(!table.contains(&id));
+    }
+
+    #[test]
+    fn failed_live_node_does_not_promote_unverified_replacement() {
+        let mut table = RoutingTable::new([0; 20]);
+        let live_id = [1; 20];
+        let candidate_id = [2; 20];
+        let candidate = NodeContact {
+            id: candidate_id,
+            addr: addr(2),
+            last_seen: Instant::now(),
+            last_seen_unix: chrono::Utc::now().timestamp(),
+        };
+        table.mark_validated(live_id, addr(1));
+        table.add_candidate(candidate);
+
+        table.record_failure(&live_id);
+        table.record_failure(&live_id);
+
+        assert!(!table.contains(&live_id));
+        assert!(!table.contains(&candidate_id));
+        assert_eq!(table.node_count(), 0);
+        assert_eq!(table.candidate_count(), 1);
+        assert_eq!(
+            table.contact_state(&candidate_id, Duration::from_secs(60)),
+            Some(ContactState::Candidate)
+        );
+
+        assert!(table.mark_validated(candidate_id, addr(2)));
+        assert!(table.contains(&candidate_id));
+        assert_eq!(table.candidate_count(), 0);
     }
 }
