@@ -456,6 +456,18 @@ impl Config {
             1,
             4096,
         )?;
+        validate_range(
+            "crawl.announced_peer_hash_capacity",
+            self.crawl.announced_peer_hash_capacity,
+            1,
+            1_000_000,
+        )?;
+        validate_range(
+            "crawl.announced_peers_per_hash",
+            self.crawl.announced_peers_per_hash,
+            1,
+            4096,
+        )?;
         validate_range("database.batch_size", self.database.batch_size, 1, 10_000)?;
 
         validate_u64_range(
@@ -615,5 +627,22 @@ mod tests {
         let mut config = Config::default();
         config.metadata.max_metadata_size_bytes = 64 * 1024 * 1024 + 1;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_validation_rejects_zero_announced_peer_capacity() {
+        let mut config = Config::default();
+        config.crawl.announced_peers_per_hash = 0;
+        assert_eq!(
+            config.validate().unwrap_err(),
+            "crawl.announced_peers_per_hash must be between 1 and 4096"
+        );
+
+        config.crawl.announced_peers_per_hash = 1;
+        config.crawl.announced_peer_hash_capacity = 0;
+        assert_eq!(
+            config.validate().unwrap_err(),
+            "crawl.announced_peer_hash_capacity must be between 1 and 1000000"
+        );
     }
 }

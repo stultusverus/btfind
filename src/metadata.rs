@@ -734,6 +734,35 @@ struct FetchRoundConfig {
     prior_attempt_count: u32,
 }
 
+fn apply_job_outcome(
+    jobs: &mut HashMap<InfoHash, HashJob>,
+    ready: &mut VecDeque<InfoHash>,
+    ready_set: &mut HashSet<InfoHash>,
+    outcome: JobOutcome,
+) {
+    let remove = if outcome.complete || outcome.terminal || outcome.parked {
+        true
+    } else if let Some(job) = jobs.get_mut(&outcome.info_hash) {
+        job.running = false;
+        job.attempt_count = job.attempt_count.saturating_add(outcome.attempts);
+        if job.peers.is_empty() {
+            true
+        } else {
+            if ready_set.insert(outcome.info_hash) {
+                ready.push_back(outcome.info_hash);
+            }
+            false
+        }
+    } else {
+        false
+    };
+
+    if remove {
+        jobs.remove(&outcome.info_hash);
+        ready_set.remove(&outcome.info_hash);
+    }
+}
+
 async fn process_hash_round(
     info_hash: InfoHash,
     peers: Vec<PeerContact>,
@@ -762,15 +791,22 @@ async fn process_hash_round(
         let attempt_store = store.clone();
         let attempt_hash = info_hash;
         let attempt_addr = peer_addr.clone();
-        if tokio::task::spawn_blocking(move || {
+        match tokio::task::spawn_blocking(move || {
             attempt_store.set_peer_attempt(&attempt_hash, &attempt_addr, None)
         })
         .await
-        .is_err()
         {
-            last_error = "storage worker failed to record peer attempt".to_string();
-            retryable_attempts = retryable_attempts.saturating_add(1);
-            continue;
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                last_error = format!("storage: failed to record peer attempt: {}", error);
+                retryable_attempts = retryable_attempts.saturating_add(1);
+                continue;
+            }
+            Err(error) => {
+                last_error = format!("storage worker failed to record peer attempt: {}", error);
+                retryable_attempts = retryable_attempts.saturating_add(1);
+                continue;
+            }
         }
 
         match fetch_from_peer_with_limit(
@@ -1082,7 +1118,7 @@ pub async fn run_metadata_fetcher(
                 if let Ok(Ok(records)) = due {
                     for (record, peers) in records {
                         if jobs.len() >= max_active_hash_jobs && !jobs.contains_key(&record.info_hash) {
-                            break;
+                            continue;
                         }
                         tracing::debug!(
                             "restoring {} metadata job {} after {:?}",
@@ -1104,16 +1140,7 @@ pub async fn run_metadata_fetcher(
             result = workers.join_next(), if !workers.is_empty() => {
                 match result {
                     Some(Ok(outcome)) => {
-                        if outcome.complete || outcome.terminal || outcome.parked {
-                            jobs.remove(&outcome.info_hash);
-                            ready_set.remove(&outcome.info_hash);
-                        } else if let Some(job) = jobs.get_mut(&outcome.info_hash) {
-                            job.running = false;
-                            job.attempt_count = job.attempt_count.saturating_add(outcome.attempts);
-                            if !job.peers.is_empty() && ready_set.insert(outcome.info_hash) {
-                                ready.push_back(outcome.info_hash);
-                            }
-                        }
+                        apply_job_outcome(&mut jobs, &mut ready, &mut ready_set, outcome);
                     }
                     Some(Err(error)) => tracing::warn!("metadata worker join error: {}", error),
                     None => {}
@@ -1132,6 +1159,60 @@ pub async fn run_metadata_fetcher(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn retry_outcome(info_hash: InfoHash) -> JobOutcome {
+        JobOutcome {
+            info_hash,
+            attempts: 1,
+            complete: false,
+            terminal: false,
+            parked: false,
+        }
+    }
+
+    #[test]
+    fn retry_without_pending_peers_releases_active_job_capacity() {
+        let info_hash = [0x91; 20];
+        let mut jobs = HashMap::from([(info_hash, HashJob::new(0))]);
+        jobs.get_mut(&info_hash).unwrap().running = true;
+        let mut ready = VecDeque::new();
+        let mut ready_set = HashSet::new();
+
+        apply_job_outcome(
+            &mut jobs,
+            &mut ready,
+            &mut ready_set,
+            retry_outcome(info_hash),
+        );
+
+        assert!(!jobs.contains_key(&info_hash));
+        assert!(ready.is_empty());
+    }
+
+    #[test]
+    fn retry_with_new_pending_peer_stays_ready() {
+        let info_hash = [0x92; 20];
+        let peer = PeerContact {
+            addr: "8.8.8.8:6881".parse().unwrap(),
+        };
+        let mut job = HashJob::new(2);
+        job.running = true;
+        job.merge_peers(vec![peer], 8);
+        let mut jobs = HashMap::from([(info_hash, job)]);
+        let mut ready = VecDeque::new();
+        let mut ready_set = HashSet::new();
+
+        apply_job_outcome(
+            &mut jobs,
+            &mut ready,
+            &mut ready_set,
+            retry_outcome(info_hash),
+        );
+
+        assert_eq!(ready.pop_front(), Some(info_hash));
+        assert_eq!(jobs.get(&info_hash).unwrap().attempt_count, 3);
+        assert!(!jobs.get(&info_hash).unwrap().running);
+    }
 
     #[test]
     fn test_metadata_piece_count() {
@@ -1155,6 +1236,32 @@ mod tests {
         let info_dict = b"d6:lengthi42e4:name8:test.txte";
         let wrong_hash: InfoHash = [0xABu8; 20];
         assert!(!verify_metadata_hash(&wrong_hash, info_dict));
+    }
+
+    #[test]
+    fn parse_torrent_info_rejects_negative_single_file_length() {
+        let result = parse_torrent_info(b"d6:lengthi-1e4:name3:bad12:piece lengthi16384ee");
+
+        assert!(result.unwrap_err().contains("negative torrent length"));
+    }
+
+    #[test]
+    fn parse_torrent_info_rejects_empty_multi_file_path() {
+        let result =
+            parse_torrent_info(b"d5:filesld6:lengthi1e4:pathleee4:name1:x12:piece lengthi16384ee");
+
+        assert!(result
+            .unwrap_err()
+            .contains("invalid file path component count"));
+    }
+
+    #[test]
+    fn parse_torrent_info_rejects_total_size_overflow() {
+        let result = parse_torrent_info(
+            b"d5:filesld6:lengthi9223372036854775807e4:pathl1:aeed6:lengthi1e4:pathl1:beee4:name1:x12:piece lengthi16384ee",
+        );
+
+        assert!(result.unwrap_err().contains("torrent total size overflow"));
     }
 
     #[tokio::test]

@@ -153,6 +153,14 @@ fn is_public_endpoint(addr: &SocketAddrV4) -> bool {
     addr.port() != 0 && is_public_ipv4(addr.ip())
 }
 
+fn record_hash_observation(info_hashes_found: &mut usize, info_hash: &InfoHash) -> bool {
+    if info_hash == &[0; 20] {
+        return false;
+    }
+    *info_hashes_found = info_hashes_found.saturating_add(1);
+    true
+}
+
 fn transaction_id_bytes(id: u16) -> [u8; TRANSACTION_ID_LEN] {
     id.to_be_bytes()
 }
@@ -504,6 +512,7 @@ pub struct DhtCrawler {
     peer_cache: HashMap<InfoHash, Vec<CachedPeer>>,
     config: DhtConfig,
     queries_sent: usize,
+    info_hashes_found: usize,
     sampling_round_id: u64,
 }
 
@@ -552,6 +561,7 @@ impl DhtCrawler {
             peer_cache: HashMap::new(),
             config,
             queries_sent: 0,
+            info_hashes_found: 0,
             sampling_round_id: 0,
         }
     }
@@ -685,6 +695,9 @@ impl DhtCrawler {
         mut peers: Vec<PeerContact>,
         source: DiscoverySource,
     ) {
+        if !record_hash_observation(&mut self.info_hashes_found, &info_hash) {
+            return;
+        }
         peers.sort_by_key(|peer| peer.addr);
         peers.dedup();
         peers.truncate(self.config.max_peers_per_hash);
@@ -735,7 +748,7 @@ impl DhtCrawler {
                     self.emit_stat(CrawlStatsEvent::DhtSnapshot {
                         nodes_known: self.routing.node_count(),
                         queries_sent: self.queries_sent,
-                        info_hashes_found: self.discovery_set.len(),
+                        info_hashes_found: self.info_hashes_found,
                     });
                 }
             }
@@ -1140,6 +1153,11 @@ impl DhtCrawler {
     }
 
     fn cache_peer(&mut self, hash: InfoHash, peer: PeerContact) {
+        if self.config.announced_peer_hash_capacity == 0
+            || self.config.announced_peers_per_hash == 0
+        {
+            return;
+        }
         if !self.peer_cache.contains_key(&hash)
             && self.peer_cache.len() >= self.config.announced_peer_hash_capacity
         {
@@ -1192,6 +1210,16 @@ fn response_nodes(message: &KrpcMessage) -> Vec<NodeContact> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discovery_count_is_cumulative_and_rejects_zero_hash() {
+        let mut count = 0;
+
+        assert!(record_hash_observation(&mut count, &[2; 20]));
+        assert!(record_hash_observation(&mut count, &[3; 20]));
+        assert!(!record_hash_observation(&mut count, &[0; 20]));
+        assert_eq!(count, 2);
+    }
 
     fn response(
         transaction: u16,

@@ -377,21 +377,44 @@ async fn flush_stats_batch(
     events: &mut Vec<types::CrawlStatsEvent>,
     snapshot: &mut Option<store::RuntimeSnapshot>,
 ) {
+    let mut retry_delay = Duration::from_millis(100);
+    while !try_flush_stats_batch(store, events, snapshot).await {
+        tokio::time::sleep(retry_delay).await;
+        retry_delay = retry_delay.saturating_mul(2).min(Duration::from_secs(5));
+    }
+}
+
+async fn try_flush_stats_batch(
+    store: &Arc<store::Store>,
+    events: &mut Vec<types::CrawlStatsEvent>,
+    snapshot: &mut Option<store::RuntimeSnapshot>,
+) -> bool {
     if events.is_empty() {
-        return;
+        return true;
     }
     let batch = std::mem::take(events);
     let batch_snapshot = snapshot.take();
+    let retry_batch = batch.clone();
+    let retry_snapshot = batch_snapshot;
     let persistence_store = store.clone();
     let persisted = tokio::task::spawn_blocking(move || {
         persistence_store.persist_runtime_batch(&batch, batch_snapshot)
     })
     .await;
     match persisted {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => tracing::warn!("failed to persist runtime batch: {}", error),
-        Err(error) => tracing::warn!("storage worker join error: {}", error),
+        Ok(Ok(())) => return true,
+        Ok(Err(error)) => {
+            tracing::warn!("failed to persist runtime batch: {}", error);
+            *events = retry_batch;
+            *snapshot = retry_snapshot;
+        }
+        Err(error) => {
+            tracing::warn!("storage worker join error: {}", error);
+            *events = retry_batch;
+            *snapshot = retry_snapshot;
+        }
     }
+    false
 }
 
 #[derive(Default)]
@@ -985,6 +1008,32 @@ mod integration_tests {
         .unwrap();
         drop(stats_tx);
         handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_failed_runtime_batch_is_retained_for_retry() {
+        let store = Arc::new(store::Store::open_in_memory().unwrap());
+        store
+            .execute_batch_for_test("DROP TABLE metadata_failure_counts")
+            .unwrap();
+        let mut events = vec![types::CrawlStatsEvent::MetadataFetchFailed {
+            reason: types::MetadataFailureReason::Connect,
+        }];
+        let mut snapshot = Some(store::RuntimeSnapshot {
+            nodes_known: 1,
+            queries_sent: 2,
+            info_hashes_found: 3,
+            metadata_fetched: 4,
+        });
+
+        assert!(!try_flush_stats_batch(&store, &mut events, &mut snapshot).await);
+
+        assert_eq!(events.len(), 1);
+        let snapshot = snapshot.unwrap();
+        assert_eq!(snapshot.nodes_known, 1);
+        assert_eq!(snapshot.queries_sent, 2);
+        assert_eq!(snapshot.info_hashes_found, 3);
+        assert_eq!(snapshot.metadata_fetched, 4);
     }
 
     #[test]

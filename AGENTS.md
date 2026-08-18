@@ -11,7 +11,7 @@ cargo clippy         # Lint
 cargo fmt --check    # Format check
 ```
 
-Run tests and clippy before committing. All 26 tests must pass, clippy must have 0 warnings.
+Run tests and clippy before committing. All tests must pass, clippy must have 0 warnings.
 
 ## Project Structure
 
@@ -26,19 +26,24 @@ src/
 ├── wire.rs          # BitTorrent wire protocol (handshake, messages, extensions, ut_metadata)
 ├── metadata.rs      # Metadata fetcher: connect to peers, fetch torrent metadata
 ├── store.rs         # SQLite: schema, CRUD, search, stats, prune
+├── magnet.rs        # Magnet URI validation and formatting
+├── web.rs           # Axum HTTP API and dashboard routes
+├── web_dashboard.html # Embedded local dashboard markup
+├── web_dashboard.css  # Embedded dashboard styles
+├── web_dashboard.js   # Embedded dashboard behavior
 ```
 
 ## Architecture
 
-Three async subsystems connected by `tokio::sync::mpsc` channels:
+Three async subsystems connected by bounded `tokio::sync::mpsc` channels:
 
 ```
 DhtCrawler ──(InfoHash, Vec<PeerContact>)──→ run_metadata_fetcher ──→ Store
 ```
 
 - **DHT Crawler** (`dht.rs`): Single `tokio::net::UdpSocket`. Bootstrap via `find_node`, periodic `get_peers` to random targets. Handles incoming queries (`ping`, `find_node`, `get_peers`, `announce_peer`). Publishes discovered `(info_hash, peers)` tuples to channel.
-- **Metadata Fetcher** (`metadata.rs`): Consumes channel. Connects to peers via TCP, performs BitTorrent handshake, negotiates `ut_metadata` extension (BEP 9), downloads and assembles torrent info dict. Rate-limited via `Semaphore`.
-- **SQLite Store** (`store.rs`): WAL mode, foreign keys enabled. Tables: `torrents`, `files`, `crawl_stats`. All access through `Store` struct with `Mutex<Connection>`.
+- **Metadata Fetcher** (`metadata.rs`): Consumes discoveries, dedupes work by info hash, persists retry state and peers, and limits concurrent hash workers. Connects to peers via TCP, performs the BitTorrent handshake, negotiates `ut_metadata` (BEP 9), and downloads torrent info dictionaries.
+- **SQLite Store** (`store.rs`): WAL mode, foreign keys enabled, and `PRAGMA user_version` migrations. Persists torrents, files, crawl state, metadata jobs and peers, DHT nodes, statistics, and FTS data through `Store` with `Mutex<Connection>`.
 
 ## Code Conventions
 
@@ -56,4 +61,4 @@ DhtCrawler ──(InfoHash, Vec<PeerContact>)──→ run_metadata_fetcher ─�
 - Store tests use `Store::open_in_memory()`.
 - Integration tests in `src/main.rs` under `mod integration_tests`.
 - Don't write tests that hit the network (real DHT/peers).
-- Run with `cargo test` (should be 26 passing).
+- Run with `cargo test`; every test must pass.
