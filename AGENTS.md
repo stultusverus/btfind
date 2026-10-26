@@ -25,7 +25,7 @@ src/
 ├── dht.rs           # DHT crawler: bootstrap, find_node, get_peers, discovery loop
 ├── wire.rs          # BitTorrent wire protocol (handshake, messages, extensions, ut_metadata)
 ├── metadata.rs      # Metadata fetcher: connect to peers, fetch torrent metadata
-├── store.rs         # SQLite: schema, CRUD, search, stats, prune
+├── store.rs         # MySQL: async CRUD, ngram search, stats, prune
 ├── magnet.rs        # Magnet URI validation and formatting
 ├── web.rs           # Axum HTTP API and dashboard routes
 ├── web_dashboard.html # Embedded local dashboard markup
@@ -43,22 +43,22 @@ DhtCrawler ──(InfoHash, Vec<PeerContact>)──→ run_metadata_fetcher ─�
 
 - **DHT Crawler** (`dht.rs`): Single `tokio::net::UdpSocket`. Bootstrap via `find_node`, periodic `get_peers` to random targets. Handles incoming queries (`ping`, `find_node`, `get_peers`, `announce_peer`). Publishes discovered `(info_hash, peers)` tuples to channel.
 - **Metadata Fetcher** (`metadata.rs`): Consumes discoveries, dedupes work by info hash, persists retry state and peers, and limits concurrent hash workers. Connects to peers via TCP, performs the BitTorrent handshake, negotiates `ut_metadata` (BEP 9), and downloads torrent info dictionaries.
-- **SQLite Store** (`store.rs`): WAL mode, foreign keys enabled, and `PRAGMA user_version` migrations. Persists torrents, files, crawl state, metadata jobs and peers, DHT nodes, statistics, and FTS data through `Store` with `Mutex<Connection>`.
+- **MySQL Store** (`store.rs`): Async SQLx pool, InnoDB foreign keys, and explicit versioned migrations. Persists torrents, files, crawler state, jobs/peers, statistics, and ngram search documents. SQLite is read-only import input in migration.rs.
 
 ## Code Conventions
 
-- **Error handling**: Use `Result<T, E>` where E is `rusqlite::Error` or `String`. Don't use `unwrap()` in production code paths; use `expect()` with a message for invariants. Log errors at `warn` or `debug` level, never silently drop with `let _ =`.
-- **Mutex**: `Store.conn` is `Mutex<Connection>`. Lock scope is per-method call (lock, query, drop). No nested locks.
-- **Async**: All I/O is async (`tokio`). CPU-bound work (SQLite) is synchronous behind the mutex — callers are in `tokio::spawn` tasks.
+- **Error handling**: Use `store::Error` (SQLx) or `String`. Don't use `unwrap()` in production code paths; use `expect()` with a message for invariants. Log errors at `warn` or `debug` level, never silently drop with `let _ =`.
+- **Transactions**: Catalog mutations acquire the totals row before torrent rows. Keep metadata, files, search documents, jobs, and counter changes atomic.
+- **Async**: Database I/O uses SQLx futures. SQLite snapshot reading/hashing runs in spawn_blocking only during import.
 - **Channel types**: The `info_hash_tx`/`info_hash_rx` channel carries `(InfoHash, Vec<PeerContact>)`. When adding new data, update both sender and receiver sides.
-- **Database**: info_hash stored as hex text (not blob). SQL parameters via `rusqlite::params!`. Dynamic ORDER BY uses whitelist validation, not raw user input.
+- **Database**: info_hash stored as hex text (not blob). Bind SQL parameters through SQLx. Dynamic ORDER BY uses whitelist validation, not raw user input. Do not run migrations or index backfills in HTTP requests.
 - **Config**: Defaults via serde `#[serde(default = "...")]` functions. CLI flags override config values. Port is `Option<u16>` in CLI, resolved in `cmd_run` with config fallback.
 - **No comments** unless essential. Code should be self-documenting.
 
 ## Testing
 
 - Unit tests in `#[cfg(test)]` modules at the bottom of each source file.
-- Store tests use `Store::open_in_memory()`.
+- Database integration tests use isolated databases on a disposable local MySQL server, selected by BTFIND_TEST_DATABASE_URL.
 - Integration tests in `src/main.rs` under `mod integration_tests`.
 - Don't write tests that hit the network (real DHT/peers).
-- Run with `cargo test`; every test must pass.
+- Run offline tests with `cargo test` and database tests with `bash scripts/test-mysql.sh`; every test must pass. Database tests are explicitly ignored in the offline suite, not silently skipped when their server is unavailable.

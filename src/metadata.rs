@@ -607,7 +607,7 @@ struct PeerRetryFilter {
     next_eligible_at: Option<i64>,
 }
 
-fn filter_peers_for_retry(
+async fn filter_peers_for_retry(
     store: &Store,
     info_hash: &InfoHash,
     peers: &[PeerContact],
@@ -617,7 +617,10 @@ fn filter_peers_for_retry(
     let mut next_eligible_at: Option<i64> = None;
     for peer in peers {
         let peer_addr = peer.addr.to_string();
-        match store.peer_retry_eligibility(info_hash, &peer_addr, retry_after_hours) {
+        match store
+            .peer_retry_eligibility(info_hash, &peer_addr, retry_after_hours)
+            .await
+        {
             Ok(PeerRetryEligibility::Eligible) => eligible.push(peer.clone()),
             Ok(PeerRetryEligibility::RetryAt(retry_at)) => {
                 next_eligible_at =
@@ -664,14 +667,10 @@ fn emit_metadata_failure(stats_tx: &mpsc::Sender<CrawlStatsEvent>, reason: Metad
     }
 }
 
-fn log_storage_result(
-    operation: &str,
-    result: Result<Result<(), rusqlite::Error>, tokio::task::JoinError>,
-) {
+fn log_storage_result(operation: &str, result: Result<(), crate::store::Error>) {
     match result {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => tracing::warn!("{} failed: {}", operation, error),
-        Err(error) => tracing::warn!("{} worker failed: {}", operation, error),
+        Ok(()) => {}
+        Err(error) => tracing::warn!("{} failed: {}", operation, error),
     }
 }
 
@@ -772,14 +771,10 @@ async fn process_hash_round(
 ) -> JobOutcome {
     let hash_hex = hex::encode(info_hash);
     let filter_store = store.clone();
-    let filtered = tokio::task::spawn_blocking(move || {
-        filter_peers_for_retry(&filter_store, &info_hash, &peers, config.retry_after_hours)
+    let filtered = (async move {
+        filter_peers_for_retry(&filter_store, &info_hash, &peers, config.retry_after_hours).await
     })
-    .await
-    .unwrap_or(PeerRetryFilter {
-        eligible: Vec::new(),
-        next_eligible_at: Some(chrono::Utc::now().timestamp().saturating_add(300)),
-    });
+    .await;
     let mut attempts = 0u32;
     let mut last_error = "no eligible peers".to_string();
     let mut long_backoff = false;
@@ -791,19 +786,16 @@ async fn process_hash_round(
         let attempt_store = store.clone();
         let attempt_hash = info_hash;
         let attempt_addr = peer_addr.clone();
-        match tokio::task::spawn_blocking(move || {
-            attempt_store.set_peer_attempt(&attempt_hash, &attempt_addr, None)
+        match (async move {
+            attempt_store
+                .set_peer_attempt(&attempt_hash, &attempt_addr, None)
+                .await
         })
         .await
         {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                last_error = format!("storage: failed to record peer attempt: {}", error);
-                retryable_attempts = retryable_attempts.saturating_add(1);
-                continue;
-            }
+            Ok(()) => {}
             Err(error) => {
-                last_error = format!("storage worker failed to record peer attempt: {}", error);
+                last_error = format!("storage: failed to record peer attempt: {}", error);
                 retryable_attempts = retryable_attempts.saturating_add(1);
                 continue;
             }
@@ -822,12 +814,14 @@ async fn process_hash_round(
                 let failure_store = store.clone();
                 let failure_hash = info_hash;
                 let failure_addr = peer_addr.clone();
-                let recorded = tokio::task::spawn_blocking(move || {
-                    failure_store.set_peer_attempt(
-                        &failure_hash,
-                        &failure_addr,
-                        Some("metadata hash mismatch"),
-                    )
+                let recorded = (async move {
+                    failure_store
+                        .set_peer_attempt(
+                            &failure_hash,
+                            &failure_addr,
+                            Some("metadata hash mismatch"),
+                        )
+                        .await
                 })
                 .await;
                 log_storage_result("record metadata hash mismatch", recorded);
@@ -841,18 +835,20 @@ async fn process_hash_round(
                         info.file_count
                     );
                     let commit_store = store.clone();
-                    let committed = tokio::task::spawn_blocking(move || {
-                        commit_store.commit_metadata(
-                            &info_hash,
-                            &info.name,
-                            info.piece_length,
-                            info.total_size,
-                            &info.files,
-                        )
+                    let committed = (async move {
+                        commit_store
+                            .commit_metadata(
+                                &info_hash,
+                                &info.name,
+                                info.piece_length,
+                                info.total_size,
+                                &info.files,
+                            )
+                            .await
                     })
                     .await;
                     match committed {
-                        Ok(Ok(())) => {
+                        Ok(()) => {
                             if stats_tx.try_send(CrawlStatsEvent::MetadataFetched).is_err() {
                                 tracing::warn!("metadata completion statistic was not accepted");
                             }
@@ -864,12 +860,8 @@ async fn process_hash_round(
                                 parked: false,
                             };
                         }
-                        Ok(Err(error)) => {
-                            last_error = format!("storage: {}", error);
-                            retryable_attempts = retryable_attempts.saturating_add(1);
-                        }
                         Err(error) => {
-                            last_error = format!("storage worker: {}", error);
+                            last_error = format!("storage: {}", error);
                             retryable_attempts = retryable_attempts.saturating_add(1);
                         }
                     }
@@ -883,14 +875,16 @@ async fn process_hash_round(
                     };
                     let terminal_store = store.clone();
                     let terminal_error = error.clone();
-                    let recorded = tokio::task::spawn_blocking(move || {
-                        terminal_store.update_hash_job_failure(
-                            &info_hash,
-                            status,
-                            config.prior_attempt_count.saturating_add(attempts),
-                            0,
-                            &terminal_error,
-                        )
+                    let recorded = (async move {
+                        terminal_store
+                            .update_hash_job_failure(
+                                &info_hash,
+                                status,
+                                config.prior_attempt_count.saturating_add(attempts),
+                                0,
+                                &terminal_error,
+                            )
+                            .await
                     })
                     .await;
                     log_storage_result("record terminal metadata state", recorded);
@@ -913,12 +907,10 @@ async fn process_hash_round(
                 let failure_hash = info_hash;
                 let failure_addr = peer_addr.clone();
                 let failure_text = last_error.clone();
-                let recorded = tokio::task::spawn_blocking(move || {
-                    failure_store.set_peer_attempt(
-                        &failure_hash,
-                        &failure_addr,
-                        Some(&failure_text),
-                    )
+                let recorded = (async move {
+                    failure_store
+                        .set_peer_attempt(&failure_hash, &failure_addr, Some(&failure_text))
+                        .await
                 })
                 .await;
                 log_storage_result("record metadata peer failure", recorded);
@@ -940,14 +932,16 @@ async fn process_hash_round(
     if !has_retryable_peer {
         let retry_store = store.clone();
         let retry_error = last_error.clone();
-        let recorded = tokio::task::spawn_blocking(move || {
-            retry_store.update_hash_job_failure(
-                &info_hash,
-                "waiting_peers",
-                attempt_count,
-                0,
-                &retry_error,
-            )
+        let recorded = (async move {
+            retry_store
+                .update_hash_job_failure(
+                    &info_hash,
+                    "waiting_peers",
+                    attempt_count,
+                    0,
+                    &retry_error,
+                )
+                .await
         })
         .await;
         log_storage_result("park metadata job", recorded);
@@ -969,14 +963,16 @@ async fn process_hash_round(
         next_peer_eligibility.map_or(backoff_at, |peer_retry_at| backoff_at.max(peer_retry_at));
     let retry_store = store.clone();
     let retry_error = last_error.clone();
-    let recorded = tokio::task::spawn_blocking(move || {
-        retry_store.update_hash_job_failure(
-            &info_hash,
-            "retry_at",
-            attempt_count,
-            next_attempt_at,
-            &retry_error,
-        )
+    let recorded = (async move {
+        retry_store
+            .update_hash_job_failure(
+                &info_hash,
+                "retry_at",
+                attempt_count,
+                next_attempt_at,
+                &retry_error,
+            )
+            .await
     })
     .await;
     log_storage_result("schedule metadata retry", recorded);
@@ -991,19 +987,21 @@ async fn process_hash_round(
 }
 
 #[cfg(test)]
-fn mark_metadata_complete_and_emit(
+async fn mark_metadata_complete_and_emit(
     store: &Store,
     info_hash: &InfoHash,
     info: &TorrentInfo,
     stats_tx: &mpsc::Sender<CrawlStatsEvent>,
-) -> Result<(), rusqlite::Error> {
-    store.commit_metadata(
-        info_hash,
-        &info.name,
-        info.piece_length,
-        info.total_size,
-        &info.files,
-    )?;
+) -> Result<(), crate::store::Error> {
+    store
+        .commit_metadata(
+            info_hash,
+            &info.name,
+            info.piece_length,
+            info.total_size,
+            &info.files,
+        )
+        .await?;
     if stats_tx.try_send(CrawlStatsEvent::MetadataFetched).is_err() {
         tracing::warn!("stats_tx send failed after metadata fetch");
     }
@@ -1072,22 +1070,28 @@ pub async fn run_metadata_fetcher(
                 let peers = discovery.peers;
                 let has_peers = !peers.is_empty();
                 let source = discovery.source;
-                let persist_store = store.clone();
-                let durable_peers = peers.clone();
-                let persistence = tokio::task::spawn_blocking(move || {
-                    persist_store.persist_hash_discovery(
+                let mut retry_delay = Duration::from_millis(100);
+                loop {
+                    let persistence = (async {
+                    store.persist_hash_discovery(
                         &info_hash,
                         source.as_str(),
                         has_peers,
-                    )?;
-                    persist_store.persist_hash_job_peers(
+                    ).await?;
+                    store.persist_hash_job_peers(
                         &info_hash,
-                        &durable_peers,
+                        &peers,
                         max_peers_per_hash,
-                    )
+                    ).await
                 }).await;
-                if !matches!(persistence, Ok(Ok(()))) {
-                    tracing::warn!("failed to persist discovery for {}", hex::encode(info_hash));
+                    match persistence {
+                        Ok(()) => break,
+                        Err(error) => {
+                            tracing::warn!("failed to persist discovery for {}: {}; retrying", hex::encode(info_hash), error);
+                            tokio::time::sleep(retry_delay).await;
+                            retry_delay = retry_delay.saturating_mul(2).min(Duration::from_secs(5));
+                        }
+                    }
                 }
                 if !jobs.contains_key(&info_hash) && jobs.len() >= max_active_hash_jobs {
                     if stats_tx
@@ -1106,16 +1110,19 @@ pub async fn run_metadata_fetcher(
             }
             _ = retry_tick.tick() => {
                 let due_store = store.clone();
-                let due = tokio::task::spawn_blocking(move || {
-                    let records = due_store.due_hash_jobs(max_active_hash_jobs)?;
+                let due = (async move {
+                    let records = due_store.due_hash_jobs(max_active_hash_jobs).await?;
                     let mut loaded = Vec::with_capacity(records.len());
                     for record in records {
-                        let peers = due_store.hash_job_peers(&record.info_hash, max_peers_per_hash)?;
+                        let peers = due_store.hash_job_peers(&record.info_hash, max_peers_per_hash).await?;
                         loaded.push((record, peers));
                     }
-                    Ok::<_, rusqlite::Error>(loaded)
+                    Ok::<_, crate::store::Error>(loaded)
                 }).await;
-                if let Ok(Ok(records)) = due {
+                if let Err(error) = &due {
+                    tracing::warn!("failed to load due metadata jobs: {}", error);
+                }
+                if let Ok(records) = due {
                     for (record, peers) in records {
                         if jobs.len() >= max_active_hash_jobs && !jobs.contains_key(&record.info_hash) {
                             continue;
@@ -1265,20 +1272,24 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires BTFIND_TEST_DATABASE_URL; run scripts/test-mysql.sh"]
     async fn durable_retry_waits_until_peer_is_eligible() {
-        let store = Arc::new(Store::open_in_memory().unwrap());
+        let store = Arc::new(Store::open_test_database().await.unwrap());
         let info_hash = [0xACu8; 20];
         let peer = PeerContact {
             addr: "8.8.8.8:6881".parse().unwrap(),
         };
         store
             .persist_hash_discovery(&info_hash, "test", true)
+            .await
             .unwrap();
         store
             .persist_hash_job_peers(&info_hash, std::slice::from_ref(&peer), 8)
+            .await
             .unwrap();
         store
             .set_peer_attempt(&info_hash, &peer.addr.to_string(), Some("timeout"))
+            .await
             .unwrap();
         let earliest_expected = chrono::Utc::now().timestamp() + 23 * 3600;
         let (stats_tx, _stats_rx) = mpsc::channel(4);
@@ -1300,21 +1311,23 @@ mod tests {
         assert_eq!(outcome.attempts, 0);
         assert!(!outcome.parked);
         let (status, attempt_count, next_attempt_at) =
-            store.hash_job_schedule_for_test(&info_hash).unwrap();
+            store.hash_job_schedule_for_test(&info_hash).await.unwrap();
         assert_eq!(status, "retry_at");
         assert_eq!(attempt_count, 0);
         assert!(next_attempt_at >= earliest_expected);
     }
 
     #[tokio::test]
+    #[ignore = "requires BTFIND_TEST_DATABASE_URL; run scripts/test-mysql.sh"]
     async fn permanently_rejected_peer_parks_job_until_new_discovery() {
-        let store = Arc::new(Store::open_in_memory().unwrap());
+        let store = Arc::new(Store::open_test_database().await.unwrap());
         let info_hash = [0xADu8; 20];
         let peer = PeerContact {
             addr: "8.8.4.4:6881".parse().unwrap(),
         };
         store
             .persist_hash_discovery(&info_hash, "test", true)
+            .await
             .unwrap();
         store
             .set_peer_attempt(
@@ -1322,6 +1335,7 @@ mod tests {
                 &peer.addr.to_string(),
                 Some("metadata hash mismatch"),
             )
+            .await
             .unwrap();
         let (stats_tx, _stats_rx) = mpsc::channel(4);
 
@@ -1342,21 +1356,23 @@ mod tests {
         assert_eq!(outcome.attempts, 0);
         assert!(outcome.parked);
         let (status, attempt_count, next_attempt_at) =
-            store.hash_job_schedule_for_test(&info_hash).unwrap();
+            store.hash_job_schedule_for_test(&info_hash).await.unwrap();
         assert_eq!(status, "waiting_peers");
         assert_eq!(attempt_count, 1);
         assert_eq!(next_attempt_at, 0);
 
         store
             .persist_hash_discovery(&info_hash, "sample_infohashes", false)
+            .await
             .unwrap();
-        let (status, _, _) = store.hash_job_schedule_for_test(&info_hash).unwrap();
+        let (status, _, _) = store.hash_job_schedule_for_test(&info_hash).await.unwrap();
         assert_eq!(status, "waiting_peers");
 
         store
             .persist_hash_discovery(&info_hash, "announce_peer", true)
+            .await
             .unwrap();
-        let (status, _, _) = store.hash_job_schedule_for_test(&info_hash).unwrap();
+        let (status, _, _) = store.hash_job_schedule_for_test(&info_hash).await.unwrap();
         assert_eq!(status, "queued");
     }
 
@@ -1719,9 +1735,10 @@ mod tests {
         assert!(result.is_err(), "mismatched total_size was accepted");
     }
 
-    #[test]
-    fn test_filter_peers_for_retry_keeps_new_peers_for_seen_hash() {
-        let store = Store::open_in_memory().unwrap();
+    #[tokio::test]
+    #[ignore = "requires BTFIND_TEST_DATABASE_URL; run scripts/test-mysql.sh"]
+    async fn test_filter_peers_for_retry_keeps_new_peers_for_seen_hash() {
+        let store = Store::open_test_database().await.unwrap();
         let info_hash = [0xDAu8; 20];
         let attempted_peer = PeerContact {
             addr: "1.1.1.1:6881".parse().unwrap(),
@@ -1729,13 +1746,17 @@ mod tests {
         let new_peer = PeerContact {
             addr: "8.8.8.8:51413".parse().unwrap(),
         };
-        store.upsert_torrent(info_hash, None, 0, 0, "dht").unwrap();
+        store
+            .upsert_torrent(info_hash, None, 0, 0, "dht")
+            .await
+            .unwrap();
         store
             .set_peer_attempt(
                 &info_hash,
                 &attempted_peer.addr.to_string(),
                 Some("timeout"),
             )
+            .await
             .unwrap();
 
         let peers = filter_peers_for_retry(
@@ -1743,30 +1764,37 @@ mod tests {
             &info_hash,
             &[attempted_peer.clone(), new_peer.clone()],
             24,
-        );
+        )
+        .await;
 
         assert_eq!(peers.eligible, vec![new_peer]);
         assert!(peers.next_eligible_at.is_some());
     }
 
-    #[test]
-    fn test_filter_peers_for_retry_disabled_window_keeps_all_peers() {
-        let store = Store::open_in_memory().unwrap();
+    #[tokio::test]
+    #[ignore = "requires BTFIND_TEST_DATABASE_URL; run scripts/test-mysql.sh"]
+    async fn test_filter_peers_for_retry_disabled_window_keeps_all_peers() {
+        let store = Store::open_test_database().await.unwrap();
         let info_hash = [0xDBu8; 20];
         let attempted_peer = PeerContact {
             addr: "1.1.1.1:6881".parse().unwrap(),
         };
-        store.upsert_torrent(info_hash, None, 0, 0, "dht").unwrap();
+        store
+            .upsert_torrent(info_hash, None, 0, 0, "dht")
+            .await
+            .unwrap();
         store
             .set_peer_attempt(
                 &info_hash,
                 &attempted_peer.addr.to_string(),
                 Some("timeout"),
             )
+            .await
             .unwrap();
 
         let peers =
-            filter_peers_for_retry(&store, &info_hash, std::slice::from_ref(&attempted_peer), 0);
+            filter_peers_for_retry(&store, &info_hash, std::slice::from_ref(&attempted_peer), 0)
+                .await;
 
         assert_eq!(peers.eligible, vec![attempted_peer]);
         assert_eq!(peers.next_eligible_at, None);
@@ -1800,43 +1828,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_mark_metadata_complete_emits_metadata_fetched_stat() {
-        let store = Store::open_in_memory().unwrap();
+    #[tokio::test]
+    #[ignore = "requires BTFIND_TEST_DATABASE_URL; run scripts/test-mysql.sh"]
+    async fn test_mark_metadata_complete_emits_metadata_fetched_stat() {
+        let store = Store::open_test_database().await.unwrap();
         let info_hash = [0xABu8; 20];
-        store.upsert_torrent(info_hash, None, 0, 0, "dht").unwrap();
-        let info = TorrentInfo {
-            name: "test".to_string(),
-            piece_length: 16384,
-            total_size: 42,
-            file_count: 1,
-            files: vec![("test".to_string(), 42)],
-        };
-        let (stats_tx, mut stats_rx) = mpsc::channel(8);
-
-        mark_metadata_complete_and_emit(&store, &info_hash, &info, &stats_tx).unwrap();
-
-        assert_eq!(
-            stats_rx.try_recv().unwrap(),
-            CrawlStatsEvent::MetadataFetched
-        );
-    }
-
-    #[test]
-    fn test_mark_metadata_complete_does_not_emit_when_file_insert_fails() {
-        let store = Store::open_in_memory().unwrap();
-        let info_hash = [0xACu8; 20];
-        store.upsert_torrent(info_hash, None, 0, 0, "dht").unwrap();
         store
-            .execute_batch_for_test(
-                "
-                CREATE TRIGGER fail_file_insert
-                BEFORE INSERT ON files
-                BEGIN
-                    SELECT RAISE(ABORT, 'forced insert failure');
-                END;
-                ",
-            )
+            .upsert_torrent(info_hash, None, 0, 0, "dht")
+            .await
             .unwrap();
         let info = TorrentInfo {
             name: "test".to_string(),
@@ -1847,7 +1846,45 @@ mod tests {
         };
         let (stats_tx, mut stats_rx) = mpsc::channel(8);
 
-        let result = mark_metadata_complete_and_emit(&store, &info_hash, &info, &stats_tx);
+        mark_metadata_complete_and_emit(&store, &info_hash, &info, &stats_tx)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            stats_rx.try_recv().unwrap(),
+            CrawlStatsEvent::MetadataFetched
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires BTFIND_TEST_DATABASE_URL; run scripts/test-mysql.sh"]
+    async fn test_mark_metadata_complete_does_not_emit_when_file_insert_fails() {
+        let store = Store::open_test_database().await.unwrap();
+        let info_hash = [0xACu8; 20];
+        store
+            .upsert_torrent(info_hash, None, 0, 0, "dht")
+            .await
+            .unwrap();
+        store
+            .execute_batch_for_test(
+                "
+                CREATE TRIGGER fail_file_insert
+                BEFORE INSERT ON files FOR EACH ROW
+                SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='forced insert failure';
+                ",
+            )
+            .await
+            .unwrap();
+        let info = TorrentInfo {
+            name: "test".to_string(),
+            piece_length: 16384,
+            total_size: 42,
+            file_count: 1,
+            files: vec![("test".to_string(), 42)],
+        };
+        let (stats_tx, mut stats_rx) = mpsc::channel(8);
+
+        let result = mark_metadata_complete_and_emit(&store, &info_hash, &info, &stats_tx).await;
 
         assert!(result.is_err());
         assert!(stats_rx.try_recv().is_err());

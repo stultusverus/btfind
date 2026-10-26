@@ -1,6 +1,6 @@
 # btfind
 
-BitTorrent DHT sniffer — crawls the DHT network, discovers torrents, fetches metadata (BEP 9), stores results in SQLite, and provides CLI search, magnet link export, and a local HTTP dashboard.
+BitTorrent DHT sniffer — crawls the DHT network, discovers torrents, fetches metadata (BEP 9), stores results in MySQL, and provides CLI search, magnet link export, and a local HTTP dashboard.
 
 ## Installation
 
@@ -8,7 +8,9 @@ BitTorrent DHT sniffer — crawls the DHT network, discovers torrents, fetches m
 cargo install --path .
 ```
 
-Requires Rust 1.73+.
+Requires current stable Rust and MySQL 8.4 or newer with the built-in ngram parser.
+See [HeatWave setup and migration](docs/heatwave-migration.md) for provisioning,
+SQLite import, deployment, backups, and rollback.
 
 ## Usage
 
@@ -19,6 +21,7 @@ btfind magnet    Print a magnet URI for an info hash
 btfind stats     Show crawler statistics
 btfind serve     Start local HTTP API/dashboard
 btfind prune     Remove old torrents
+btfind db        Migrate/check schema, import/validate SQLite, rebuild search, reconcile statistics
 ```
 
 ### btfind run
@@ -36,7 +39,11 @@ btfind run --port 6882 --max-concurrent 20
 
 ### btfind search
 
-Search treats the query as a literal substring-style term. Advanced FTS5 query syntax is not exposed by default. Normal queries (3+ characters) use SQLite FTS5 with the trigram tokenizer, with results ranked by relevance. Short queries (1-2 characters) fall back to a `LIKE` substring search with deterministic ordering (no relevance rank).
+Search uses MySQL ngram indexes with two-character tokens for Japanese, Chinese,
+and Latin text. Punctuation and filename separators split terms; every entered
+term must match and must contain at least two alphanumeric characters. Names
+receive a relevance boost over file paths. Raw Boolean operators are not exposed.
+Empty queries browse the catalog. This intentionally changes SQLite search semantics.
 
 ```bash
 # Search by name or file path
@@ -91,7 +98,7 @@ When `btfind serve` is running:
 
 ```
 GET /                         Dashboard HTML page
-GET /api/search?q=ubuntu      Search torrents (literal, FTS5/ranked for 3+ char queries)
+GET /api/search?q=ubuntu      Search torrents (ngram, minimum 2 characters per term)
                             Optional: sort, limit, complete_only, min_size, max_size
 GET /api/stats                Crawler statistics
 GET /api/torrents/<info_hash>  Torrent detail
@@ -123,9 +130,11 @@ max_metadata_size_bytes = 8388608
 max_peer_attempts_per_round = 8
 
 [database]
-path = "~/.local/share/btfind/torrents.db"
+pool_size = 8
+web_pool_size = 4
 batch_size = 128
 flush_interval_ms = 1000
+# tls_ca = "/absolute/path/mysql-ca.pem"
 
 [crawl]
 get_peers_interval_secs = 5
@@ -154,9 +163,12 @@ host = "127.0.0.1"
 port = 8080
 ```
 
-CLI flags override config values.
+CLI flags override config values. Set BTFIND_DATABASE_URL in a protected service
+environment file. TLS certificate and hostname verification are enabled by
+default; tls_ca supplies a private CA when required. database.path is obsolete.
+Run `btfind db migrate` explicitly before starting services.
 
-All queue, job, RPC, contact, peer, metadata, and sampling limits are validated before the runtime starts. Full discovery queues are coalesced into durable hash-job rows where admitted by the metadata scheduler; excess in-memory jobs remain in SQLite for the retry scan. `sampling_enabled` enables bounded random BEP 51 probing of validated live nodes. It is an opt-in discovery aid, not a keyspace traversal or coverage-complete sweep.
+All queue, job, RPC, contact, peer, metadata, and sampling limits are validated before the runtime starts. Full discovery queues are coalesced into durable hash-job rows where admitted by the metadata scheduler; excess in-memory jobs remain in MySQL for the retry scan. `sampling_enabled` enables bounded random BEP 51 probing of validated live nodes. It is an opt-in discovery aid, not a keyspace traversal or coverage-complete sweep.
 
 ## How It Works
 
@@ -164,13 +176,19 @@ Three subsystems run on a Tokio async runtime:
 
 - **DHT Crawler** — Bootstraps into the BitTorrent DHT via Kademlia, validates every response against its outbound RPC, and discovers info_hashes passively or through optional bounded random BEP 51 sampling.
 - **Metadata Fetcher** — Receives discovered info_hashes, connects to peers via TCP (BitTorrent wire protocol), negotiates BEP 9 extensions (`ut_metadata`), and downloads torrent metadata (name, size, file list).
-- **SQLite Store** — Persists torrents and files with deduplication by info_hash. Uses FTS5 full-text search (trigram tokenizer) over torrent names and file paths, provides statistics, and pruning.
+- **MySQL Store** — Persists torrents, files, and crawler state using an async connection pool. Uses ngram full-text search over names and paths, transactional statistics, and bounded pruning.
 
-Data flows through bounded `tokio::sync::mpsc` channels. Metadata work is deduplicated per info hash, runtime persistence is coalesced and committed according to the configured database batch size and flush interval, and retry state plus peer candidates survive process restarts. Synchronous SQLite work runs outside async executor threads.
+Data flows through bounded `tokio::sync::mpsc` channels. Metadata work is deduplicated per info hash, runtime persistence is batched according to the configured database batch size and flush interval, and retry state plus peer candidates survive process restarts. Stable transaction receipts prevent replayed batches from incrementing counters twice. SQLite is used only for reading migration snapshots.
 
 ## Database
 
-Stored at `~/.local/share/btfind/torrents.db` (SQLite, WAL mode).
+Connection: BTFIND_DATABASE_URL. Versioned schema: migrations/.
+Search and file-list API responses use has_next instead of exact totals.
+Run `cargo test` for offline tests, and `bash scripts/test-mysql.sh` with
+BTFIND_TEST_DATABASE_URL for the required local MySQL integration suite.
+Run `node tests/dashboard.test.cjs` for dashboard behavior tests (Node.js 18+).
+After restoring a logical dump, run `btfind db analyze` with the maintenance
+account before serving searches.
 
 ## License
 

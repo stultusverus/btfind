@@ -1,0 +1,9 @@
+[Unit]
+Description=Export btfind MySQL to private Object Storage
+
+[Service]
+Type=oneshot
+EnvironmentFile=/home/opc/.config/btfind/backup.env
+ExecStart=/bin/bash /home/opc/.local/bin/backup-mysql.sh
+UMask=0077
+TimeoutStartSec=2h

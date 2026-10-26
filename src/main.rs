@@ -3,6 +3,7 @@ mod config;
 mod dht;
 mod magnet;
 mod metadata;
+mod migration;
 mod routing;
 mod store;
 mod types;
@@ -26,6 +27,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Database administration (services must be stopped for import/validation)
+    Db {
+        #[command(subcommand)]
+        command: migration::DbCommand,
+    },
     /// Start the crawler
     Run {
         /// Run duration in seconds (one-shot mode)
@@ -120,6 +126,12 @@ fn main() {
     let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
     rt.block_on(async {
         match cli.command {
+            Commands::Db { command } => {
+                if let Err(error) = migration::run(&config.database, command).await {
+                    eprintln!("database operation failed: {error}");
+                    std::process::exit(1);
+                }
+            }
             Commands::Run {
                 duration,
                 max_concurrent,
@@ -131,9 +143,9 @@ fn main() {
                 sort,
                 json,
                 magnet,
-            } => cmd_search(&config, query, limit, &sort, json, magnet),
-            Commands::Stats => cmd_stats(&config),
-            Commands::Prune { older_than } => cmd_prune(&config, older_than),
+            } => cmd_search(&config, query, limit, &sort, json, magnet).await,
+            Commands::Stats => cmd_stats(&config).await,
+            Commands::Prune { older_than } => cmd_prune(&config, older_than).await,
             Commands::Magnet { info_hash, name } => cmd_magnet(&info_hash, name.as_deref()),
             Commands::Serve { host, port } => {
                 let host = host.unwrap_or_else(|| config.web.host.clone());
@@ -150,9 +162,8 @@ async fn cmd_run(
     max_concurrent: Option<usize>,
     port: Option<u16>,
 ) {
-    let db_path = config.database_path();
-    let store = Arc::new(open_store(&db_path));
-    let resume_state = match load_resume_state(&store, config) {
+    let store = Arc::new(open_store(config, false).await);
+    let resume_state = match load_resume_state(&store, config).await {
         Ok(state) => state,
         Err(e) => {
             tracing::warn!("failed to load resume state: {}", e);
@@ -186,7 +197,7 @@ async fn cmd_run(
     let bucket_refresh = Duration::from_secs(config.crawl.bucket_refresh_mins * 60);
 
     let bootstrap_nodes = config.network.bootstrap_nodes.clone();
-    let node_id = match store.load_or_create_node_id() {
+    let node_id = match store.load_or_create_node_id().await {
         Ok(node_id) => node_id,
         Err(error) => {
             tracing::error!("failed to load stable DHT node identity: {}", error);
@@ -378,7 +389,8 @@ async fn flush_stats_batch(
     snapshot: &mut Option<store::RuntimeSnapshot>,
 ) {
     let mut retry_delay = Duration::from_millis(100);
-    while !try_flush_stats_batch(store, events, snapshot).await {
+    let receipt = uuid::Uuid::new_v4().to_string();
+    while !try_flush_stats_batch(store, events, snapshot, &receipt).await {
         tokio::time::sleep(retry_delay).await;
         retry_delay = retry_delay.saturating_mul(2).min(Duration::from_secs(5));
     }
@@ -388,33 +400,25 @@ async fn try_flush_stats_batch(
     store: &Arc<store::Store>,
     events: &mut Vec<types::CrawlStatsEvent>,
     snapshot: &mut Option<store::RuntimeSnapshot>,
+    receipt: &str,
 ) -> bool {
     if events.is_empty() {
         return true;
     }
-    let batch = std::mem::take(events);
-    let batch_snapshot = snapshot.take();
-    let retry_batch = batch.clone();
-    let retry_snapshot = batch_snapshot;
-    let persistence_store = store.clone();
-    let persisted = tokio::task::spawn_blocking(move || {
-        persistence_store.persist_runtime_batch(&batch, batch_snapshot)
-    })
-    .await;
-    match persisted {
-        Ok(Ok(())) => return true,
-        Ok(Err(error)) => {
-            tracing::warn!("failed to persist runtime batch: {}", error);
-            *events = retry_batch;
-            *snapshot = retry_snapshot;
+    match store
+        .persist_runtime_batch(events, *snapshot, receipt)
+        .await
+    {
+        Ok(()) => {
+            events.clear();
+            *snapshot = None;
+            true
         }
         Err(error) => {
-            tracing::warn!("storage worker join error: {}", error);
-            *events = retry_batch;
-            *snapshot = retry_snapshot;
+            tracing::warn!("failed to persist runtime batch: {}", error);
+            false
         }
     }
-    false
 }
 
 #[derive(Default)]
@@ -488,12 +492,15 @@ async fn shutdown_tasks(
     report
 }
 
-fn open_store(db_path: &std::path::Path) -> store::Store {
-    if let Some(parent) = db_path.parent() {
-        std::fs::create_dir_all(parent)
-            .unwrap_or_else(|e| tracing::warn!("could not create db dir: {}", e));
-    }
-    store::Store::open(db_path).expect("failed to open database")
+async fn open_store(config: &config::Config, web: bool) -> store::Store {
+    let store = store::Store::connect(&config.database, web)
+        .await
+        .expect("failed to connect to MySQL");
+    store
+        .check()
+        .await
+        .expect("database schema/configuration check failed");
+    store
 }
 
 #[derive(Default)]
@@ -506,15 +513,17 @@ fn hours_duration(hours: u32) -> Duration {
     Duration::from_secs(u64::from(hours.max(1)) * 3600)
 }
 
-fn load_resume_state(
+async fn load_resume_state(
     store: &store::Store,
     config: &config::Config,
-) -> Result<ResumeState, rusqlite::Error> {
+) -> Result<ResumeState, store::Error> {
     let dht_node_max_age = hours_duration(config.crawl.dht_node_max_age_hours);
     let peer_attempt_retention = hours_duration(config.metadata.peer_attempt_retention_hours);
 
-    let pruned_nodes = store.prune_stale_dht_nodes(dht_node_max_age)?;
-    let pruned_peer_attempts = store.prune_stale_peer_attempts(peer_attempt_retention)?;
+    let pruned_nodes = store.prune_stale_dht_nodes(dht_node_max_age).await?;
+    let pruned_peer_attempts = store
+        .prune_stale_peer_attempts(peer_attempt_retention)
+        .await?;
     if pruned_nodes > 0 || pruned_peer_attempts > 0 {
         tracing::info!(
             "pruned {} stale DHT nodes and {} stale peer attempts",
@@ -524,12 +533,16 @@ fn load_resume_state(
     }
 
     Ok(ResumeState {
-        info_hashes: store.incomplete_info_hashes(config.crawl.resume_info_hash_limit)?,
-        dht_nodes: store.recent_dht_nodes(dht_node_max_age, config.crawl.dht_node_resume_limit)?,
+        info_hashes: store
+            .incomplete_info_hashes(config.crawl.resume_info_hash_limit)
+            .await?,
+        dht_nodes: store
+            .recent_dht_nodes(dht_node_max_age, config.crawl.dht_node_resume_limit)
+            .await?,
     })
 }
 
-fn cmd_search(
+async fn cmd_search(
     config: &config::Config,
     query: Option<String>,
     limit: usize,
@@ -537,16 +550,17 @@ fn cmd_search(
     json: bool,
     show_magnet: bool,
 ) {
-    let db_path = config.database_path();
-    let store = open_store(&db_path);
+    let store = open_store(config, false).await;
 
-    let results = match query {
-        Some(q) => store
-            .search_torrents(&q, limit, sort)
-            .expect("search failed"),
-        None => store
-            .search_torrents("", limit, sort)
-            .expect("search failed"),
+    let results = match store
+        .search_torrents(query.as_deref().unwrap_or(""), limit.clamp(1, 500), sort)
+        .await
+    {
+        Ok(results) => results,
+        Err(error) => {
+            eprintln!("search failed: {error}");
+            std::process::exit(1);
+        }
     };
 
     if json {
@@ -570,7 +584,10 @@ fn cmd_search(
                 obj
             })
             .collect();
-        println!("{}", serde_json::to_string_pretty(&output).unwrap());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&output).expect("JSON output serializes")
+        );
     } else {
         for t in &results {
             let hash_preview = hex::encode(&t.info_hash[..4]);
@@ -598,10 +615,9 @@ fn cmd_magnet(info_hash: &str, name: Option<&str>) {
     }
 }
 
-fn cmd_stats(config: &config::Config) {
-    let db_path = config.database_path();
-    let store = open_store(&db_path);
-    let stats = store.get_stats().expect("failed to get stats");
+async fn cmd_stats(config: &config::Config) {
+    let store = open_store(config, false).await;
+    let stats = store.get_stats().await.expect("failed to get stats");
 
     println!("Torrents total:           {}", stats.total_torrents);
     println!(
@@ -614,7 +630,7 @@ fn cmd_stats(config: &config::Config) {
         format_size(stats.total_size)
     );
 
-    match store.get_crawl_history(1) {
+    match store.get_crawl_history(1).await {
         Ok(history) => {
             for line in latest_crawl_stat_lines(history.first()) {
                 println!("{}", line);
@@ -623,7 +639,7 @@ fn cmd_stats(config: &config::Config) {
         Err(e) => tracing::warn!("failed to get crawl history: {}", e),
     }
 
-    match store.get_metadata_failure_counts() {
+    match store.get_metadata_failure_counts().await {
         Ok(counts) => {
             for line in metadata_failure_count_lines(&counts) {
                 println!("{}", line);
@@ -673,19 +689,12 @@ fn metadata_failure_count_lines(counts: &[store::MetadataFailureCount]) -> Vec<S
 }
 
 async fn cmd_serve(config: &config::Config, host: &str, port: u16) {
-    let db_path = config.database_path();
-    if !db_path.exists() {
-        if let Some(parent) = db_path.parent() {
-            if !parent.exists() {
-                std::fs::create_dir_all(parent).expect("failed to create database directory");
-            }
-        }
-    }
+    let store = open_store(config, true).await;
 
     let addr = format!("{host}:{port}");
     tracing::info!("serving dashboard on http://{addr}");
 
-    let app = web::router(db_path);
+    let app = web::router(store);
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .expect("failed to bind HTTP server");
@@ -693,11 +702,11 @@ async fn cmd_serve(config: &config::Config, host: &str, port: u16) {
     axum::serve(listener, app).await.expect("HTTP server error");
 }
 
-fn cmd_prune(config: &config::Config, older_than: u32) {
-    let db_path = config.database_path();
-    let store = open_store(&db_path);
+async fn cmd_prune(config: &config::Config, older_than: u32) {
+    let store = open_store(config, false).await;
     let removed = store
         .prune_old_torrents(older_than as i64)
+        .await
         .expect("prune failed");
     println!(
         "Removed {} torrents older than {} days",
@@ -728,11 +737,14 @@ fn format_size(bytes: i64) -> String {
 mod integration_tests {
     use super::*;
 
-    #[test]
-    fn test_full_search_sort_prune_pipeline() {
+    #[tokio::test]
+    #[ignore = "requires BTFIND_TEST_DATABASE_URL; run scripts/test-mysql.sh"]
+    async fn test_full_search_sort_prune_pipeline() {
         use crate::store::Store;
 
-        let store = Store::open_in_memory().expect("open in-memory store");
+        let store = Store::open_test_database()
+            .await
+            .expect("open isolated MySQL store");
 
         // Insert torrents
         store
@@ -743,12 +755,15 @@ mod integration_tests {
                 1,
                 "dht",
             )
+            .await
             .unwrap();
         store
             .upsert_torrent([2u8; 20], Some("Debian 12".into()), 3_500_000_000, 1, "dht")
+            .await
             .unwrap();
         store
             .upsert_torrent([3u8; 20], Some("Fedora 40".into()), 2_000_000_000, 2, "dht")
+            .await
             .unwrap();
         store
             .upsert_torrent(
@@ -758,50 +773,56 @@ mod integration_tests {
                 1,
                 "dht",
             )
+            .await
             .unwrap();
 
         // Mark one as metadata complete
         store
             .mark_metadata_complete(&[1u8; 20], "Ubuntu 24.04 LTS", 262144, 4_000_000_000, 1)
+            .await
             .unwrap();
         store
             .insert_files(&[1u8; 20], &[("ubuntu-24.04.iso".into(), 4_000_000_000)])
+            .await
             .unwrap();
-        store.refresh_torrent_fts(&[1u8; 20]).unwrap();
+        store.refresh_torrent_fts(&[1u8; 20]).await.unwrap();
 
         // Search by name
-        let results = store.search_torrents("Ubuntu", 10, "last_seen").unwrap();
+        let results = store
+            .search_torrents("Ubuntu", 10, "last_seen")
+            .await
+            .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name.as_deref(), Some("Ubuntu 24.04 LTS"));
         assert!(results[0].metadata_complete);
 
         // Search by sort: total_size
-        let results = store.search_torrents("", 10, "total_size").unwrap();
+        let results = store.search_torrents("", 10, "total_size").await.unwrap();
         assert!(results.len() >= 3);
         assert!(results[0].total_size >= results[1].total_size);
 
         // Search by sort: name
-        let results = store.search_torrents("", 10, "name").unwrap();
+        let results = store.search_torrents("", 10, "name").await.unwrap();
         assert!(results.len() >= 3);
         assert_eq!(results[0].name.as_deref(), Some("Arch Linux"));
 
         // Stats
-        let stats = store.get_stats().unwrap();
+        let stats = store.get_stats().await.unwrap();
         assert!(stats.total_torrents >= 4);
         assert!(stats.total_metadata_complete >= 1);
         assert!(stats.total_size > 0);
         assert!(stats.total_files >= 1);
 
         // Crawl stats
-        let id = store.insert_crawl_stat(50, 200, 20, 3).unwrap();
+        let id = store.insert_crawl_stat(50, 200, 20, 3).await.unwrap();
         assert!(id > 0);
-        let history = store.get_crawl_history(10).unwrap();
+        let history = store.get_crawl_history(10).await.unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].nodes_known, Some(50));
         assert_eq!(history[0].metadata_fetched, Some(3));
 
         // Prune old torrents (won't prune anything since all are recent)
-        let removed = store.prune_old_torrents(365).unwrap();
+        let removed = store.prune_old_torrents(365).await.unwrap();
         assert_eq!(removed, 0);
     }
 
@@ -913,8 +934,9 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires BTFIND_TEST_DATABASE_URL; run scripts/test-mysql.sh"]
     async fn test_stats_persistence_writes_snapshot_with_metadata_count() {
-        let store = Arc::new(store::Store::open_in_memory().unwrap());
+        let store = Arc::new(store::Store::open_test_database().await.unwrap());
         let (stats_tx, stats_rx) = mpsc::channel(8);
         let handle = tokio::spawn(run_stats_persistence(
             store.clone(),
@@ -954,14 +976,14 @@ mod integration_tests {
         drop(stats_tx);
         handle.await.unwrap();
 
-        let history = store.get_crawl_history(10).unwrap();
+        let history = store.get_crawl_history(10).await.unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].nodes_known, Some(12));
         assert_eq!(history[0].queries_sent, Some(34));
         assert_eq!(history[0].info_hashes_found, Some(5));
         assert_eq!(history[0].metadata_fetched, Some(2));
         assert_eq!(
-            store.get_metadata_failure_counts().unwrap(),
+            store.get_metadata_failure_counts().await.unwrap(),
             vec![
                 store::MetadataFailureCount {
                     reason: "connect".to_string(),
@@ -976,8 +998,9 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires BTFIND_TEST_DATABASE_URL; run scripts/test-mysql.sh"]
     async fn test_stats_persistence_flushes_at_configured_batch_size() {
-        let store = Arc::new(store::Store::open_in_memory().unwrap());
+        let store = Arc::new(store::Store::open_test_database().await.unwrap());
         let (stats_tx, stats_rx) = mpsc::channel(8);
         let handle = tokio::spawn(run_stats_persistence(
             store.clone(),
@@ -997,7 +1020,7 @@ mod integration_tests {
 
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
-                let counts = store.get_metadata_failure_counts().unwrap();
+                let counts = store.get_metadata_failure_counts().await.unwrap();
                 if counts.first().is_some_and(|count| count.count == 3) {
                     break;
                 }
@@ -1011,10 +1034,12 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires BTFIND_TEST_DATABASE_URL; run scripts/test-mysql.sh"]
     async fn test_failed_runtime_batch_is_retained_for_retry() {
-        let store = Arc::new(store::Store::open_in_memory().unwrap());
+        let store = Arc::new(store::Store::open_test_database().await.unwrap());
         store
             .execute_batch_for_test("DROP TABLE metadata_failure_counts")
+            .await
             .unwrap();
         let mut events = vec![types::CrawlStatsEvent::MetadataFetchFailed {
             reason: types::MetadataFailureReason::Connect,
@@ -1026,7 +1051,15 @@ mod integration_tests {
             metadata_fetched: 4,
         });
 
-        assert!(!try_flush_stats_batch(&store, &mut events, &mut snapshot).await);
+        assert!(
+            !try_flush_stats_batch(
+                &store,
+                &mut events,
+                &mut snapshot,
+                &uuid::Uuid::new_v4().to_string()
+            )
+            .await
+        );
 
         assert_eq!(events.len(), 1);
         let snapshot = snapshot.unwrap();
@@ -1085,9 +1118,10 @@ mod integration_tests {
         );
     }
 
-    #[test]
-    fn test_load_resume_state_prunes_stale_data_and_loads_progress() {
-        let store = store::Store::open_in_memory().unwrap();
+    #[tokio::test]
+    #[ignore = "requires BTFIND_TEST_DATABASE_URL; run scripts/test-mysql.sh"]
+    async fn test_load_resume_state_prunes_stale_data_and_loads_progress() {
+        let store = store::Store::open_test_database().await.unwrap();
         let incomplete = [0x41u8; 20];
         let complete = [0x42u8; 20];
         let fresh_node_id = [0x43u8; 20];
@@ -1097,32 +1131,43 @@ mod integration_tests {
         let fresh_peer = "8.8.4.4:6881";
         let stale_peer = "9.9.9.9:6881";
 
-        store.upsert_torrent(incomplete, None, 0, 0, "dht").unwrap();
-        store.upsert_torrent(complete, None, 0, 0, "dht").unwrap();
+        store
+            .upsert_torrent(incomplete, None, 0, 0, "dht")
+            .await
+            .unwrap();
+        store
+            .upsert_torrent(complete, None, 0, 0, "dht")
+            .await
+            .unwrap();
         store
             .mark_metadata_complete(&complete, "done", 16384, 1, 1)
+            .await
             .unwrap();
         store
             .upsert_dht_node(&fresh_node_id, fresh_node_addr)
+            .await
             .unwrap();
         store
             .upsert_dht_node(&stale_node_id, stale_node_addr)
+            .await
             .unwrap();
         store
             .set_peer_attempt(&incomplete, fresh_peer, Some("timeout"))
+            .await
             .unwrap();
         store
             .set_peer_attempt(&incomplete, stale_peer, Some("connect"))
+            .await
             .unwrap();
         store
             .execute_batch_for_test(&format!(
                 "
-                UPDATE dht_nodes SET last_seen = unixepoch() - 7200 WHERE id = '{}';
-                UPDATE metadata_peer_attempts SET last_attempt = unixepoch() - 7200 WHERE peer_addr = '{}';
+                UPDATE dht_nodes SET last_seen = UNIX_TIMESTAMP() - 7200 WHERE id = '{}';
+                UPDATE metadata_peer_attempts SET last_attempt = UNIX_TIMESTAMP() - 7200 WHERE peer_addr = '{}';
                 ",
                 hex::encode(stale_node_id),
                 stale_peer
-            ))
+            )).await
             .unwrap();
         let config = config::Config {
             metadata: config::MetadataConfig {
@@ -1138,7 +1183,7 @@ mod integration_tests {
             ..config::Config::default()
         };
 
-        let resume = load_resume_state(&store, &config).unwrap();
+        let resume = load_resume_state(&store, &config).await.unwrap();
 
         assert_eq!(resume.info_hashes, vec![incomplete]);
         assert_eq!(resume.dht_nodes.len(), 1);
@@ -1146,9 +1191,11 @@ mod integration_tests {
         assert_eq!(resume.dht_nodes[0].addr, fresh_node_addr);
         assert!(store
             .should_skip_peer_retry(&incomplete, fresh_peer, 24)
+            .await
             .unwrap());
         assert!(!store
             .should_skip_peer_retry(&incomplete, stale_peer, 24)
+            .await
             .unwrap());
     }
 }
