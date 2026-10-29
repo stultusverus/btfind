@@ -10,6 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use futures_util::TryStreamExt;
 use unicode_normalization::UnicodeNormalization;
 
 pub type Error = sqlx::Error;
@@ -310,7 +311,7 @@ impl Store {
             tx.rollback().await?;
             return Ok(());
         }
-        sqlx::query("INSERT INTO persistence_receipts VALUES (?,?)")
+        sqlx::query("INSERT INTO persistence_receipts(id,created_at) VALUES (?,?)")
             .bind(receipt)
             .bind(now())
             .execute(&mut *tx)
@@ -349,6 +350,15 @@ impl Store {
             sqlx::query("INSERT INTO crawl_stats(timestamp,nodes_known,queries_sent,info_hashes_found,metadata_fetched) VALUES (?,?,?,?,?)").bind(now()).bind(s.nodes_known).bind(s.queries_sent).bind(s.info_hashes_found).bind(s.metadata_fetched).execute(&mut *tx).await?;
         }
         tx.commit().await
+    }
+    pub async fn acknowledge_receipt(&self, receipt: &str) -> Result<(), Error> {
+        sqlx::query("UPDATE persistence_receipts SET acknowledged_at=? WHERE id=? AND acknowledged_at IS NULL")
+            .bind(now()).bind(receipt).execute(&self.pool).await?;
+        Ok(())
+    }
+    pub async fn prune_receipts(&self) -> Result<i64, Error> {
+        self.prune_rows("persistence_receipts", "acknowledged_at", now() - 7 * 86400)
+            .await
     }
     pub async fn update_hash_job_failure(
         &self,
@@ -632,6 +642,15 @@ impl Store {
         tx.commit().await
     }
     pub async fn rebuild_search_index(&self) -> Result<(), Error> {
+        let packet: u64 = sqlx::query_scalar("SELECT @@max_allowed_packet")
+            .fetch_one(&self.pool)
+            .await?;
+        let budget = packet.saturating_sub(16 * 1024).min(1024 * 1024) as usize;
+        if budget < 1024 {
+            return Err(invalid(
+                "max_allowed_packet is too small for search rebuild",
+            ));
+        }
         sqlx::query("DELETE s FROM search_documents s JOIN torrents t ON t.info_hash=s.info_hash WHERE (t.metadata_complete=0 OR t.name IS NULL) AND NOT EXISTS (SELECT 1 FROM files f WHERE f.torrent_id=s.info_hash)")
             .execute(&self.pool).await?;
         let mut after = String::new();
@@ -647,58 +666,86 @@ impl Store {
             if hashes.is_empty() {
                 return self.analyze().await;
             }
-            let mut tx = self.pool.begin().await?;
-            let mut names = QueryBuilder::<MySql>::new("SELECT info_hash,CASE WHEN metadata_complete=1 THEN name ELSE NULL END AS name FROM torrents WHERE info_hash IN (");
-            let mut parameters = names.separated(",");
+            let mut documents = Vec::new();
+            let mut bytes = 0;
             for hash in &hashes {
-                parameters.push_bind(hash);
+                let document = self.search_document(hash, budget).await?;
+                let size = document.0.len() + document.1.len() + document.2.len() + 128;
+                if !documents.is_empty() && bytes + size > budget {
+                    self.replace_search_documents(&documents).await?;
+                    rebuilt += documents.len();
+                    documents.clear();
+                    bytes = 0;
+                }
+                bytes += size;
+                documents.push(document);
             }
-            names.push(") ORDER BY info_hash FOR UPDATE");
-            let names: Vec<(String, Option<String>)> =
-                names.build_query_as().fetch_all(&mut *tx).await?;
-            let mut files = QueryBuilder::<MySql>::new(
-                "SELECT torrent_id,path FROM files WHERE torrent_id IN (",
-            );
-            let mut parameters = files.separated(",");
-            for hash in &hashes {
-                parameters.push_bind(hash);
-            }
-            files.push(") ORDER BY torrent_id,id");
-            let files: Vec<(String, String)> = files.build_query_as().fetch_all(&mut *tx).await?;
-            let mut paths = BTreeMap::<String, Vec<String>>::new();
-            for (hash, path) in files {
-                paths.entry(hash).or_default().push(path);
-            }
-            let documents: Vec<_> = names
-                .into_iter()
-                .map(|(hash, name)| {
-                    let path = paths.remove(&hash).unwrap_or_default().join(" ");
-                    (
-                        hash,
-                        normalize_search(name.as_deref().unwrap_or_default()),
-                        normalize_search(&path),
-                    )
-                })
-                .collect();
-            let mut delete =
-                QueryBuilder::<MySql>::new("DELETE FROM search_documents WHERE info_hash IN (");
-            let mut parameters = delete.separated(",");
-            for hash in &hashes {
-                parameters.push_bind(hash);
-            }
-            delete.push(")");
-            delete.build().execute(&mut *tx).await?;
-            let mut insert =
-                QueryBuilder::<MySql>::new("INSERT INTO search_documents(info_hash,name,paths) ");
-            insert.push_values(&documents, |mut row, (hash, name, paths)| {
-                row.push_bind(hash).push_bind(name).push_bind(paths);
-            });
-            insert.build().execute(&mut *tx).await?;
-            tx.commit().await?;
+            self.replace_search_documents(&documents).await?;
             rebuilt += documents.len();
             after = hashes.last().expect("nonempty search batch").clone();
             tracing::info!(rebuilt, "rebuilt search documents");
         }
+    }
+    async fn search_document(
+        &self,
+        hash: &str,
+        budget: usize,
+    ) -> Result<(String, String, String), Error> {
+        let row = sqlx::query("SELECT CASE WHEN metadata_complete=1 THEN OCTET_LENGTH(name) ELSE 0 END AS bytes, CASE WHEN metadata_complete=1 AND OCTET_LENGTH(name)<=? THEN name ELSE NULL END AS name FROM torrents WHERE info_hash=?")
+            .bind(budget as u64).bind(hash).fetch_one(&self.pool).await?;
+        let raw_bytes: Option<i64> = row.try_get("bytes")?;
+        let too_large = || {
+            invalid(format!("search document {hash} exceeds rebuild byte budget {budget}; document was not truncated"))
+        };
+        if raw_bytes.unwrap_or(0) > budget as i64 {
+            return Err(too_large());
+        }
+        let name = normalize_search(row.try_get::<Option<&str>, _>("name")?.unwrap_or_default());
+        let mut paths = String::new();
+        let mut bytes = hash.len() + name.len() + 128;
+        if bytes > budget {
+            return Err(too_large());
+        }
+        let mut rows = sqlx::query("SELECT CASE WHEN OCTET_LENGTH(path)<=? THEN path ELSE NULL END AS path FROM files WHERE torrent_id=? ORDER BY id")
+            .bind(budget as u64).bind(hash).fetch(&self.pool);
+        while let Some(row) = rows.try_next().await? {
+            let path: Option<&str> = row.try_get("path")?;
+            let path = normalize_search(path.ok_or_else(too_large)?);
+            if path.is_empty() {
+                continue;
+            }
+            let separator = usize::from(!paths.is_empty());
+            bytes += path.len() + separator;
+            if bytes > budget {
+                return Err(too_large());
+            }
+            if separator != 0 {
+                paths.push(' ');
+            }
+            paths.push_str(&path);
+        }
+        Ok((hash.to_owned(), name, paths))
+    }
+    async fn replace_search_documents(
+        &self,
+        documents: &[(String, String, String)],
+    ) -> Result<(), Error> {
+        let mut tx = self.pool.begin().await?;
+        let mut delete =
+            QueryBuilder::<MySql>::new("DELETE FROM search_documents WHERE info_hash IN (");
+        let mut parameters = delete.separated(",");
+        for (hash, _, _) in documents {
+            parameters.push_bind(hash);
+        }
+        delete.push(")");
+        delete.build().execute(&mut *tx).await?;
+        let mut insert =
+            QueryBuilder::<MySql>::new("INSERT INTO search_documents(info_hash,name,paths) ");
+        insert.push_values(documents, |mut row, (hash, name, paths)| {
+            row.push_bind(hash).push_bind(name).push_bind(paths);
+        });
+        insert.build().execute(&mut *tx).await?;
+        tx.commit().await
     }
     pub async fn analyze(&self) -> Result<(), Error> {
         let rows = sqlx::query("ANALYZE TABLE torrents,files,search_documents,hash_jobs")
@@ -810,6 +857,7 @@ fn row_to_torrent(r: &MySqlRow) -> Result<TorrentRecord, Error> {
 }
 fn retryable(e: &Error) -> bool {
     matches!(e,Error::Database(d) if matches!(d.code().as_deref(),Some("40001")))
+        || matches!(e, Error::Database(d) if d.try_downcast_ref::<sqlx::mysql::MySqlDatabaseError>().is_some_and(|e| e.number() == 1205))
         || matches!(e, Error::Io(_) | Error::PoolTimedOut)
 }
 async fn backoff(attempt: u32) {

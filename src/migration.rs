@@ -262,6 +262,15 @@ async fn import_locked(store: &Store, path: &Path, fp: &str) -> Result<(), Error
     if markers.iter().any(|(_, f)| f != fp) {
         return Err(invalid("target belongs to a different SQLite snapshot"));
     }
+    let completed: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM import_progress WHERE table_name='__derived' AND finished=1",
+    )
+    .fetch_one(&store.pool)
+    .await?;
+    if completed == 1 {
+        tracing::info!("snapshot was already imported; no changes made");
+        return Ok(());
+    }
     if markers.is_empty() {
         for table in TABLES {
             let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM `{}`", table.name))
@@ -571,7 +580,12 @@ mod tests {
                 .len(),
             130
         );
+        store.execute_batch_for_test("CREATE TRIGGER no_rebuild BEFORE DELETE ON search_documents FOR EACH ROW SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='unexpected rebuild'").await.unwrap();
         import(&store, &file.0).await.unwrap();
+        store
+            .execute_batch_for_test("DROP TRIGGER no_rebuild")
+            .await
+            .unwrap();
         assert_eq!(store.get_stats().await.unwrap().total_files, 130);
         let next:u64=sqlx::query_scalar("SELECT AUTO_INCREMENT FROM information_schema.tables WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='files'").fetch_one(&store.pool).await.unwrap();
         assert!(next >= 901);

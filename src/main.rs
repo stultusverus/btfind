@@ -359,9 +359,15 @@ async fn run_stats_persistence(
     let mut flush_tick = tokio::time::interval(flush_interval);
     flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     flush_tick.tick().await;
+    let mut receipt_tick = tokio::time::interval(Duration::from_secs(3600));
 
     loop {
         tokio::select! {
+            _ = receipt_tick.tick() => {
+                if let Err(error) = store.prune_receipts().await {
+                    tracing::warn!("failed to prune acknowledged receipts: {error}");
+                }
+            }
             event = stats_rx.recv() => {
                 let Some(event) = event else {
                     flush_stats_batch(&store, &mut events, &mut snapshot).await;
@@ -410,6 +416,10 @@ async fn try_flush_stats_batch(
         .await
     {
         Ok(()) => {
+            if let Err(error) = store.acknowledge_receipt(receipt).await {
+                tracing::warn!("failed to acknowledge persistence receipt: {error}");
+                return false;
+            }
             events.clear();
             *snapshot = None;
             true

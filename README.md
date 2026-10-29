@@ -188,6 +188,37 @@ Run `node tests/dashboard.test.cjs` for dashboard behavior tests (Node.js 18+).
 After restoring a logical dump, run `btfind db analyze` with the maintenance
 account before serving searches.
 
+Stop the crawler and web service before schema migrations, imports, or search
+rebuilds. Migration 0002 adds receipt acknowledgement and its retention index;
+apply it with `btfind db migrate` before running the updated binary.
+
+The single crawler persistence worker acknowledges committed batches and prunes
+acknowledged receipts older than seven days hourly, in chunks of 500 rows.
+Pruning and retrying run serially in that worker, so cleanup cannot expire its
+active retry. Unacknowledged receipts (including legacy receipts and batches
+interrupted before acknowledgement) are retained: runtime retries have no fixed
+maximum duration. Do not run multiple crawler persistence workers against the
+same database. Retained receipts continue to prevent duplicate counter updates.
+
+Search rebuilds stream filenames and write at most 128 documents or approximately
+1 MiB of encoded data per transaction, whichever comes first. The byte budget is
+reduced for smaller `max_allowed_packet` settings. A single oversized document
+stops the rebuild with its hash and budget in the error, without truncating it or
+replacing its existing search document. Earlier batches may already be committed;
+rerunning the rebuild replaces them safely. Repeating a completed SQLite import
+with the same source fingerprint skips derived-data rebuilding.
+
+The catalogue totals row still serializes mutations. To measure contention on a
+disposable MySQL server, run `cargo test mysql_catalogue_concurrent_load --
+--ignored --nocapture` with `BTFIND_TEST_DATABASE_URL` set. This exercises eight
+writers and reports discovery throughput, p95 operation latency, and aggregate
+InnoDB row-lock wait time. Local results do not establish remote HeatWave capacity;
+repeat against a disposable database with representative network latency and
+traffic before relying on higher crawler throughput.
+
+OCI backup uploads and a successful managed-database restore rehearsal remain
+outstanding release prerequisites.
+
 ## License
 
 MIT
