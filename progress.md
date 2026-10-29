@@ -1,5 +1,7 @@
 # Dirty-Tree Review Progress
 
+> **Historical archive — superseded.** This document records the May 2026 implementation or review, not the current code or an active work plan. Its SQLite examples, commands, source line numbers, and test results are historical. Do not execute its implementation instructions. See the [current architecture](docs/architecture.md) and [README](README.md) for the MySQL implementation and supported commands.
+
 ## 2026-05-28 Continuation Review
 
 ### Scope

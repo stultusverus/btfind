@@ -1,5 +1,7 @@
 # btfind — BitTorrent DHT Sniffer Design
 
+> **Historical archive — superseded.** This document records the May 2026 implementation or review, not the current code or an active work plan. Its SQLite examples, commands, source line numbers, and test results are historical. Do not execute its implementation instructions. See the [current architecture](../../../docs/architecture.md) and [README](../../../README.md) for the MySQL implementation and supported commands.
+
 A BitTorrent sniffer that discovers torrents from the DHT network, fetches their metadata, stores them in a local SQLite database, and provides CLI search/query capabilities.
 
 ## Architecture Overview

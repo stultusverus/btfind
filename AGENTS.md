@@ -13,11 +13,16 @@ cargo fmt --check    # Format check
 
 Run tests and clippy before committing. All tests must pass, clippy must have 0 warnings.
 
+Current architecture: [docs/architecture.md](docs/architecture.md). The dated
+plans/specifications and root review logs are historical archives, not active
+implementation instructions.
+
 ## Project Structure
 
 ```
 src/
 ├── main.rs          # CLI entry point (clap), subcommand dispatch, cmd_* functions
+├── db.rs            # MySQL schema and maintenance subcommands
 ├── config.rs        # Config structs, TOML loading, XDG paths, defaults
 ├── types.rs         # NodeId, InfoHash, PeerContact, NodeContact, helpers
 ├── bencode.rs       # KRPC message types, bencode serialize/deserialize

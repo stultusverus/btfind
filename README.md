@@ -8,7 +8,8 @@ BitTorrent DHT sniffer — crawls the DHT network, discovers torrents, fetches m
 cargo install --path .
 ```
 
-Requires current stable Rust and MySQL 8.4 or newer with the built-in ngram parser.
+Requires current stable Rust and MySQL 8.4 or newer with the built-in ngram parser
+and `ngram_token_size=2`. Application connections disable full-text stopwords.
 
 ## Usage
 
@@ -19,7 +20,7 @@ btfind magnet    Print a magnet URI for an info hash
 btfind stats     Show crawler statistics
 btfind serve     Start local HTTP API/dashboard
 btfind prune     Remove old torrents
-btfind db        Migrate/check schema, rebuild search, reconcile statistics
+btfind db        Migrate/check schema, rebuild search, reconcile statistics, analyze
 ```
 
 ### btfind run
@@ -81,7 +82,8 @@ The dashboard binds to 127.0.0.1 by default and is intended as a local read-only
 btfind stats
 ```
 
-Outputs: total torrents, metadata complete count, files indexed, total data size.
+Outputs catalog totals, the latest persisted crawler snapshot when available,
+and metadata failure counts.
 
 ### btfind prune
 
@@ -97,7 +99,7 @@ When `btfind serve` is running:
 ```
 GET /                         Dashboard HTML page
 GET /api/search?q=ubuntu      Search torrents (ngram, minimum 2 characters per term)
-                            Optional: sort, limit, complete_only, min_size, max_size
+                            Optional: sort, limit, offset, complete_only, min_size, max_size
 GET /api/stats                Crawler statistics
 GET /api/torrents/<info_hash>  Torrent detail
 GET /api/torrents/<info_hash>/files  Paginated file list; optional q, limit, offset
@@ -164,13 +166,17 @@ port = 8080
 CLI flags override config values. Set BTFIND_DATABASE_URL in a protected service
 environment file. TLS certificate and hostname verification are enabled by
 default; tls_ca supplies a private CA when required. database.path is obsolete.
-Run `btfind db migrate` explicitly before starting services.
+Run `btfind db migrate` explicitly before starting services, using a maintenance
+account with schema-changing privileges against the same database as the services.
+The crawler account needs read/write access; the web account can be read-only.
+Do not use the restricted crawler account to apply schema migrations.
 
 All queue, job, RPC, contact, peer, metadata, and sampling limits are validated before the runtime starts. Full discovery queues are coalesced into durable hash-job rows where admitted by the metadata scheduler; excess in-memory jobs remain in MySQL for the retry scan. `sampling_enabled` enables bounded random BEP 51 probing of validated live nodes. It is an opt-in discovery aid, not a keyspace traversal or coverage-complete sweep.
 
 ## How It Works
 
-Three subsystems run on a Tokio async runtime:
+See [Current architecture](docs/architecture.md) for module responsibilities and
+storage invariants. Three subsystems run on a Tokio async runtime:
 
 - **DHT Crawler** — Bootstraps into the BitTorrent DHT via Kademlia, validates every response against its outbound RPC, and discovers info_hashes passively or through optional bounded random BEP 51 sampling.
 - **Metadata Fetcher** — Receives discovered info_hashes, connects to peers via TCP (BitTorrent wire protocol), negotiates BEP 9 extensions (`ut_metadata`), and downloads torrent metadata (name, size, file list).
@@ -188,9 +194,15 @@ Run `node tests/dashboard.test.cjs` for dashboard behavior tests (Node.js 18+).
 After restoring a logical dump, run `btfind db analyze` with the maintenance
 account before serving searches.
 
-Stop the crawler and web service before schema migrations or search
-rebuilds. Migration 0002 adds receipt acknowledgement and its retention index;
-apply it with `btfind db migrate` before running the updated binary.
+Stop the crawler and web service before schema migrations, search rebuilds, or
+statistics reconciliation. `btfind db migrate` applies all pending migrations
+embedded in that binary; `btfind db check` verifies the schema and search settings.
+Keep the versioned SQL files unchanged after deployment. Both `0001` (catalog) and
+`0002` (receipt retention) remain required for new installations.
+
+SQLite import and validation commands have been removed. The unused
+`import_progress` table remains to preserve the deployed schema; application
+startup no longer reads its checkpoints.
 
 The single crawler persistence worker acknowledges committed batches and prunes
 acknowledged receipts older than seven days hourly, in chunks of 500 rows.
@@ -215,8 +227,12 @@ InnoDB row-lock wait time. Local results do not establish remote HeatWave capaci
 repeat against a disposable database with representative network latency and
 traffic before relying on higher crawler throughput.
 
-OCI backup uploads and a successful managed-database restore rehearsal remain
-outstanding release prerequisites.
+The existing [backup script](scripts/backup-mysql.sh) exports the `btfind` database
+and uploads it to OCI Object Storage using instance-principal authentication. It
+requires `MYSQL_DEFAULTS_FILE`, `OCI_BACKUP_BUCKET`, and `OCI_BACKUP_NAMESPACE`,
+plus MySQL client tools, gzip, and the OCI CLI. It does not schedule itself.
+As of 2026-10-29, OCI backup uploads and a successful managed-database restore
+rehearsal remain outstanding release prerequisites.
 
 ## License
 

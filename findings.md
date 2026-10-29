@@ -1,5 +1,7 @@
 # btfind Dirty-Tree Review Findings
 
+> **Historical archive — superseded.** This document records the May 2026 implementation or review, not the current code or an active work plan. Its SQLite examples, commands, source line numbers, and test results are historical. Do not execute its implementation instructions. See the [current architecture](docs/architecture.md) and [README](README.md) for the MySQL implementation and supported commands.
+
 ## Review Target
 
 - Base commit: `a456120` - `fix: address post-commit review -- validated wire/dht parsers, HMAC tokens, IP filtering, shutdown, transaction robustness`
