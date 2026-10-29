@@ -9,8 +9,6 @@ cargo install --path .
 ```
 
 Requires current stable Rust and MySQL 8.4 or newer with the built-in ngram parser.
-See [HeatWave setup and migration](docs/heatwave-migration.md) for provisioning,
-SQLite import, deployment, backups, and rollback.
 
 ## Usage
 

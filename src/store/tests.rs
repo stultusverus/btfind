@@ -1,5 +1,79 @@
 use super::*;
 
+#[tokio::test]
+#[ignore = "requires BTFIND_TEST_DATABASE_URL; run scripts/test-mysql.sh"]
+async fn mysql_batched_rebuild_and_browse_order() {
+    let store = Store::open_test_database().await.unwrap();
+    for i in 1..=132u64 {
+        sqlx::query("INSERT INTO torrents(info_hash,name,first_seen,last_seen,total_size,metadata_complete) VALUES (?,?,1,1,1,?)")
+            .bind(format!("{i:040x}"))
+            .bind("東京 中文")
+            .bind(i <= 130)
+            .execute(&store.pool).await.unwrap();
+    }
+    sqlx::query("INSERT INTO files(torrent_id,path,size) VALUES (?, '資料/文件.txt', 1)")
+        .bind(format!("{:040x}", 131))
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO search_documents VALUES (?, 'obsolete', '')")
+        .bind(format!("{:040x}", 132))
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    store.rebuild_search_index().await.unwrap();
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM search_documents")
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 131);
+    assert_eq!(
+        store
+            .search_torrents("東京", 500, "rank")
+            .await
+            .unwrap()
+            .len(),
+        130
+    );
+    let files = store.search_torrents("文件", 10, "rank").await.unwrap();
+    assert_eq!(files.len(), 1);
+    assert_eq!(hex::encode(files[0].info_hash), format!("{:040x}", 131));
+    assert!(store
+        .search_torrents("obsolete", 10, "rank")
+        .await
+        .unwrap()
+        .is_empty());
+    sqlx::query("UPDATE torrents SET name='大阪' WHERE info_hash=?")
+        .bind(format!("{:040x}", 1))
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    store.rebuild_search_index().await.unwrap();
+    assert_eq!(
+        store
+            .search_torrents("大阪", 10, "rank")
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    for sort in ["last_seen", "first_seen", "total_size", "rank"] {
+        let page = store
+            .search_torrents_filtered_page("", 2, 1, sort, TorrentSearchFilters::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            hex::encode(page.results[0].info_hash),
+            format!("{:040x}", 131)
+        );
+        assert_eq!(
+            hex::encode(page.results[1].info_hash),
+            format!("{:040x}", 130)
+        );
+        assert!(page.has_next);
+    }
+}
+
 impl Store {
     pub async fn open_test_database() -> Result<Self, Error> {
         let url = std::env::var("BTFIND_TEST_DATABASE_URL")

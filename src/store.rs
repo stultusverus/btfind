@@ -560,9 +560,9 @@ impl Store {
         let terms = search_query(query).map_err(invalid)?;
         let order = match sort {
             "rank" if !terms.is_empty() => "score DESC,t.last_seen DESC,t.info_hash",
-            "rank" | "last_seen" => "t.last_seen DESC,t.info_hash",
-            "first_seen" => "t.first_seen DESC,t.info_hash",
-            "total_size" => "t.total_size DESC,t.info_hash",
+            "rank" | "last_seen" => "t.last_seen DESC,t.info_hash DESC",
+            "first_seen" => "t.first_seen DESC,t.info_hash DESC",
+            "total_size" => "t.total_size DESC,t.info_hash DESC",
             "name" => "t.name,t.info_hash",
             _ => return Err(invalid("invalid sort")),
         };
@@ -632,27 +632,72 @@ impl Store {
         tx.commit().await
     }
     pub async fn rebuild_search_index(&self) -> Result<(), Error> {
+        sqlx::query("DELETE s FROM search_documents s JOIN torrents t ON t.info_hash=s.info_hash WHERE (t.metadata_complete=0 OR t.name IS NULL) AND NOT EXISTS (SELECT 1 FROM files f WHERE f.torrent_id=s.info_hash)")
+            .execute(&self.pool).await?;
         let mut after = String::new();
+        let mut rebuilt = 0usize;
         loop {
             let hashes: Vec<String> = sqlx::query_scalar(
-                "SELECT info_hash FROM torrents WHERE info_hash>? ORDER BY info_hash LIMIT 128",
+                "(SELECT info_hash FROM torrents WHERE metadata_complete=1 AND name IS NOT NULL AND info_hash>? ORDER BY info_hash LIMIT 128) UNION (SELECT DISTINCT torrent_id AS info_hash FROM files WHERE torrent_id>? ORDER BY torrent_id LIMIT 128) ORDER BY info_hash LIMIT 128",
             )
+            .bind(&after)
             .bind(&after)
             .fetch_all(&self.pool)
             .await?;
             if hashes.is_empty() {
                 return self.analyze().await;
             }
-            for h in hashes {
-                let mut tx = self.pool.begin().await?;
-                sqlx::query("SELECT info_hash FROM torrents WHERE info_hash=? FOR UPDATE")
-                    .bind(&h)
-                    .fetch_optional(&mut *tx)
-                    .await?;
-                refresh_search(&mut tx, &h).await?;
-                tx.commit().await?;
-                after = h;
+            let mut tx = self.pool.begin().await?;
+            let mut names = QueryBuilder::<MySql>::new("SELECT info_hash,CASE WHEN metadata_complete=1 THEN name ELSE NULL END AS name FROM torrents WHERE info_hash IN (");
+            let mut parameters = names.separated(",");
+            for hash in &hashes {
+                parameters.push_bind(hash);
             }
+            names.push(") ORDER BY info_hash FOR UPDATE");
+            let names: Vec<(String, Option<String>)> =
+                names.build_query_as().fetch_all(&mut *tx).await?;
+            let mut files = QueryBuilder::<MySql>::new(
+                "SELECT torrent_id,path FROM files WHERE torrent_id IN (",
+            );
+            let mut parameters = files.separated(",");
+            for hash in &hashes {
+                parameters.push_bind(hash);
+            }
+            files.push(") ORDER BY torrent_id,id");
+            let files: Vec<(String, String)> = files.build_query_as().fetch_all(&mut *tx).await?;
+            let mut paths = BTreeMap::<String, Vec<String>>::new();
+            for (hash, path) in files {
+                paths.entry(hash).or_default().push(path);
+            }
+            let documents: Vec<_> = names
+                .into_iter()
+                .map(|(hash, name)| {
+                    let path = paths.remove(&hash).unwrap_or_default().join(" ");
+                    (
+                        hash,
+                        normalize_search(name.as_deref().unwrap_or_default()),
+                        normalize_search(&path),
+                    )
+                })
+                .collect();
+            let mut delete =
+                QueryBuilder::<MySql>::new("DELETE FROM search_documents WHERE info_hash IN (");
+            let mut parameters = delete.separated(",");
+            for hash in &hashes {
+                parameters.push_bind(hash);
+            }
+            delete.push(")");
+            delete.build().execute(&mut *tx).await?;
+            let mut insert =
+                QueryBuilder::<MySql>::new("INSERT INTO search_documents(info_hash,name,paths) ");
+            insert.push_values(&documents, |mut row, (hash, name, paths)| {
+                row.push_bind(hash).push_bind(name).push_bind(paths);
+            });
+            insert.build().execute(&mut *tx).await?;
+            tx.commit().await?;
+            rebuilt += documents.len();
+            after = hashes.last().expect("nonempty search batch").clone();
+            tracing::info!(rebuilt, "rebuilt search documents");
         }
     }
     pub async fn analyze(&self) -> Result<(), Error> {
