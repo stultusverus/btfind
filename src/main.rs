@@ -1,9 +1,9 @@
 mod bencode;
 mod config;
+mod db;
 mod dht;
 mod magnet;
 mod metadata;
-mod migration;
 mod routing;
 mod store;
 mod types;
@@ -27,10 +27,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Database administration (services must be stopped for import/validation)
+    /// Database administration (stop services before migrations, rebuilds, or reconciliation)
     Db {
         #[command(subcommand)]
-        command: migration::DbCommand,
+        command: db::DbCommand,
     },
     /// Start the crawler
     Run {
@@ -127,7 +127,7 @@ fn main() {
     rt.block_on(async {
         match cli.command {
             Commands::Db { command } => {
-                if let Err(error) = migration::run(&config.database, command).await {
+                if let Err(error) = db::run(&config.database, command).await {
                     eprintln!("database operation failed: {error}");
                     std::process::exit(1);
                 }

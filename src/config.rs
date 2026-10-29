@@ -394,7 +394,7 @@ impl Config {
 
     pub fn validate(&self) -> Result<(), String> {
         if self.database.path.is_some() {
-            return Err("database.path is no longer supported; import SQLite with btfind db import-sqlite and set BTFIND_DATABASE_URL".into());
+            return Err("database.path is no longer supported; set BTFIND_DATABASE_URL to a MySQL connection URL".into());
         }
         validate_range(
             "database.pool_size",
@@ -588,7 +588,10 @@ mod tests {
     fn mysql_config_rejects_legacy_paths_and_unbounded_pools() {
         let mut config = Config::default();
         config.database.path = Some("old.db".into());
-        assert!(config.validate().unwrap_err().contains("import-sqlite"));
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .contains("BTFIND_DATABASE_URL"));
         config.database.path = None;
         config.database.pool_size = 0;
         assert!(config.validate().is_err());

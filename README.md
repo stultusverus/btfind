@@ -19,7 +19,7 @@ btfind magnet    Print a magnet URI for an info hash
 btfind stats     Show crawler statistics
 btfind serve     Start local HTTP API/dashboard
 btfind prune     Remove old torrents
-btfind db        Migrate/check schema, import/validate SQLite, rebuild search, reconcile statistics
+btfind db        Migrate/check schema, rebuild search, reconcile statistics
 ```
 
 ### btfind run
@@ -41,7 +41,7 @@ Search uses MySQL ngram indexes with two-character tokens for Japanese, Chinese,
 and Latin text. Punctuation and filename separators split terms; every entered
 term must match and must contain at least two alphanumeric characters. Names
 receive a relevance boost over file paths. Raw Boolean operators are not exposed.
-Empty queries browse the catalog. This intentionally changes SQLite search semantics.
+Empty queries browse the catalog.
 
 ```bash
 # Search by name or file path
@@ -176,7 +176,7 @@ Three subsystems run on a Tokio async runtime:
 - **Metadata Fetcher** — Receives discovered info_hashes, connects to peers via TCP (BitTorrent wire protocol), negotiates BEP 9 extensions (`ut_metadata`), and downloads torrent metadata (name, size, file list).
 - **MySQL Store** — Persists torrents, files, and crawler state using an async connection pool. Uses ngram full-text search over names and paths, transactional statistics, and bounded pruning.
 
-Data flows through bounded `tokio::sync::mpsc` channels. Metadata work is deduplicated per info hash, runtime persistence is batched according to the configured database batch size and flush interval, and retry state plus peer candidates survive process restarts. Stable transaction receipts prevent replayed batches from incrementing counters twice. SQLite is used only for reading migration snapshots.
+Data flows through bounded `tokio::sync::mpsc` channels. Metadata work is deduplicated per info hash, runtime persistence is batched according to the configured database batch size and flush interval, and retry state plus peer candidates survive process restarts. Stable transaction receipts prevent replayed batches from incrementing counters twice.
 
 ## Database
 
@@ -188,7 +188,7 @@ Run `node tests/dashboard.test.cjs` for dashboard behavior tests (Node.js 18+).
 After restoring a logical dump, run `btfind db analyze` with the maintenance
 account before serving searches.
 
-Stop the crawler and web service before schema migrations, imports, or search
+Stop the crawler and web service before schema migrations or search
 rebuilds. Migration 0002 adds receipt acknowledgement and its retention index;
 apply it with `btfind db migrate` before running the updated binary.
 
@@ -205,8 +205,7 @@ Search rebuilds stream filenames and write at most 128 documents or approximatel
 reduced for smaller `max_allowed_packet` settings. A single oversized document
 stops the rebuild with its hash and budget in the error, without truncating it or
 replacing its existing search document. Earlier batches may already be committed;
-rerunning the rebuild replaces them safely. Repeating a completed SQLite import
-with the same source fingerprint skips derived-data rebuilding.
+rerunning the rebuild replaces them safely.
 
 The catalogue totals row still serializes mutations. To measure contention on a
 disposable MySQL server, run `cargo test mysql_catalogue_concurrent_load --

@@ -215,17 +215,7 @@ impl Store {
         Ok(())
     }
     pub async fn check(&self) -> Result<(), Error> {
-        self.check_schema().await?;
-        let importing: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM import_progress WHERE finished=0")
-                .fetch_one(&self.pool)
-                .await?;
-        if importing > 0 {
-            return Err(invalid(
-                "SQLite import is incomplete; resume and validate before starting services",
-            ));
-        }
-        Ok(())
+        self.check_schema().await
     }
     #[cfg(test)]
     pub async fn get_torrent(&self, hash: &InfoHash) -> Result<Option<TorrentRecord>, Error> {
