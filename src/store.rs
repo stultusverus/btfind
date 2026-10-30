@@ -414,7 +414,7 @@ impl Store {
         Ok(terminal.unwrap_or(false))
     }
     pub async fn due_hash_jobs(&self, limit: usize) -> Result<Vec<HashJobRecord>, Error> {
-        sqlx::query("SELECT * FROM hash_jobs WHERE status IN ('queued','retry_at') AND next_attempt_at<=? ORDER BY next_attempt_at,updated_at,info_hash LIMIT ?").bind(now()).bind(limit as u64).fetch_all(&self.pool).await?.iter().map(|r| Ok(HashJobRecord {
+        sqlx::query("SELECT j.* FROM hash_jobs j WHERE j.status IN ('queued','retry_at') AND j.next_attempt_at<=? AND EXISTS (SELECT 1 FROM hash_job_peers p WHERE p.info_hash=j.info_hash) ORDER BY j.next_attempt_at,j.updated_at,j.info_hash LIMIT ?").bind(now()).bind(limit as u64).fetch_all(&self.pool).await?.iter().map(|r| Ok(HashJobRecord {
             info_hash:decode_hash(r.try_get("info_hash")?)?,status:r.try_get("status")?,attempt_count:u32::try_from(r.try_get::<i64,_>("attempt_count")?).map_err(|_| invalid("invalid attempt count"))?,next_attempt_at:r.try_get("next_attempt_at")?,last_failure:r.try_get("last_failure")?
         })).collect()
     }
