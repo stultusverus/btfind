@@ -1,0 +1,21 @@
+[Unit]
+Description=btfind DHT crawler
+After=network-online.target mysql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/opc
+EnvironmentFile=/home/opc/.config/btfind/btfind.env
+Environment=RUST_LOG=btfind=info
+ExecStart=/home/opc/.local/bin/btfind run
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=45
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=btfind-crawler
+
+[Install]
+WantedBy=default.target

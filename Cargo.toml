@@ -16,7 +16,7 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 sha1 = { version = "0.10", features = ["std"] }
 rand = "0.8"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json", "time"] }
 toml = "0.8"
 dirs = "5"
 chrono = { version = "0.4", features = ["serde"] }

@@ -2,8 +2,10 @@ mod bencode;
 mod config;
 mod db;
 mod dht;
+mod logging;
 mod magnet;
 mod metadata;
+mod metrics;
 mod routing;
 mod store;
 mod types;
@@ -103,25 +105,51 @@ enum Commands {
 }
 
 fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "btfind=info".into()),
-        )
-        .init();
-
     let cli = Cli::parse();
+    let (service, output) = match &cli.command {
+        Commands::Run { .. } => ("crawler", logging::LogOutput::Stdout),
+        Commands::Serve { .. } => ("web", logging::LogOutput::Stdout),
+        _ => ("btfind", logging::LogOutput::Stderr),
+    };
+    logging::init(service, output);
+    logging::install_panic_hook();
+
+    tracing::info!(
+        event = "process_started",
+        version = logging::VERSION,
+        revision = logging::GIT_REVISION.unwrap_or("unknown"),
+        "process started"
+    );
+
     let config = match config::Config::load() {
         Ok(config) => config,
         Err(error) => {
+            tracing::error!(
+                event = "configuration_failed",
+                reason = "load",
+                error = %error,
+                "configuration failed"
+            );
             eprintln!("configuration error: {}", error);
             std::process::exit(2);
         }
     };
     if let Err(error) = config.validate() {
+        tracing::error!(
+            event = "configuration_failed",
+            reason = "validation",
+            error = %error,
+            "configuration failed"
+        );
         eprintln!("invalid configuration: {}", error);
         std::process::exit(2);
     }
+    tracing::info!(
+        event = "configuration_loaded",
+        database_pool_size = config.database.pool_size,
+        web_pool_size = config.database.web_pool_size,
+        "configuration loaded"
+    );
 
     let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
     rt.block_on(async {
@@ -162,11 +190,28 @@ async fn cmd_run(
     max_concurrent: Option<usize>,
     port: Option<u16>,
 ) {
-    let store = Arc::new(open_store(config, false).await);
+    let store = match open_store(config, false).await {
+        Ok(store) => Arc::new(store),
+        Err(error) => {
+            tracing::error!(
+                event = "startup_failed",
+                component = "database",
+                reason = "connect",
+                error = %error,
+                "crawler startup failed"
+            );
+            std::process::exit(1);
+        }
+    };
     let resume_state = match load_resume_state(&store, config).await {
         Ok(state) => state,
         Err(e) => {
-            tracing::warn!("failed to load resume state: {}", e);
+            tracing::warn!(
+                event = "resume_state_failed",
+                reason = "database",
+                error = %e,
+                "failed to load resume state"
+            );
             ResumeState::default()
         }
     };
@@ -174,19 +219,31 @@ async fn cmd_run(
     let port = port.unwrap_or(config.network.port);
     let max_concurrent = max_concurrent.unwrap_or(config.metadata.max_concurrent);
     if !(1..=4096).contains(&max_concurrent) {
-        tracing::error!("--max-concurrent must be between 1 and 4096");
+        tracing::error!(
+            event = "configuration_failed",
+            reason = "max_concurrent",
+            "max_concurrent must be between 1 and 4096"
+        );
         return;
     }
     let addr: SocketAddrV4 = format!("0.0.0.0:{}", port)
         .parse()
         .expect("0.0.0.0:<port> should parse to a valid IPv4 address");
-    let socket = Arc::new(
-        UdpSocket::bind(addr)
-            .await
-            .expect("failed to bind UDP socket"),
-    );
+    let socket = match UdpSocket::bind(addr).await {
+        Ok(socket) => Arc::new(socket),
+        Err(error) => {
+            tracing::error!(
+                event = "startup_failed",
+                component = "dht_socket",
+                reason = "bind",
+                error = %error,
+                "crawler startup failed"
+            );
+            std::process::exit(1);
+        }
+    };
 
-    tracing::info!("bound to {}", addr);
+    tracing::info!(event = "crawler_listening", address = %addr, "DHT socket bound");
 
     let (info_hash_tx, info_hash_rx) =
         mpsc::channel::<types::HashDiscovery>(config.crawl.info_hash_channel_capacity);
@@ -200,7 +257,13 @@ async fn cmd_run(
     let node_id = match store.load_or_create_node_id().await {
         Ok(node_id) => node_id,
         Err(error) => {
-            tracing::error!("failed to load stable DHT node identity: {}", error);
+            tracing::error!(
+                event = "startup_failed",
+                component = "database",
+                reason = "node_identity",
+                error = %error,
+                "crawler startup failed"
+            );
             return;
         }
     };
@@ -233,24 +296,30 @@ async fn cmd_run(
     let resumed_nodes = crawler.seed_nodes(resume_state.dht_nodes);
     if resumed_hashes > 0 || resumed_nodes > 0 {
         tracing::info!(
-            "resumed {} incomplete hashes and {} DHT nodes",
-            resumed_hashes,
-            resumed_nodes
+            event = "crawler_resumed",
+            resumed_hashes = resumed_hashes,
+            resumed_nodes = resumed_nodes,
+            "resumed crawler state"
         );
     }
     let crawler_handle = tokio::spawn(async move {
         crawler.run(get_peers_interval, bucket_refresh).await;
     });
 
+    let crawler_metrics = Arc::new(metrics::CrawlerMetrics::default());
+    let metrics_handle = tokio::spawn(metrics::run_crawler_reporter(crawler_metrics.clone()));
+
     let store_stats = store.clone();
     let database_batch_size = config.database.batch_size;
     let database_flush_interval = Duration::from_millis(config.database.flush_interval_ms);
+    let stats_metrics = crawler_metrics.clone();
     let stats_handle = tokio::spawn(async move {
         run_stats_persistence(
             store_stats,
             stats_rx,
             database_batch_size,
             database_flush_interval,
+            stats_metrics,
         )
         .await;
     });
@@ -278,26 +347,63 @@ async fn cmd_run(
         .await;
     });
 
-    tracing::info!("crawler started");
+    tracing::info!(
+        event = "crawler_started",
+        version = logging::VERSION,
+        revision = logging::GIT_REVISION.unwrap_or("unknown"),
+        "crawler started"
+    );
 
-    if let Some(secs) = duration {
-        tracing::info!("running for {} seconds", secs);
+    let shutdown_reason = if let Some(secs) = duration {
+        tracing::info!(
+            event = "crawler_duration_started",
+            seconds = secs,
+            "running for a fixed duration"
+        );
         tokio::time::sleep(Duration::from_secs(secs)).await;
-        tracing::info!("duration reached, shutting down");
+        "duration"
     } else {
         match tokio::signal::ctrl_c().await {
-            Ok(()) => tracing::info!("received Ctrl+C, shutting down"),
-            Err(e) => tracing::warn!("failed to listen for Ctrl+C: {}, shutting down", e),
+            Ok(()) => {
+                tracing::info!(
+                    event = "crawler_shutdown_received",
+                    signal = "sigint",
+                    "shutdown requested"
+                );
+                "sigint"
+            }
+            Err(e) => {
+                tracing::warn!(
+                    event = "crawler_shutdown_signal_failed",
+                    reason = "signal",
+                    error = %e,
+                    "failed to listen for shutdown signal"
+                );
+                "signal_error"
+            }
         }
-    }
+    };
 
-    shutdown_tasks(
+    let report = shutdown_tasks(
         crawler_handle,
         fetcher_handle,
         stats_handle,
         Duration::from_secs(config.crawl.shutdown_drain_secs),
     )
     .await;
+    metrics_handle.abort();
+    let _ = metrics_handle.await;
+    crawler_metrics.emit(true);
+    tracing::info!(
+        event = "crawler_shutdown",
+        graceful = true,
+        reason = shutdown_reason,
+        crawler_join_error = report.crawler_join_error,
+        fetcher_join_error = report.fetcher_join_error,
+        stats_join_error = report.stats_join_error,
+        stats_timed_out = report.stats_timed_out,
+        "crawler stopped"
+    );
 }
 
 #[derive(Default)]
@@ -332,6 +438,7 @@ impl RuntimeStats {
             | types::CrawlStatsEvent::RpcUnexpectedSource
             | types::CrawlStatsEvent::DiscoveryBackpressure
             | types::CrawlStatsEvent::SamplingResponse { .. }
+            | types::CrawlStatsEvent::MetadataQueue { .. }
             | types::CrawlStatsEvent::SampleObserved { .. }
             | types::CrawlStatsEvent::HashObserved { .. } => {}
         }
@@ -352,6 +459,7 @@ async fn run_stats_persistence(
     mut stats_rx: mpsc::Receiver<types::CrawlStatsEvent>,
     batch_size: usize,
     flush_interval: Duration,
+    metrics: Arc<metrics::CrawlerMetrics>,
 ) {
     let mut stats = RuntimeStats::default();
     let mut events = Vec::with_capacity(batch_size);
@@ -365,25 +473,31 @@ async fn run_stats_persistence(
         tokio::select! {
             _ = receipt_tick.tick() => {
                 if let Err(error) = store.prune_receipts().await {
-                    tracing::warn!("failed to prune acknowledged receipts: {error}");
+                    tracing::warn!(
+                        event = "persistence_prune_failed",
+                        reason = "database",
+                        error = %error,
+                        "failed to prune acknowledged receipts"
+                    );
                 }
             }
             event = stats_rx.recv() => {
                 let Some(event) = event else {
-                    flush_stats_batch(&store, &mut events, &mut snapshot).await;
+                    flush_stats_batch(&store, &mut events, &mut snapshot, &metrics).await;
                     break;
                 };
+                metrics.apply(&event);
                 stats.apply(event);
                 if matches!(event, types::CrawlStatsEvent::DhtSnapshot { .. }) {
                     snapshot = Some(stats.snapshot());
                 }
                 events.push(event);
                 if events.len() >= batch_size {
-                    flush_stats_batch(&store, &mut events, &mut snapshot).await;
+                    flush_stats_batch(&store, &mut events, &mut snapshot, &metrics).await;
                 }
             }
             _ = flush_tick.tick(), if !events.is_empty() => {
-                flush_stats_batch(&store, &mut events, &mut snapshot).await;
+                flush_stats_batch(&store, &mut events, &mut snapshot, &metrics).await;
             }
         }
     }
@@ -393,10 +507,11 @@ async fn flush_stats_batch(
     store: &Arc<store::Store>,
     events: &mut Vec<types::CrawlStatsEvent>,
     snapshot: &mut Option<store::RuntimeSnapshot>,
+    metrics: &metrics::CrawlerMetrics,
 ) {
     let mut retry_delay = Duration::from_millis(100);
     let receipt = uuid::Uuid::new_v4().to_string();
-    while !try_flush_stats_batch(store, events, snapshot, &receipt).await {
+    while !try_flush_stats_batch(store, events, snapshot, &receipt, metrics).await {
         tokio::time::sleep(retry_delay).await;
         retry_delay = retry_delay.saturating_mul(2).min(Duration::from_secs(5));
     }
@@ -407,6 +522,7 @@ async fn try_flush_stats_batch(
     events: &mut Vec<types::CrawlStatsEvent>,
     snapshot: &mut Option<store::RuntimeSnapshot>,
     receipt: &str,
+    metrics: &metrics::CrawlerMetrics,
 ) -> bool {
     if events.is_empty() {
         return true;
@@ -417,7 +533,13 @@ async fn try_flush_stats_batch(
     {
         Ok(()) => {
             if let Err(error) = store.acknowledge_receipt(receipt).await {
-                tracing::warn!("failed to acknowledge persistence receipt: {error}");
+                metrics.record_persistence_error();
+                tracing::warn!(
+                    event = "persistence_ack_failed",
+                    reason = "database",
+                    error = %error,
+                    "failed to acknowledge persistence receipt"
+                );
                 return false;
             }
             events.clear();
@@ -425,7 +547,13 @@ async fn try_flush_stats_batch(
             true
         }
         Err(error) => {
-            tracing::warn!("failed to persist runtime batch: {}", error);
+            metrics.record_persistence_error();
+            tracing::warn!(
+                event = "persistence_flush_failed",
+                reason = "database",
+                error = %error,
+                "failed to persist runtime batch"
+            );
             false
         }
     }
@@ -446,7 +574,13 @@ async fn join_aborted_task(name: &str, handle: JoinHandle<()>) -> bool {
         Ok(()) => false,
         Err(e) if e.is_cancelled() => false,
         Err(e) => {
-            tracing::warn!("{} task join error: {}", name, e);
+            tracing::warn!(
+                event = "task_join_failed",
+                task = name,
+                reason = "join",
+                error = %e,
+                "task join error"
+            );
             true
         }
     }
@@ -464,11 +598,22 @@ async fn shutdown_tasks(
         Ok(Ok(())) => false,
         Ok(Err(error)) if error.is_cancelled() => false,
         Ok(Err(error)) => {
-            tracing::warn!("metadata fetcher task join error: {}", error);
+            tracing::warn!(
+                event = "task_join_failed",
+                task = "metadata_fetcher",
+                reason = "join",
+                error = %error,
+                "task join error"
+            );
             true
         }
         Err(_) => {
-            tracing::warn!("metadata fetcher did not drain within {:?}", stats_timeout);
+            tracing::warn!(
+                event = "task_drain_timeout",
+                task = "metadata_fetcher",
+                timeout_seconds = stats_timeout.as_secs(),
+                "task did not drain before shutdown timeout"
+            );
             fetcher_handle.abort();
             join_aborted_task("metadata fetcher", fetcher_handle).await
         }
@@ -483,15 +628,32 @@ async fn shutdown_tasks(
     match tokio::time::timeout(stats_timeout, &mut stats_handle).await {
         Ok(Ok(())) => {}
         Ok(Err(e)) => {
-            tracing::warn!("stats task join error: {}", e);
+            tracing::warn!(
+                event = "task_join_failed",
+                task = "stats_persistence",
+                reason = "join",
+                error = %e,
+                "task join error"
+            );
             report.stats_join_error = true;
         }
         Err(_) => {
-            tracing::warn!("stats task did not stop within {:?}", stats_timeout);
+            tracing::warn!(
+                event = "task_drain_timeout",
+                task = "stats_persistence",
+                timeout_seconds = stats_timeout.as_secs(),
+                "task did not stop before shutdown timeout"
+            );
             stats_handle.abort();
             if let Err(e) = stats_handle.await {
                 if !e.is_cancelled() {
-                    tracing::warn!("stats task join error after abort: {}", e);
+                    tracing::warn!(
+                        event = "task_join_failed",
+                        task = "stats_persistence",
+                        reason = "join_after_abort",
+                        error = %e,
+                        "task join error"
+                    );
                     report.stats_join_error = true;
                 }
             }
@@ -502,15 +664,20 @@ async fn shutdown_tasks(
     report
 }
 
-async fn open_store(config: &config::Config, web: bool) -> store::Store {
+async fn open_store(config: &config::Config, web: bool) -> Result<store::Store, String> {
     let store = store::Store::connect(&config.database, web)
         .await
-        .expect("failed to connect to MySQL");
+        .map_err(|error| format!("failed to connect to MySQL: {error}"))?;
     store
         .check()
         .await
-        .expect("database schema/configuration check failed");
-    store
+        .map_err(|error| format!("database schema/configuration check failed: {error}"))?;
+    tracing::info!(
+        event = "database_connected",
+        pool = if web { "web" } else { "crawler" },
+        "database connected"
+    );
+    Ok(store)
 }
 
 #[derive(Default)]
@@ -560,7 +727,20 @@ async fn cmd_search(
     json: bool,
     show_magnet: bool,
 ) {
-    let store = open_store(config, false).await;
+    let store = match open_store(config, false).await {
+        Ok(store) => store,
+        Err(error) => {
+            tracing::error!(
+                event = "command_failed",
+                command = "search",
+                reason = "database",
+                error = %error,
+                "search failed"
+            );
+            eprintln!("search failed: {error}");
+            std::process::exit(1);
+        }
+    };
 
     let results = match store
         .search_torrents(query.as_deref().unwrap_or(""), limit.clamp(1, 500), sort)
@@ -568,6 +748,13 @@ async fn cmd_search(
     {
         Ok(results) => results,
         Err(error) => {
+            tracing::error!(
+                event = "command_failed",
+                command = "search",
+                reason = "database",
+                error = %error,
+                "search failed"
+            );
             eprintln!("search failed: {error}");
             std::process::exit(1);
         }
@@ -626,8 +813,34 @@ fn cmd_magnet(info_hash: &str, name: Option<&str>) {
 }
 
 async fn cmd_stats(config: &config::Config) {
-    let store = open_store(config, false).await;
-    let stats = store.get_stats().await.expect("failed to get stats");
+    let store = match open_store(config, false).await {
+        Ok(store) => store,
+        Err(error) => {
+            tracing::error!(
+                event = "command_failed",
+                command = "stats",
+                reason = "database",
+                error = %error,
+                "stats failed"
+            );
+            eprintln!("stats failed: {error}");
+            std::process::exit(1);
+        }
+    };
+    let stats = match store.get_stats().await {
+        Ok(stats) => stats,
+        Err(error) => {
+            tracing::error!(
+                event = "command_failed",
+                command = "stats",
+                reason = "database",
+                error = %error,
+                "stats failed"
+            );
+            eprintln!("stats failed: {error}");
+            std::process::exit(1);
+        }
+    };
 
     println!("Torrents total:           {}", stats.total_torrents);
     println!(
@@ -646,7 +859,13 @@ async fn cmd_stats(config: &config::Config) {
                 println!("{}", line);
             }
         }
-        Err(e) => tracing::warn!("failed to get crawl history: {}", e),
+        Err(e) => tracing::warn!(
+            event = "database_query_failed",
+            query = "crawl_history",
+            reason = "database",
+            error = %e,
+            "failed to get crawl history"
+        ),
     }
 
     match store.get_metadata_failure_counts().await {
@@ -655,7 +874,13 @@ async fn cmd_stats(config: &config::Config) {
                 println!("{}", line);
             }
         }
-        Err(e) => tracing::warn!("failed to get metadata failure counts: {}", e),
+        Err(e) => tracing::warn!(
+            event = "database_query_failed",
+            query = "metadata_failure_counts",
+            reason = "database",
+            error = %e,
+            "failed to get metadata failure counts"
+        ),
     }
 }
 
@@ -699,25 +924,128 @@ fn metadata_failure_count_lines(counts: &[store::MetadataFailureCount]) -> Vec<S
 }
 
 async fn cmd_serve(config: &config::Config, host: &str, port: u16) {
-    let store = open_store(config, true).await;
+    let store = match open_store(config, true).await {
+        Ok(store) => store,
+        Err(error) => {
+            tracing::error!(
+                event = "startup_failed",
+                component = "database",
+                reason = "connect",
+                error = %error,
+                "web startup failed"
+            );
+            std::process::exit(1);
+        }
+    };
 
     let addr = format!("{host}:{port}");
-    tracing::info!("serving dashboard on http://{addr}");
+    let web_metrics = Arc::new(metrics::WebMetrics::default());
+    let app = web::router(store, web_metrics.clone());
+    let listener = match tokio::net::TcpListener::bind(&addr).await {
+        Ok(listener) => listener,
+        Err(error) => {
+            tracing::error!(
+                event = "startup_failed",
+                component = "http_listener",
+                reason = "bind",
+                address = %addr,
+                error = %error,
+                "web startup failed"
+            );
+            std::process::exit(1);
+        }
+    };
+    tracing::info!(
+        event = "web_started",
+        version = logging::VERSION,
+        revision = logging::GIT_REVISION.unwrap_or("unknown"),
+        "web started"
+    );
+    tracing::info!(event = "web_listening", address = %addr, "listening for HTTP requests");
 
-    let app = web::router(store);
-    let listener = tokio::net::TcpListener::bind(&addr)
-        .await
-        .expect("failed to bind HTTP server");
+    let reporter = tokio::spawn(metrics::run_web_reporter(web_metrics.clone()));
+    let server = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal());
+    let result = server.await;
+    reporter.abort();
+    let _ = reporter.await;
+    web_metrics.emit(true);
+    match result {
+        Ok(()) => tracing::info!(
+            event = "web_shutdown",
+            graceful = true,
+            reason = "signal",
+            "web stopped"
+        ),
+        Err(error) => {
+            tracing::error!(
+                event = "web_shutdown",
+                graceful = false,
+                reason = "server_error",
+                error = %error,
+                "web stopped unexpectedly"
+            );
+            std::process::exit(1);
+        }
+    }
+}
 
-    axum::serve(listener, app).await.expect("HTTP server error");
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut terminate = match signal(SignalKind::terminate()) {
+            Ok(signal) => signal,
+            Err(error) => {
+                tracing::warn!(
+                    event = "shutdown_signal_failed",
+                    reason = "sigterm",
+                    error = %error,
+                    "failed to register SIGTERM handler"
+                );
+                let _ = tokio::signal::ctrl_c().await;
+                return;
+            }
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = terminate.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 async fn cmd_prune(config: &config::Config, older_than: u32) {
-    let store = open_store(config, false).await;
-    let removed = store
-        .prune_old_torrents(older_than as i64)
-        .await
-        .expect("prune failed");
+    let store = match open_store(config, false).await {
+        Ok(store) => store,
+        Err(error) => {
+            tracing::error!(
+                event = "command_failed",
+                command = "prune",
+                reason = "database",
+                error = %error,
+                "prune failed"
+            );
+            eprintln!("prune failed: {error}");
+            std::process::exit(1);
+        }
+    };
+    let removed = match store.prune_old_torrents(older_than as i64).await {
+        Ok(removed) => removed,
+        Err(error) => {
+            tracing::error!(
+                event = "command_failed",
+                command = "prune",
+                reason = "database",
+                error = %error,
+                "prune failed"
+            );
+            eprintln!("prune failed: {error}");
+            std::process::exit(1);
+        }
+    };
     println!(
         "Removed {} torrents older than {} days",
         removed, older_than
@@ -953,6 +1281,7 @@ mod integration_tests {
             stats_rx,
             128,
             Duration::from_secs(60),
+            Arc::new(metrics::CrawlerMetrics::default()),
         ));
 
         stats_tx
@@ -1017,6 +1346,7 @@ mod integration_tests {
             stats_rx,
             3,
             Duration::from_secs(60),
+            Arc::new(metrics::CrawlerMetrics::default()),
         ));
 
         for _ in 0..3 {
@@ -1066,7 +1396,8 @@ mod integration_tests {
                 &store,
                 &mut events,
                 &mut snapshot,
-                &uuid::Uuid::new_v4().to_string()
+                &uuid::Uuid::new_v4().to_string(),
+                &metrics::CrawlerMetrics::default()
             )
             .await
         );

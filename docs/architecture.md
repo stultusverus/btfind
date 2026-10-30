@@ -19,6 +19,8 @@ bounded channel to the persistence worker. Database I/O is asynchronous.
 | Module | Responsibility |
 | --- | --- |
 | `src/main.rs` | CLI dispatch, process startup/shutdown, runtime event batching |
+| `src/logging.rs` | JSON logging initialisation, service identity, panic hook |
+| `src/metrics.rs` | Bounded crawler measurements and web request/latency snapshots |
 | `src/config.rs` | TOML configuration, defaults, validation, XDG config paths |
 | `src/dht.rs`, `src/routing.rs` | UDP KRPC, bootstrap, routing, peer/hash discovery, optional BEP 51 sampling |
 | `src/bencode.rs`, `src/types.rs` | KRPC encoding and shared types |

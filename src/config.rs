@@ -367,10 +367,7 @@ impl Config {
         if config_path.exists() {
             match std::fs::read_to_string(&config_path) {
                 Ok(contents) => match toml::from_str(&contents) {
-                    Ok(config) => {
-                        tracing::info!("loaded config from {}", config_path.display());
-                        return Ok(config);
-                    }
+                    Ok(config) => return Ok(config),
                     Err(error) => {
                         return Err(format!(
                             "failed to parse {}: {}",
