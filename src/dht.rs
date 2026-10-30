@@ -495,6 +495,24 @@ fn error_message(transaction: &[u8], description: &str) -> KrpcMessage {
     }
 }
 
+fn enqueue_discovery(
+    sender: &mpsc::Sender<HashDiscovery>,
+    discovery: HashDiscovery,
+) -> (CrawlStatsEvent, bool) {
+    let info_hash = discovery.info_hash;
+    let source = discovery.source;
+    let has_peers = !discovery.peers.is_empty();
+    let accepted = sender.try_send(discovery).is_ok();
+    (
+        CrawlStatsEvent::HashObserved {
+            info_hash,
+            source,
+            has_peers: has_peers && accepted,
+        },
+        !accepted,
+    )
+}
+
 pub struct DhtCrawler {
     pub our_id: NodeId,
     pub socket: Arc<TokioUdpSocket>,
@@ -701,21 +719,17 @@ impl DhtCrawler {
         peers.sort_by_key(|peer| peer.addr);
         peers.dedup();
         peers.truncate(self.config.max_peers_per_hash);
-        self.emit_stat(CrawlStatsEvent::HashObserved {
-            info_hash,
-            source,
-            has_peers: !peers.is_empty(),
-        });
         self.queue_hash(info_hash);
-        if self
-            .info_hash_tx
-            .try_send(HashDiscovery {
+        let (observation, backpressure) = enqueue_discovery(
+            &self.info_hash_tx,
+            HashDiscovery {
                 info_hash,
                 peers,
                 source,
-            })
-            .is_err()
-        {
+            },
+        );
+        self.emit_stat(observation);
+        if backpressure {
             self.emit_stat(CrawlStatsEvent::DiscoveryBackpressure);
         }
     }
@@ -1219,6 +1233,85 @@ mod tests {
         assert!(record_hash_observation(&mut count, &[3; 20]));
         assert!(!record_hash_observation(&mut count, &[0; 20]));
         assert_eq!(count, 2);
+    }
+
+    fn peer_discovery(hash: InfoHash) -> HashDiscovery {
+        HashDiscovery {
+            info_hash: hash,
+            peers: vec![PeerContact {
+                addr: "8.8.8.8:6881".parse().unwrap(),
+            }],
+            source: DiscoverySource::AnnouncePeer,
+        }
+    }
+
+    #[test]
+    fn saturated_discovery_channel_emits_peerless_fallback() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let (accepted, backpressure) = enqueue_discovery(&tx, peer_discovery([1; 20]));
+        assert!(!backpressure);
+        assert!(matches!(
+            accepted,
+            CrawlStatsEvent::HashObserved {
+                has_peers: true,
+                ..
+            }
+        ));
+        let (fallback, backpressure) = enqueue_discovery(&tx, peer_discovery([2; 20]));
+        assert!(backpressure);
+        assert_eq!(
+            fallback,
+            CrawlStatsEvent::HashObserved {
+                info_hash: [2; 20],
+                source: DiscoverySource::AnnouncePeer,
+                has_peers: false,
+            }
+        );
+        let queued = rx.try_recv().unwrap();
+        assert_eq!(queued.info_hash, [1; 20]);
+        assert_eq!(queued.peers, peer_discovery([1; 20]).peers);
+        assert!(rx.try_recv().is_err());
+        drop(rx);
+        let (fallback, backpressure) = enqueue_discovery(&tx, peer_discovery([3; 20]));
+        assert!(backpressure);
+        assert!(matches!(
+            fallback,
+            CrawlStatsEvent::HashObserved {
+                has_peers: false,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires BTFIND_TEST_DATABASE_URL; run scripts/test-mysql.sh"]
+    async fn saturated_discovery_fallback_is_recoverable() {
+        let store = crate::store::Store::open_test_database().await.unwrap();
+        let (tx, _rx) = mpsc::channel(1);
+        tx.try_send(peer_discovery([1; 20])).unwrap();
+        let hash = [2; 20];
+        let (fallback, backpressure) = enqueue_discovery(&tx, peer_discovery(hash));
+        assert!(backpressure);
+        for _ in 0..2 {
+            store
+                .persist_runtime_batch(&[fallback], None, "saturated-discovery")
+                .await
+                .unwrap();
+        }
+        assert_eq!(store.get_stats().await.unwrap().total_torrents, 1);
+        assert_eq!(store.incomplete_info_hashes(10).await.unwrap(), vec![hash]);
+        assert_eq!(store.due_hash_jobs(10).await.unwrap()[0].info_hash, hash);
+        assert!(store.hash_job_peers(&hash, 8).await.unwrap().is_empty());
+        let discovery = peer_discovery(hash);
+        store
+            .persist_hash_discovery(&hash, discovery.source.as_str(), &discovery.peers, 8)
+            .await
+            .unwrap();
+        assert_eq!(store.get_stats().await.unwrap().total_torrents, 1);
+        assert_eq!(
+            store.hash_job_peers(&hash, 8).await.unwrap(),
+            discovery.peers
+        );
     }
 
     fn response(

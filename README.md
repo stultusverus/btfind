@@ -188,9 +188,14 @@ A discovery's torrent row, durable metadata job, supplied peers, and peer-retent
 changes commit in one transaction. Retrying upserts the same torrent and peer
 keys without duplicating catalogue counts. Peer-bearing observations are persisted
 by the metadata worker; statistics events without addresses cannot create a
-partially persisted peer-bearing discovery. Peerless observations still use the
-statistics persistence path. Work not yet committed can still be lost on process
-exit, but a committed discovery includes its retained peers for restart recovery.
+partially persisted peer-bearing discovery. If the metadata channel is full or
+closed, the crawler instead emits a peerless observation to the statistics path,
+retaining the hash and source for future lookup and restart recovery. This fallback
+does not retain the supplied peer addresses. Both channels are bounded; recovery
+through this fallback depends on the statistics event being accepted and committed.
+Peerless observations also use the statistics path. Work not yet committed can
+still be lost on process exit; accepted metadata discoveries commit their retained
+peers atomically.
 
 ## Database
 

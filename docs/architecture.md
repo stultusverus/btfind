@@ -42,8 +42,11 @@ retention changes in one transaction, locking catalogue totals before the torren
 Peer upserts and retention deletes use bounded batches. Replays preserve unique
 torrent/peer keys and do not increment catalogue totals twice; completed jobs stay
 complete. Concurrent discoveries serialize through the existing catalogue lock.
-The statistics worker only persists peerless hash observations: peer-bearing
-observations belong to the metadata worker, which has the actual addresses.
+Accepted peer-bearing discoveries belong to the metadata worker, which has the
+actual addresses. If its channel is full or closed, the crawler marks the
+statistics observation as peerless so the statistics worker can retain the hash
+and source for future lookup. This fallback retains no peer addresses and requires
+the bounded statistics channel to accept the event and its worker to commit it.
 Committed retained peer candidates and retry state survive restarts. Workers
 negotiate `ut_metadata`, retrieve and validate the info dictionary, and commit
 metadata, files, search documents, job completion, and counters atomically.
