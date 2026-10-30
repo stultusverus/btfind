@@ -14,7 +14,7 @@ running. There is no resident agent, proxy, or Prometheus listener.
 
 | File | Responsibility |
 | --- | --- |
-| `export.py` | configuration, OCI clients, retries, independent stream orchestration |
+| `export.py` | parent hard-deadline orchestration, child stream runners, OCI clients, retries |
 | `journal.py` | bounded forward-only `journalctl -o json` reader and record normalisation |
 | `logging_export.py` | OCI Logging batches, stable UUIDs, oversized-record dead letters |
 | `metrics_export.py` | summary-event to OCI Monitoring mapping and counter baselines |
@@ -70,8 +70,10 @@ sudo -u root /opt/btfind-observability/venv/bin/python \
 | `METRICS_BATCH_MAX_POINTS` | `40` | Metric datapoints per `post_metric_data` call (OCI allows 50 unique streams) |
 | `OCI_MAX_ATTEMPTS` | `5` | Transient retry attempts per operation |
 | `OCI_API_TIMEOUT_SECONDS` | `8` | Per-request connect/read timeout; clamped to one third of each stream budget |
-| `LOG_EXPORT_BUDGET_SECONDS` | `25` | Independent log-stream execution budget |
-| `METRICS_EXPORT_BUDGET_SECONDS` | `25` | Independent metric-stream execution budget |
+| `LOG_EXPORT_BUDGET_SECONDS` | `25` | Cooperative log-stream retry budget |
+| `METRICS_EXPORT_BUDGET_SECONDS` | `25` | Cooperative metric-stream retry budget |
+| `LOG_EXPORT_HARD_TIMEOUT_SECONDS` | `35` | Parent-enforced hard deadline for the log child process |
+| `METRICS_EXPORT_HARD_TIMEOUT_SECONDS` | `35` | Parent-enforced hard deadline for the metric child process |
 | `STATE_DIR` | `/var/lib/btfind-observability` | Checkpoints, lock, and dead letters |
 | `DEAD_LETTER_PATH` | `$STATE_DIR/dead-letter.jsonl` | Oversized record diagnostics |
 | `DEAD_LETTER_MAX_BYTES` | `8388608` | Per-file cap; rotated to `.1` before appending |
@@ -173,27 +175,32 @@ under its own identifier rather than the two source identifiers.
 
 ## Execution budgets
 
-Logs and metrics run sequentially but each stream gets a fresh independent
-`Budget`. A logging outage that exhausts `LOG_EXPORT_BUDGET_SECONDS` cannot stop
-the metrics pass, which starts with its own `METRICS_EXPORT_BUDGET_SECONDS`.
-Retries check the remaining budget before every API attempt and before sleeping,
-so a failing destination cannot consume the other destination's time.
+The default invocation is a small parent orchestrator. It starts `export.py
+--stream logs` as a child process, waits with `LOG_EXPORT_HARD_TIMEOUT_SECONDS`,
+kills it if necessary, then starts `export.py --stream metrics` with its own
+`METRICS_EXPORT_HARD_TIMEOUT_SECONDS`. The child process is the unit of hard
+termination, so an in-flight Logging request cannot delay or prevent Monitoring
+processing. Each child uses the same versioned checkpoint file under the state
+lock; sequential execution keeps state updates safe while cursors remain
+independent.
 
-The OCI per-request timeout is also clamped to one third of the smaller stream
-budget, and metric points are posted in bounded chunks so the budget is checked
-between API calls. With the defaults, the worst-case per-stream overrun is one
-8-second request beyond its 25-second budget; both streams plus SDK startup stay
-inside the example `TimeoutStartSec=90`. If you raise the budgets, keep their
-sum plus startup and one in-flight request below the systemd timeout.
+Inside each child, the cooperative `Budget` stops retries before the hard
+deadline and permits a graceful checkpoint. The OCI per-request timeout is
+clamped to one third of the smaller cooperative budget, and log/metric requests
+are chunked so the budget is checked between calls. The hard parent timeout is
+the backstop for a stalled socket read. With the defaults (25-second cooperative
+budgets, 35-second hard deadlines), two children plus startup stay inside the
+example `TimeoutStartSec=90`. If you raise the cooperative budgets or hard
+timeouts, keep their sum plus startup below the systemd timeout.
 
 ## Failure semantics
 
-- `0`: both streams completed their bounded pass.
-- `1`: one or both streams failed after retries; checkpoints advance only for
-  acknowledged work.
-- `2`: required configuration is missing or invalid.
-- `3`: instance-principal authentication or client creation failed.
-- `75`: another exporter invocation holds the state lock.
+- `0`: the parent's log and metric children both completed their bounded pass.
+- `1`: one or both children failed, were killed at their hard deadline, or
+  returned a nonzero child code; checkpoints advance only for acknowledged work.
+- Child `2`: required configuration is missing or invalid.
+- Child `3`: instance-principal authentication or client creation failed.
+- Child `75`: another exporter invocation holds the state lock.
 
 Journal storage exhaustion, journald vacuuming, or a long OCI outage can create
 gaps. Gaps are local diagnostics, not synthetic cloud records. Restore OCI access

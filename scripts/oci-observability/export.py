@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """One-shot btfind journal -> OCI Logging and Monitoring exporter.
 
-Journal logs and metric summaries use independent durable cursors.  The script
-exits after one bounded pass; systemd schedules the next pass with a timer.
+Journal logs and metric summaries use independent durable cursors.  The default
+invocation is a parent that runs each stream in a separately terminable child
+process with its own hard deadline.  The script exits after one bounded pass;
+systemd schedules the next pass with a timer.
 """
 
 import os
 import random
+import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
@@ -17,6 +20,10 @@ import journal
 import logging_export
 import metrics_export
 from diagnostics import emit
+
+
+STREAMS = ("logs", "metrics")
+DEFAULT_HARD_TIMEOUT_SECONDS = 35
 
 
 class PublishError(Exception):
@@ -363,11 +370,16 @@ def run_metrics(store, client, config):
         raise PublishError(f"journal read failed: {error}") from error
 
 
-def main():
+def run_stream(stream):
     try:
         config = load_config()
     except (ValueError, TypeError) as error:
-        emit("configuration_invalid", level="error", error=str(error))
+        emit(
+            "configuration_invalid",
+            level="error",
+            stream=stream,
+            error=str(error),
+        )
         return 2
 
     try:
@@ -376,32 +388,93 @@ def main():
             try:
                 logging_client, monitoring_client = make_clients(config)
             except Exception as error:
-                emit("instance_principal_failed", level="error", error=str(error))
+                emit(
+                    "instance_principal_failed",
+                    level="error",
+                    stream=stream,
+                    error=str(error),
+                )
                 return 3
 
-            logs_ok = False
-            metrics_ok = False
             try:
-                run_logs(store, logging_client, config)
-                logs_ok = True
+                if stream == "logs":
+                    run_logs(store, logging_client, config)
+                else:
+                    run_metrics(store, monitoring_client, config)
             except PublishError as error:
-                emit("log_export_failed", level="error", error=str(error))
+                emit(
+                    f"{stream}_export_failed",
+                    level="error",
+                    stream=stream,
+                    error=str(error),
+                )
+                return 1
 
-            try:
-                run_metrics(store, monitoring_client, config)
-                metrics_ok = True
-            except PublishError as error:
-                emit("metric_export_failed", level="error", error=str(error))
-
-            emit(
-                "export_completed",
-                logs_ok=logs_ok,
-                metrics_ok=metrics_ok,
-            )
-            return 0 if logs_ok and metrics_ok else 1
+            emit("export_stream_completed", stream=stream)
+            return 0
     except RuntimeError as error:
-        emit("exporter_locked", level="warning", error=str(error))
+        emit("exporter_locked", level="warning", stream=stream, error=str(error))
         return 75
+
+
+def run_parent():
+    failed = []
+    hard_timeout_env = {
+        "logs": "LOG_EXPORT_HARD_TIMEOUT_SECONDS",
+        "metrics": "METRICS_EXPORT_HARD_TIMEOUT_SECONDS",
+    }
+    for stream in STREAMS:
+        timeout = env_int(
+            hard_timeout_env[stream],
+            DEFAULT_HARD_TIMEOUT_SECONDS,
+        )
+        emit("export_stream_started", stream=stream, hard_timeout_seconds=timeout)
+        try:
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    os.path.abspath(__file__),
+                    "--stream",
+                    stream,
+                ],
+                timeout=timeout,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            emit(
+                "export_stream_timeout",
+                level="error",
+                stream=stream,
+                hard_timeout_seconds=timeout,
+            )
+            failed.append(stream)
+            continue
+
+        if completed.returncode != 0:
+            emit(
+                "export_stream_failed",
+                level="error",
+                stream=stream,
+                exit_code=completed.returncode,
+            )
+            failed.append(stream)
+
+    emit("export_completed", failed_streams=failed)
+    return 1 if failed else 0
+
+
+def main(argv=None):
+    arguments = sys.argv[1:] if argv is None else argv
+    if not arguments:
+        return run_parent()
+    if len(arguments) == 2 and arguments[0] == "--stream" and arguments[1] in STREAMS:
+        return run_stream(arguments[1])
+    emit(
+        "configuration_invalid",
+        level="error",
+        error="usage: export.py [--stream logs|metrics]",
+    )
+    return 2
 
 
 if __name__ == "__main__":
