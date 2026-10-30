@@ -284,6 +284,7 @@ async fn cmd_run(
         announced_peers_per_hash: config.crawl.announced_peers_per_hash,
         announced_peer_ttl: Duration::from_secs(config.crawl.announced_peer_ttl_secs),
     };
+    let crawler_metrics = Arc::new(metrics::CrawlerMetrics::default());
     let mut crawler = dht::DhtCrawler::with_config(
         node_id,
         socket.clone(),
@@ -291,6 +292,7 @@ async fn cmd_run(
         stats_tx.clone(),
         bootstrap_nodes,
         dht_config,
+        crawler_metrics.clone(),
     );
     let resumed_hashes = crawler.seed_info_hashes(resume_state.info_hashes);
     let resumed_nodes = crawler.seed_nodes(resume_state.dht_nodes);
@@ -306,7 +308,6 @@ async fn cmd_run(
         crawler.run(get_peers_interval, bucket_refresh).await;
     });
 
-    let crawler_metrics = Arc::new(metrics::CrawlerMetrics::default());
     let metrics_handle = tokio::spawn(metrics::run_crawler_reporter(crawler_metrics.clone()));
 
     let store_stats = store.clone();
@@ -331,6 +332,7 @@ async fn cmd_run(
     let max_peer_attempts_per_round = config.metadata.max_peer_attempts_per_round;
     let max_active_hash_jobs = config.metadata.max_active_hash_jobs;
     let max_peers_per_hash = config.metadata.max_peers_per_hash;
+    let fetcher_metrics = crawler_metrics.clone();
     let fetcher_handle = tokio::spawn(async move {
         metadata::run_metadata_fetcher(
             info_hash_rx,
@@ -343,6 +345,7 @@ async fn cmd_run(
             max_active_hash_jobs,
             max_peers_per_hash,
             stats_tx,
+            fetcher_metrics,
         )
         .await;
     });
@@ -486,7 +489,6 @@ async fn run_stats_persistence(
                     flush_stats_batch(&store, &mut events, &mut snapshot, &metrics).await;
                     break;
                 };
-                metrics.apply(&event);
                 stats.apply(event);
                 if matches!(event, types::CrawlStatsEvent::DhtSnapshot { .. }) {
                     snapshot = Some(stats.snapshot());

@@ -9,6 +9,11 @@ from diagnostics import emit
 DEFAULT_MAX_DATA_CHARS = 10000
 DEFAULT_MAX_ENTRIES = 200
 DEFAULT_STATE_DIR = "/var/lib/btfind-observability"
+DEFAULT_DEAD_LETTER_BYTES = 8 * 1024 * 1024
+
+
+class DeadLetterError(Exception):
+    pass
 
 
 def max_data_chars():
@@ -17,6 +22,10 @@ def max_data_chars():
 
 def max_entries():
     return int(os.environ.get("LOG_BATCH_MAX_ENTRIES", DEFAULT_MAX_ENTRIES))
+
+
+def max_dead_letter_bytes():
+    return int(os.environ.get("DEAD_LETTER_MAX_BYTES", DEFAULT_DEAD_LETTER_BYTES))
 
 
 def dead_letter_path():
@@ -38,29 +47,44 @@ def stable_entry_id(record):
 
 def write_dead_letter(record, data_chars):
     path = dead_letter_path()
+    limit = max_dead_letter_bytes()
+    line = json.dumps(
+        {
+            "cursor": record.cursor,
+            "timestamp": record.timestamp.isoformat(),
+            "service": record.service,
+            "data_chars": data_chars,
+            "content": record.content,
+        },
+        separators=(",", ":"),
+        default=str,
+    )
+    encoded = (line + "\n").encode("utf-8")
+
+    if len(encoded) > limit:
+        emit(
+            "dead_letter_full",
+            level="error",
+            reason="single_record",
+            bytes=len(encoded),
+            limit=limit,
+        )
+        raise DeadLetterError("oversized record exceeds dead-letter limit")
+
     try:
         os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
-        line = json.dumps(
-            {
-                "cursor": record.cursor,
-                "timestamp": record.timestamp.isoformat(),
-                "service": record.service,
-                "data_chars": data_chars,
-                "content": record.content,
-            },
-            separators=(",", ":"),
-            default=str,
-        )
+        if os.path.exists(path) and os.path.getsize(path) + len(encoded) > limit:
+            backup = path + ".1"
+            os.replace(path, backup)
+            emit(
+                "dead_letter_rotated",
+                level="warning",
+                limit=limit,
+                backup=backup,
+            )
         descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         with os.fdopen(descriptor, "a", encoding="utf-8") as handle:
             handle.write(line + "\n")
-        emit(
-            "log_entry_oversized",
-            level="warning",
-            reason="data_limit",
-            data_chars=data_chars,
-            max_chars=max_data_chars(),
-        )
     except OSError as error:
         emit(
             "dead_letter_write_failed",
@@ -68,6 +92,15 @@ def write_dead_letter(record, data_chars):
             reason="filesystem",
             error=str(error),
         )
+        raise DeadLetterError(str(error)) from error
+
+    emit(
+        "log_entry_oversized",
+        level="warning",
+        reason="data_limit",
+        data_chars=data_chars,
+        max_chars=max_data_chars(),
+    )
 
 
 def serialise(record):

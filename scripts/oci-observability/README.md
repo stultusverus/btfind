@@ -33,6 +33,7 @@ sudo python3 -m venv /opt/btfind-observability/venv
 sudo /opt/btfind-observability/venv/bin/pip install \
   --requirement /opt/btfind-observability/requirements.txt
 sudo install -d -m 0700 /var/lib/btfind-observability
+sudo install -d -m 0755 /etc/btfind
 sudo install -m 0600 /dev/null /etc/btfind/observability.env
 ```
 
@@ -71,6 +72,7 @@ sudo -u root /opt/btfind-observability/venv/bin/python \
 | `OCI_API_TIMEOUT_SECONDS` | `20` | Per-request connect/read timeout |
 | `STATE_DIR` | `/var/lib/btfind-observability` | Checkpoints, lock, and dead letters |
 | `DEAD_LETTER_PATH` | `$STATE_DIR/dead-letter.jsonl` | Oversized record diagnostics |
+| `DEAD_LETTER_MAX_BYTES` | `8388608` | Per-file cap; rotated to `.1` before appending |
 
 The source journal identifiers are `btfind-crawler` and `btfind-web`. The
 exporter itself uses `btfind-observability`, which is intentionally excluded from
@@ -78,9 +80,12 @@ the journal filters to avoid recursive ingestion.
 
 ## Journal selection and backlog
 
-`journal.py` runs `journalctl --system`, filters `_UID` and
-`_SYSTEMD_USER_UNIT=btfind.service|btfind-web.service`, and corroborates
-`SYSLOG_IDENTIFIER` before selecting a destination. It reads forward from
+`journal.py` runs `journalctl` **without** `--system` or `--user`, filters
+`_UID` and `_SYSTEMD_USER_UNIT=btfind.service|btfind-web.service`, and
+corroborates `SYSLOG_IDENTIFIER` before selecting a destination. Omitting
+`--system` is required: with persistent journald and `SplitMode=uid`, regular
+user records live in per-user journal files that `--system` excludes. It reads
+forward from
 `--after-cursor` in journal order. A batch is bounded by record count **and**
 encoded line size; up to ten batches are read per invocation. It does not use
 `journalctl -n`, whose latest-record semantics would skip backlog.
@@ -110,6 +115,15 @@ record is appended to the root-only dead-letter file and a small
 `log_entry_oversized` diagnostic is sent in its place. This keeps one large
 event from blocking the queue forever; it is not silent truncation.
 
+Dead-letter storage is bounded to `DEAD_LETTER_MAX_BYTES` per file. When the
+current file would exceed the cap, it is rotated to `dead-letter.jsonl.1`
+(replacing the previous backup), so total on-disk use stays bounded at roughly
+twice the cap. If the record cannot be preserved because the cap is too small
+for one record or the filesystem write fails, the exporter records a
+`dead_letter_failed` gap and does **not** advance the log cursor. It reports the
+condition on its own journal identifier instead of silently replacing and
+checkpointing the record.
+
 Logs and metrics have independent cursors. A log batch may contain both service
 partitions; the log cursor advances only after every non-empty partition is
 acknowledged. A partial success can resend the acknowledged partition on the
@@ -132,8 +146,11 @@ Metric namespace: `btfind`. Dimensions are bounded to `instance`, `service`,
 records `unit` (`count` or `milliseconds`) and `semantics` (`gauge`,
 `interval_delta`, `window_count`, or `window_sum`).
 
-Metrics have their own journal cursor and retry policy, so log shipping can fail
-without blocking metrics and vice versa. If a summary is older than
+Metric batches use OCI's `ATOMIC` validation, and the exporter also inspects
+`failed_metrics_count` in every response. A rejected point prevents metric
+checkpoint and baseline advancement. Metrics have their own journal cursor and
+retry policy, so log shipping can fail without blocking metrics and vice versa.
+If a summary is older than
 `METRICS_MAX_AGE_SECONDS`, the exporter records a `freshness_skip` gap and
 advances the metrics cursor without posting it. OCI cannot accept arbitrarily old
 datapoints. No API call is made when a scanned batch contains no summary events.

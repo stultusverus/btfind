@@ -1,4 +1,5 @@
 use crate::bencode::{KrpcError, KrpcMessage, KrpcValue};
+use crate::metrics::CrawlerMetrics;
 use crate::routing::RoutingTable;
 use crate::types::{
     random_node_id, CrawlStatsEvent, DiscoverySource, HashDiscovery, InfoHash, NodeContact, NodeId,
@@ -525,6 +526,7 @@ pub struct DhtCrawler {
     pub routing: RoutingTable,
     info_hash_tx: mpsc::Sender<HashDiscovery>,
     stats_tx: mpsc::Sender<CrawlStatsEvent>,
+    metrics: Arc<CrawlerMetrics>,
     token_secret: [u8; 16],
     bootstrap_nodes: Vec<String>,
     discovery_queue: VecDeque<InfoHash>,
@@ -547,6 +549,7 @@ impl DhtCrawler {
         info_hash_tx: mpsc::Sender<HashDiscovery>,
         stats_tx: mpsc::Sender<CrawlStatsEvent>,
         bootstrap_nodes: Vec<String>,
+        metrics: Arc<CrawlerMetrics>,
     ) -> Self {
         Self::with_config(
             random_node_id(),
@@ -555,6 +558,7 @@ impl DhtCrawler {
             stats_tx,
             bootstrap_nodes,
             DhtConfig::default(),
+            metrics,
         )
     }
 
@@ -565,6 +569,7 @@ impl DhtCrawler {
         stats_tx: mpsc::Sender<CrawlStatsEvent>,
         bootstrap_nodes: Vec<String>,
         config: DhtConfig,
+        metrics: Arc<CrawlerMetrics>,
     ) -> Self {
         let mut token_secret = [0; 16];
         rand::thread_rng().fill(&mut token_secret);
@@ -574,6 +579,7 @@ impl DhtCrawler {
             routing: RoutingTable::with_candidate_capacity(our_id, config.max_candidate_nodes),
             info_hash_tx,
             stats_tx,
+            metrics,
             token_secret,
             bootstrap_nodes,
             discovery_queue: VecDeque::new(),
@@ -591,6 +597,7 @@ impl DhtCrawler {
     }
 
     fn emit_stat(&self, event: CrawlStatsEvent) {
+        self.metrics.apply(&event);
         if matches!(
             self.stats_tx.try_send(event),
             Err(mpsc::error::TrySendError::Closed(_))

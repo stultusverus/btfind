@@ -129,19 +129,22 @@ def make_clients(config):
     import oci
 
     signer = oci.auth.signers.InstancePrincipalsSecurityTokenSigner()
-    client_config = {
-        "region": config.region,
-        "timeout": (config.api_timeout_seconds, config.api_timeout_seconds),
-    }
+    client_config = {"region": config.region}
+    timeout = (config.api_timeout_seconds, config.api_timeout_seconds)
     monitoring_endpoint = os.environ.get(
         "OCI_MONITORING_ENDPOINT",
         f"https://telemetry-ingestion.{config.region}.oraclecloud.com",
     )
-    logging_client = oci.loggingingestion.LoggingClient(client_config, signer=signer)
+    logging_client = oci.loggingingestion.LoggingClient(
+        client_config,
+        signer=signer,
+        timeout=timeout,
+    )
     monitoring_client = oci.monitoring.MonitoringClient(
         client_config,
         signer=signer,
         service_endpoint=monitoring_endpoint,
+        timeout=timeout,
     )
     return logging_client, monitoring_client
 
@@ -204,8 +207,24 @@ def run_logs(store, client, config):
             stream="logs",
             reason="cursor_invalid",
         )
-        ship_log_stream(store, client, config, None, None)
+        try:
+            ship_log_stream(store, client, config, None, None)
+        except logging_export.DeadLetterError as dead_letter:
+            store.record_gap(
+                "logs",
+                "dead_letter_failed",
+                cursor=None,
+                error=str(dead_letter),
+            )
+            store.save()
+            raise PublishError(
+                f"dead-letter storage failed: {dead_letter}"
+            ) from dead_letter
         return True
+    except logging_export.DeadLetterError as error:
+        store.record_gap("logs", "dead_letter_failed", cursor=cursor, error=str(error))
+        store.save()
+        raise PublishError(f"dead-letter storage failed: {error}") from error
     except PublishError:
         raise
     except journal.JournalError as error:
@@ -223,7 +242,7 @@ def ship_metrics_batch(store, client, batch, config):
     for gap in skipped:
         store.record_gap("metrics", "freshness_skip", **gap)
     if points:
-        with_retry(
+        responses = with_retry(
             "monitoring",
             lambda: metrics_export.publish_metrics(
                 client,
@@ -232,6 +251,20 @@ def ship_metrics_batch(store, client, batch, config):
             ),
             config,
         )
+        failed = sum(
+            int(getattr(getattr(response, "data", None), "failed_metrics_count", 0) or 0)
+            for response in responses or []
+        )
+        if failed:
+            emit(
+                "metric_points_rejected",
+                level="error",
+                count=failed,
+                cursor=batch.cursor,
+            )
+            raise PublishError(
+                f"monitoring rejected {failed} metric point(s); checkpoint not advanced"
+            )
     store.advance("metrics", batch.cursor, baselines=baselines)
     store.save()
     emit(

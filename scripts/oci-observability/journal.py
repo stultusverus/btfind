@@ -1,4 +1,10 @@
-"""Bounded, forward-only journal reader for the two btfind services."""
+"""Bounded, forward-only journal reader for the two btfind services.
+
+The query deliberately does not pass --system or --user. Persistent journald
+with SplitMode=uid stores regular-user records in per-user files; --system would
+exclude them. Explicit _UID and _SYSTEMD_USER_UNIT filters keep the selection
+bounded without relying on journalctl's user view.
+"""
 
 import json
 import os
@@ -132,7 +138,6 @@ def normalise(raw, uid):
 def build_command(cursor, lookback_seconds, uid):
     command = [
         "journalctl",
-        "--system",
         "--no-pager",
         "--quiet",
         "--output=json",

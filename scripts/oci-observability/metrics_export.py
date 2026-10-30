@@ -340,7 +340,7 @@ def publish_metrics(client, points, compartment_id):
         ]
         details = oci.monitoring.models.PostMetricDataDetails(
             metric_data=metric_data,
-            batch_atomicity="NON_ATOMIC",
+            batch_atomicity="ATOMIC",
         )
         responses.append(client.post_metric_data(post_metric_data_details=details))
     return responses

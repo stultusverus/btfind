@@ -123,6 +123,11 @@ converts crawler cumulative counters to interval deltas using a stored
 `run_id` baseline; a new run starts at a zero delta rather than republishing reset
 counters.
 
+Crawler and metadata workers update the in-memory metric registry when they emit
+an event, before the bounded statistics channel send. Metric collection therefore
+continues during database persistence failures and retry backoff; it does not
+depend on the database writer draining its queue.
+
 ### Volume controls
 
 - Normal operation emits at most a few INFO status records per minute per
@@ -163,9 +168,11 @@ contains placeholders only.
 
 ## Oracle Linux 9 setup
 
-Install the system-wide journald policy. Oracle Linux 9 stores user-service output
-in the system journal, but `journalctl --user` uses the user manager's view and may
-appear empty before lingering or when queried from the wrong context.
+Install the system-wide journald policy. Oracle Linux 9 may store user-service
+output in per-user journal files, so `journalctl --user` uses the user manager's
+view while the exporter reads the aggregate journal with explicit UID/unit
+filters. Enable lingering so the user services start without an interactive
+login.
 
 ```bash
 sudo install -d -m 0755 /etc/systemd/journald.conf.d
@@ -175,8 +182,12 @@ sudo systemctl restart systemd-journald
 sudo loginctl enable-linger opc
 ```
 
-The configuration enables persistent storage and bounds total usage. The system
-journal is the source for the exporter; use:
+The configuration enables persistent storage and bounds total usage. The
+exporter queries the aggregate journal as root with explicit `_UID` and
+`_SYSTEMD_USER_UNIT` filters; it deliberately does not pass `--system`, because
+persistent journald with `SplitMode=uid` can store user-service records in
+per-user journal files. It also does not use `journalctl --user`'s user-manager
+view. Use:
 
 ```bash
 journalctl --user-unit btfind.service
@@ -208,6 +219,7 @@ sudo python3 -m venv /opt/btfind-observability/venv
 sudo /opt/btfind-observability/venv/bin/pip install \
   --requirement /opt/btfind-observability/requirements.txt
 sudo install -d -m 0700 /var/lib/btfind-observability
+sudo install -d -m 0755 /etc/btfind
 sudo install -m 0600 deploy/observability.env.example \
   /etc/btfind/observability.env
 sudo install -m 0644 deploy/systemd/btfind-observability.service \
@@ -219,7 +231,7 @@ sudo systemctl enable --now btfind-observability.timer
 ```
 
 Edit `/etc/btfind/observability.env` before enabling the timer. The unit runs as
-root only to read the system journal; it has no resident daemon, uses
+root only to read the aggregate journal; it has no resident daemon, uses
 `StateDirectory=btfind-observability`, `UMask=0077`, and a 192 MiB memory cap.
 The exporter's diagnostics use `SyslogIdentifier=btfind-observability`, which is
 not among the two source identifiers and therefore cannot be ingested
@@ -257,7 +269,14 @@ for `ap-osaka-1`, `vm-sub01`, batching, lookback, and the freshness cutoff.
 - **Oversized entries.** A record whose OCI `LogEntry.data` would exceed 10,000
   characters is written to the root-only dead-letter file and replaced by a small
   `log_entry_oversized` diagnostic. This avoids silent truncation and prevents one
-  record from blocking the queue.
+  record from blocking the queue. Dead-letter storage is capped by
+  `DEAD_LETTER_MAX_BYTES` and rotates to `dead-letter.jsonl.1`, bounding total
+  on-disk use. If a record cannot be preserved because the cap is too small or
+  the write fails, the exporter records a `dead_letter_failed` gap and does not
+  advance the log cursor rather than silently dropping the original.
+- **Metric rejection.** Metric batches use OCI `ATOMIC` validation, and the
+  exporter inspects `failed_metrics_count` in every response. If OCI rejects a
+  point, the metric cursor and counter baselines do not advance.
 - **Metrics freshness.** OCI Monitoring accepts datapoints less than two hours
   old. The default cutoff is 6,900 seconds; older summaries are recorded as
   `freshness_skip` gaps and the metrics cursor advances without posting. Stale

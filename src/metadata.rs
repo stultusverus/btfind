@@ -1,3 +1,4 @@
+use crate::metrics::CrawlerMetrics;
 use crate::store::{PeerRetryEligibility, Store};
 use crate::types::{CrawlStatsEvent, HashDiscovery, InfoHash, MetadataFailureReason, PeerContact};
 use crate::wire::{self, ExtendedHandshake, Handshake, WireMessage, HANDSHAKE_LEN};
@@ -657,11 +658,25 @@ async fn filter_peers_for_retry(
     }
 }
 
-fn emit_metadata_failure(stats_tx: &mpsc::Sender<CrawlStatsEvent>, reason: MetadataFailureReason) {
-    if stats_tx
-        .try_send(CrawlStatsEvent::MetadataFetchFailed { reason })
-        .is_err()
-    {
+fn emit_stat(
+    metrics: &CrawlerMetrics,
+    stats_tx: &mpsc::Sender<CrawlStatsEvent>,
+    event: CrawlStatsEvent,
+) -> bool {
+    metrics.apply(&event);
+    stats_tx.try_send(event).is_ok()
+}
+
+fn emit_metadata_failure(
+    metrics: &CrawlerMetrics,
+    stats_tx: &mpsc::Sender<CrawlStatsEvent>,
+    reason: MetadataFailureReason,
+) {
+    if !emit_stat(
+        metrics,
+        stats_tx,
+        CrawlStatsEvent::MetadataFetchFailed { reason },
+    ) {
         tracing::debug!(
             event = "stats_channel_full",
             event_kind = "metadata_fetch_failed",
@@ -782,6 +797,7 @@ struct FetchRoundConfig {
     retry_after_hours: u32,
     max_metadata_size: u32,
     prior_attempt_count: u32,
+    metrics: Arc<CrawlerMetrics>,
 }
 
 fn apply_job_outcome(
@@ -925,7 +941,11 @@ where
                 })
                 .await;
                 log_storage_result("record metadata hash mismatch", recorded);
-                emit_metadata_failure(&stats_tx, MetadataFailureReason::HashMismatch);
+                emit_metadata_failure(
+                    &config.metrics,
+                    &stats_tx,
+                    MetadataFailureReason::HashMismatch,
+                );
             }
             Ok(bytes) => match parse_torrent_info(&bytes) {
                 Ok(info) => {
@@ -950,7 +970,11 @@ where
                     .await;
                     match committed {
                         Ok(()) => {
-                            if stats_tx.try_send(CrawlStatsEvent::MetadataFetched).is_err() {
+                            if !emit_stat(
+                                &config.metrics,
+                                &stats_tx,
+                                CrawlStatsEvent::MetadataFetched,
+                            ) {
                                 tracing::debug!(
                                     event = "stats_channel_full",
                                     event_kind = "metadata_fetched",
@@ -1035,7 +1059,7 @@ where
                     })
                     .await;
                     log_storage_result("record terminal metadata state", recorded);
-                    emit_metadata_failure(&stats_tx, MetadataFailureReason::Parse);
+                    emit_metadata_failure(&config.metrics, &stats_tx, MetadataFailureReason::Parse);
                     return JobOutcome {
                         info_hash,
                         attempts,
@@ -1061,7 +1085,7 @@ where
                 })
                 .await;
                 log_storage_result("record metadata peer failure", recorded);
-                emit_metadata_failure(&stats_tx, reason);
+                emit_metadata_failure(&config.metrics, &stats_tx, reason);
             }
         }
     }
@@ -1176,6 +1200,7 @@ pub async fn run_metadata_fetcher(
     max_active_hash_jobs: usize,
     max_peers_per_hash: usize,
     stats_tx: mpsc::Sender<CrawlStatsEvent>,
+    metrics: Arc<CrawlerMetrics>,
 ) {
     let mut jobs: HashMap<InfoHash, HashJob> = HashMap::new();
     let mut ready = VecDeque::new();
@@ -1209,6 +1234,7 @@ pub async fn run_metadata_fetcher(
                 retry_after_hours,
                 max_metadata_size,
                 prior_attempt_count: job.attempt_count,
+                metrics: metrics.clone(),
             };
             workers.spawn(process_hash_round(
                 info_hash,
@@ -1260,9 +1286,11 @@ pub async fn run_metadata_fetcher(
                     max_active_hash_jobs,
                     max_peers_per_hash,
                 ) == JobAdmission::AtCapacity
-                    && stats_tx
-                        .try_send(CrawlStatsEvent::DiscoveryBackpressure)
-                        .is_err()
+                    && !emit_stat(
+                        &metrics,
+                        &stats_tx,
+                        CrawlStatsEvent::DiscoveryBackpressure,
+                    )
                 {
                     tracing::debug!(
                         event = "stats_channel_full",
@@ -1273,14 +1301,15 @@ pub async fn run_metadata_fetcher(
             }
             _ = status_tick.tick() => {
                 let pending_peers = jobs.values().map(|job| job.peers.len()).sum();
-                if stats_tx
-                    .try_send(CrawlStatsEvent::MetadataQueue {
+                if !emit_stat(
+                    &metrics,
+                    &stats_tx,
+                    CrawlStatsEvent::MetadataQueue {
                         active_jobs: jobs.len(),
                         queued_jobs: ready.len(),
                         pending_peers,
-                    })
-                    .is_err()
-                {
+                    },
+                ) {
                     tracing::debug!(
                         event = "stats_channel_full",
                         event_kind = "metadata_queue",
@@ -1678,6 +1707,7 @@ mod tests {
                     retry_after_hours: 0,
                     max_metadata_size: 64 * 1024 * 1024,
                     prior_attempt_count: 0,
+                    metrics: Arc::new(CrawlerMetrics::default()),
                 },
                 |_, _, _, _| {
                     downloads.set(downloads.get() + 1);
@@ -1728,6 +1758,7 @@ mod tests {
                 retry_after_hours: 0,
                 max_metadata_size: 1024,
                 prior_attempt_count: 0,
+                metrics: Arc::new(CrawlerMetrics::default()),
             },
             |_, _, _, _| std::future::ready(Ok(bytes.clone())),
         )
@@ -1768,6 +1799,7 @@ mod tests {
                 retry_after_hours: 24,
                 max_metadata_size: 1024,
                 prior_attempt_count: 0,
+                metrics: Arc::new(CrawlerMetrics::default()),
             },
         )
         .await;
@@ -1813,6 +1845,7 @@ mod tests {
                 retry_after_hours: 24,
                 max_metadata_size: 1024,
                 prior_attempt_count: 1,
+                metrics: Arc::new(CrawlerMetrics::default()),
             },
         )
         .await;
