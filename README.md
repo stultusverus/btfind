@@ -184,6 +184,14 @@ storage invariants. Three subsystems run on a Tokio async runtime:
 
 Data flows through bounded `tokio::sync::mpsc` channels. Metadata work is deduplicated per info hash, runtime persistence is batched according to the configured database batch size and flush interval, and retry state plus peer candidates survive process restarts. Stable transaction receipts prevent replayed batches from incrementing counters twice.
 
+A discovery's torrent row, durable metadata job, supplied peers, and peer-retention
+changes commit in one transaction. Retrying upserts the same torrent and peer
+keys without duplicating catalogue counts. Peer-bearing observations are persisted
+by the metadata worker; statistics events without addresses cannot create a
+partially persisted peer-bearing discovery. Peerless observations still use the
+statistics persistence path. Work not yet committed can still be lost on process
+exit, but a committed discovery includes its retained peers for restart recovery.
+
 ## Database
 
 Connection: BTFIND_DATABASE_URL. Versioned schema: migrations/.
@@ -212,11 +220,22 @@ interrupted before acknowledgement) are retained: runtime retries have no fixed
 maximum duration. Do not run multiple crawler persistence workers against the
 same database. Retained receipts continue to prevent duplicate counter updates.
 
-Search rebuilds stream filenames and write at most 128 documents or approximately
-1 MiB of encoded data per transaction, whichever comes first. The byte budget is
-reduced for smaller `max_allowed_packet` settings. A single oversized document
-stops the rebuild with its hash and budget in the error, without truncating it or
-replacing its existing search document. Earlier batches may already be committed;
+Ingestion and search rebuilds use the same streamed document builder and limits.
+One document (normalized name, paths, hash, and encoding allowance) is limited to
+16 MiB or `max_allowed_packet` minus 16 KiB, whichever is smaller. Individual raw
+name/path fields are also bounded by that limit before retrieval. Normalization
+is incremental, so Unicode expansion cannot build an unlimited intermediate
+string. Exceeding a limit returns an explicit error with the hash and limit;
+content is never silently truncated. Ingestion rolls back the metadata transaction
+on failure; a failed rebuild retains the affected document's existing index entry.
+
+The rebuild batching target is separate: at most 128 documents and approximately
+1 MiB per write, reduced for smaller packet limits. An accepted document larger
+than the batching target is written alone, bounded by the document limit. Paths
+are streamed one row at a time, and only the pending batch and current document
+are accumulated. With unchanged server settings and application limits, every
+document accepted by ingestion can be rebuilt with identical searchable content.
+Earlier rebuild batches may already be committed when a later document fails;
 rerunning the rebuild replaces them safely.
 
 The catalogue totals row still serializes mutations. To measure contention on a

@@ -277,11 +277,41 @@ impl Store {
         &self,
         hash: &InfoHash,
         source: &str,
-        peers: bool,
+        peers: &[PeerContact],
+        limit: usize,
     ) -> Result<(), Error> {
+        let addresses: Vec<String> = peers
+            .iter()
+            .take(limit)
+            .map(|p| p.addr.to_string())
+            .collect();
+        let h = hex::encode(hash);
         let mut tx = self.pool.begin().await?;
         lock_totals(&mut tx).await?;
-        discover(&mut tx, hash, source, peers).await?;
+        discover(&mut tx, hash, source, !addresses.is_empty()).await?;
+        for chunk in addresses.chunks(128) {
+            let mut insert = QueryBuilder::<MySql>::new(
+                "INSERT INTO hash_job_peers(info_hash,peer_addr,last_seen) ",
+            );
+            insert.push_values(chunk, |mut row, addr| {
+                row.push_bind(&h).push_bind(addr).push_bind(now());
+            });
+            insert.push(" ON DUPLICATE KEY UPDATE last_seen=VALUES(last_seen)");
+            insert.build().execute(&mut *tx).await?;
+        }
+        let excess: Vec<String> = sqlx::query_scalar("SELECT peer_addr FROM hash_job_peers WHERE info_hash=? ORDER BY last_seen DESC,peer_addr LIMIT 18446744073709551615 OFFSET ?")
+            .bind(&h).bind(limit as u64).fetch_all(&mut *tx).await?;
+        for chunk in excess.chunks(128) {
+            let mut delete =
+                QueryBuilder::<MySql>::new("DELETE FROM hash_job_peers WHERE info_hash=");
+            delete.push_bind(&h).push(" AND peer_addr IN (");
+            let mut values = delete.separated(",");
+            for addr in chunk {
+                values.push_bind(addr);
+            }
+            delete.push(")");
+            delete.build().execute(&mut *tx).await?;
+        }
         tx.commit().await
     }
     pub async fn persist_runtime_batch(
@@ -318,8 +348,8 @@ impl Store {
                 CrawlStatsEvent::HashObserved {
                     info_hash,
                     source,
-                    has_peers,
-                } => discover(&mut tx, info_hash, source.as_str(), *has_peers).await?,
+                    has_peers: false,
+                } => discover(&mut tx, info_hash, source.as_str(), false).await?,
                 CrawlStatsEvent::SampleObserved {
                     info_hash,
                     node_id,
@@ -360,31 +390,6 @@ impl Store {
     ) -> Result<(), Error> {
         sqlx::query("UPDATE hash_jobs SET status=?,attempt_count=?,next_attempt_at=?,last_failure=?,updated_at=? WHERE info_hash=? AND status<>'complete'").bind(status).bind(i64::from(attempts)).bind(next).bind(failure).bind(now()).bind(hex::encode(hash)).execute(&self.pool).await?;
         Ok(())
-    }
-    pub async fn persist_hash_job_peers(
-        &self,
-        hash: &InfoHash,
-        peers: &[PeerContact],
-        limit: usize,
-    ) -> Result<(), Error> {
-        let h = hex::encode(hash);
-        let mut tx = self.pool.begin().await?;
-        sqlx::query("SELECT info_hash FROM torrents WHERE info_hash=? FOR UPDATE")
-            .bind(&h)
-            .fetch_one(&mut *tx)
-            .await?;
-        for peer in peers.iter().take(limit) {
-            sqlx::query("INSERT INTO hash_job_peers VALUES (?,?,?) ON DUPLICATE KEY UPDATE last_seen=VALUES(last_seen)").bind(&h).bind(peer.addr.to_string()).bind(now()).execute(&mut *tx).await?;
-        }
-        let excess:Vec<String>=sqlx::query_scalar("SELECT peer_addr FROM hash_job_peers WHERE info_hash=? ORDER BY last_seen DESC,peer_addr LIMIT 18446744073709551615 OFFSET ?").bind(&h).bind(limit as u64).fetch_all(&mut *tx).await?;
-        for addr in excess {
-            sqlx::query("DELETE FROM hash_job_peers WHERE info_hash=? AND peer_addr=?")
-                .bind(&h)
-                .bind(addr)
-                .execute(&mut *tx)
-                .await?;
-        }
-        tx.commit().await
     }
     pub async fn hash_job_peers(
         &self,
@@ -632,15 +637,7 @@ impl Store {
         tx.commit().await
     }
     pub async fn rebuild_search_index(&self) -> Result<(), Error> {
-        let packet: u64 = sqlx::query_scalar("SELECT @@max_allowed_packet")
-            .fetch_one(&self.pool)
-            .await?;
-        let budget = packet.saturating_sub(16 * 1024).min(1024 * 1024) as usize;
-        if budget < 1024 {
-            return Err(invalid(
-                "max_allowed_packet is too small for search rebuild",
-            ));
-        }
+        let limits = SearchLimits::load(&mut *self.pool.acquire().await?).await?;
         sqlx::query("DELETE s FROM search_documents s JOIN torrents t ON t.info_hash=s.info_hash WHERE (t.metadata_complete=0 OR t.name IS NULL) AND NOT EXISTS (SELECT 1 FROM files f WHERE f.torrent_id=s.info_hash)")
             .execute(&self.pool).await?;
         let mut after = String::new();
@@ -659,9 +656,17 @@ impl Store {
             let mut documents = Vec::new();
             let mut bytes = 0;
             for hash in &hashes {
-                let document = self.search_document(hash, budget).await?;
+                let Some(document) = search_document(
+                    &mut *self.pool.acquire().await?,
+                    hash,
+                    limits.document_bytes,
+                )
+                .await?
+                else {
+                    continue;
+                };
                 let size = document.0.len() + document.1.len() + document.2.len() + 128;
-                if !documents.is_empty() && bytes + size > budget {
+                if !documents.is_empty() && bytes + size > limits.batch_bytes {
                     self.replace_search_documents(&documents).await?;
                     rebuilt += documents.len();
                     documents.clear();
@@ -669,52 +674,20 @@ impl Store {
                 }
                 bytes += size;
                 documents.push(document);
+                if bytes >= limits.batch_bytes {
+                    self.replace_search_documents(&documents).await?;
+                    rebuilt += documents.len();
+                    documents.clear();
+                    bytes = 0;
+                }
             }
-            self.replace_search_documents(&documents).await?;
-            rebuilt += documents.len();
+            if !documents.is_empty() {
+                self.replace_search_documents(&documents).await?;
+                rebuilt += documents.len();
+            }
             after = hashes.last().expect("nonempty search batch").clone();
             tracing::info!(rebuilt, "rebuilt search documents");
         }
-    }
-    async fn search_document(
-        &self,
-        hash: &str,
-        budget: usize,
-    ) -> Result<(String, String, String), Error> {
-        let row = sqlx::query("SELECT CASE WHEN metadata_complete=1 THEN OCTET_LENGTH(name) ELSE 0 END AS bytes, CASE WHEN metadata_complete=1 AND OCTET_LENGTH(name)<=? THEN name ELSE NULL END AS name FROM torrents WHERE info_hash=?")
-            .bind(budget as u64).bind(hash).fetch_one(&self.pool).await?;
-        let raw_bytes: Option<i64> = row.try_get("bytes")?;
-        let too_large = || {
-            invalid(format!("search document {hash} exceeds rebuild byte budget {budget}; document was not truncated"))
-        };
-        if raw_bytes.unwrap_or(0) > budget as i64 {
-            return Err(too_large());
-        }
-        let name = normalize_search(row.try_get::<Option<&str>, _>("name")?.unwrap_or_default());
-        let mut paths = String::new();
-        let mut bytes = hash.len() + name.len() + 128;
-        if bytes > budget {
-            return Err(too_large());
-        }
-        let mut rows = sqlx::query("SELECT CASE WHEN OCTET_LENGTH(path)<=? THEN path ELSE NULL END AS path FROM files WHERE torrent_id=? ORDER BY id")
-            .bind(budget as u64).bind(hash).fetch(&self.pool);
-        while let Some(row) = rows.try_next().await? {
-            let path: Option<&str> = row.try_get("path")?;
-            let path = normalize_search(path.ok_or_else(too_large)?);
-            if path.is_empty() {
-                continue;
-            }
-            let separator = usize::from(!paths.is_empty());
-            bytes += path.len() + separator;
-            if bytes > budget {
-                return Err(too_large());
-            }
-            if separator != 0 {
-                paths.push(' ');
-            }
-            paths.push_str(&path);
-        }
-        Ok((hash.to_owned(), name, paths))
     }
     async fn replace_search_documents(
         &self,
@@ -781,28 +754,110 @@ async fn discover(
     sqlx::query("INSERT INTO hash_jobs(info_hash,status,last_new_peer_at,discovery_sources,updated_at) VALUES (?,'queued',?,?,?) ON DUPLICATE KEY UPDATE status=CASE WHEN status IN ('complete','invalid','unsupported') THEN status WHEN status='waiting_peers' AND VALUES(last_new_peer_at) IS NULL THEN status ELSE 'queued' END,next_attempt_at=IF(VALUES(last_new_peer_at) IS NULL,next_attempt_at,0),last_new_peer_at=COALESCE(VALUES(last_new_peer_at),last_new_peer_at),discovery_sources=IF(FIND_IN_SET(VALUES(discovery_sources),discovery_sources)>0,discovery_sources,CONCAT_WS(',',NULLIF(discovery_sources,''),VALUES(discovery_sources))),updated_at=VALUES(updated_at)").bind(&h).bind(peers.then_some(now())).bind(source).bind(now()).execute(&mut *conn).await?;
     Ok(())
 }
-async fn refresh_search(conn: &mut MySqlConnection, h: &str) -> Result<(), Error> {
-    let name: Option<String> =
-        sqlx::query_scalar("SELECT name FROM torrents WHERE info_hash=? AND metadata_complete=1")
-            .bind(h)
-            .fetch_optional(&mut *conn)
-            .await?
-            .flatten();
-    let paths: Vec<String> =
-        sqlx::query_scalar("SELECT path FROM files WHERE torrent_id=? ORDER BY id")
-            .bind(h)
-            .fetch_all(&mut *conn)
-            .await?;
-    if name.is_none() && paths.is_empty() {
-        sqlx::query("DELETE FROM search_documents WHERE info_hash=?")
-            .bind(h)
-            .execute(conn)
-            .await?;
-        return Ok(());
+const SEARCH_DOCUMENT_BYTES: usize = 16 * 1024 * 1024;
+const SEARCH_BATCH_BYTES: usize = 1024 * 1024;
+const SEARCH_PACKET_HEADROOM: u64 = 16 * 1024;
+
+struct SearchLimits {
+    document_bytes: usize,
+    batch_bytes: usize,
+}
+impl SearchLimits {
+    fn for_packet(packet: u64) -> Result<Self, Error> {
+        let document_bytes = packet
+            .saturating_sub(SEARCH_PACKET_HEADROOM)
+            .min(SEARCH_DOCUMENT_BYTES as u64) as usize;
+        if document_bytes < 1024 {
+            return Err(invalid(
+                "max_allowed_packet is too small for search indexing",
+            ));
+        }
+        Ok(Self {
+            document_bytes,
+            batch_bytes: document_bytes.min(SEARCH_BATCH_BYTES),
+        })
     }
-    let name = normalize_search(name.as_deref().unwrap_or_default());
-    let paths = normalize_search(&paths.join(" "));
-    sqlx::query("INSERT INTO search_documents VALUES (?,?,?) ON DUPLICATE KEY UPDATE name=VALUES(name),paths=VALUES(paths)").bind(h).bind(name).bind(paths).execute(conn).await?;
+    async fn load(conn: &mut MySqlConnection) -> Result<Self, Error> {
+        let packet: u64 = sqlx::query_scalar("SELECT @@max_allowed_packet")
+            .fetch_one(conn)
+            .await?;
+        Self::for_packet(packet)
+    }
+}
+fn document_too_large(hash: &str, budget: usize) -> Error {
+    invalid(format!(
+        "search document {hash} exceeds document byte limit {budget}; document was not truncated"
+    ))
+}
+fn append_search_text(output: &mut String, input: &str, budget: usize) -> bool {
+    let mut separator = !output.is_empty();
+    for c in input.nfkc() {
+        if !c.is_alphanumeric() {
+            separator = !output.is_empty();
+            continue;
+        }
+        let size = c.len_utf8() + usize::from(separator);
+        if output.len() + size > budget {
+            return false;
+        }
+        if separator {
+            output.push(' ');
+            separator = false;
+        }
+        output.push(c);
+    }
+    true
+}
+async fn search_document(
+    conn: &mut MySqlConnection,
+    hash: &str,
+    budget: usize,
+) -> Result<Option<(String, String, String)>, Error> {
+    let row = sqlx::query("SELECT CASE WHEN metadata_complete=1 THEN OCTET_LENGTH(name) ELSE 0 END AS bytes, CASE WHEN metadata_complete=1 AND OCTET_LENGTH(name)<=? THEN name ELSE NULL END AS name FROM torrents WHERE info_hash=?")
+        .bind(budget as u64).bind(hash).fetch_one(&mut *conn).await?;
+    let raw_bytes: Option<i64> = row.try_get("bytes")?;
+    let too_large = || document_too_large(hash, budget);
+    if raw_bytes.unwrap_or(0) > budget as i64 {
+        return Err(too_large());
+    }
+    let raw_name: Option<&str> = row.try_get("name")?;
+    let mut present = raw_name.is_some();
+    let content_budget = budget.checked_sub(hash.len() + 128).ok_or_else(too_large)?;
+    let mut name = String::new();
+    if !append_search_text(&mut name, raw_name.unwrap_or_default(), content_budget) {
+        return Err(too_large());
+    }
+    drop(row);
+    let mut paths = String::new();
+    let mut rows = sqlx::query("SELECT CASE WHEN OCTET_LENGTH(path)<=? THEN path ELSE NULL END AS path FROM files WHERE torrent_id=? ORDER BY id")
+        .bind(budget as u64).bind(hash).fetch(conn);
+    while let Some(row) = rows.try_next().await? {
+        present = true;
+        let path: Option<&str> = row.try_get("path")?;
+        if !append_search_text(
+            &mut paths,
+            path.ok_or_else(too_large)?,
+            content_budget - name.len(),
+        ) {
+            return Err(too_large());
+        }
+    }
+    Ok(present.then(|| (hash.to_owned(), name, paths)))
+}
+async fn refresh_search(conn: &mut MySqlConnection, h: &str) -> Result<(), Error> {
+    let limits = SearchLimits::load(conn).await?;
+    match search_document(conn, h, limits.document_bytes).await? {
+        Some((hash, name, paths)) => {
+            sqlx::query("INSERT INTO search_documents VALUES (?,?,?) ON DUPLICATE KEY UPDATE name=VALUES(name),paths=VALUES(paths)")
+                .bind(hash).bind(name).bind(paths).execute(conn).await?;
+        }
+        None => {
+            sqlx::query("DELETE FROM search_documents WHERE info_hash=?")
+                .bind(h)
+                .execute(conn)
+                .await?;
+        }
+    }
     Ok(())
 }
 pub fn normalize_search(s: &str) -> String {

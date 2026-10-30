@@ -36,8 +36,15 @@ IDs and expected responders; validated nodes enter the live routing table.
 Incoming queries, peer lookups, announces, and optional sampling produce work.
 Sampling is bounded and disabled by default.
 
-The metadata scheduler deduplicates hashes, persists jobs and peer candidates,
-and limits concurrent hash workers. Peer retry state survives restarts. Workers
+The metadata scheduler deduplicates hashes and limits concurrent hash workers.
+Discovery persistence writes the torrent, job, supplied peer addresses, and peer
+retention changes in one transaction, locking catalogue totals before the torrent.
+Peer upserts and retention deletes use bounded batches. Replays preserve unique
+torrent/peer keys and do not increment catalogue totals twice; completed jobs stay
+complete. Concurrent discoveries serialize through the existing catalogue lock.
+The statistics worker only persists peerless hash observations: peer-bearing
+observations belong to the metadata worker, which has the actual addresses.
+Committed retained peer candidates and retry state survive restarts. Workers
 negotiate `ut_metadata`, retrieve and validate the info dictionary, and commit
 metadata, files, search documents, job completion, and counters atomically.
 `MetadataFetched` is emitted after persistence succeeds. Timeout, retry, queue,
@@ -79,10 +86,14 @@ must have at least two alphanumeric characters and match; names receive a
 relevance boost. Empty queries browse the catalogue. Sort fields are whitelisted,
 SQL values are bound, and pagination returns `has_next` instead of exact totals.
 
-Search rebuilds stream paths and cap writes at 128 documents or approximately
-1 MiB, reduced for smaller packet limits. A document that exceeds the budget
-fails explicitly without truncation. Completed batches remain committed; a
-rebuild can be rerun. Rebuilds, schema migrations, and counter reconciliation
+Ingestion and rebuilds share a streamed document builder. The per-document limit
+is 16 MiB, reduced to fit `max_allowed_packet` with 16 KiB of headroom; raw fields
+are bounded too, and normalization checks its output incrementally. The separate
+rebuild batching target is 128 documents or approximately 1 MiB. A valid document
+larger than that target is written alone. Both paths preserve all searchable
+content or fail explicitly without truncation. An ingestion failure rolls back
+metadata changes. Completed rebuild batches remain committed; a rebuild can be
+rerun. See the README for exact limits and memory behavior. Rebuilds, schema migrations, and counter reconciliation
 require stopped services and never run within HTTP requests. After a logical
 restore, `db analyze` refreshes optimizer/full-text statistics.
 

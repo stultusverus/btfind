@@ -90,15 +90,14 @@ async fn mysql_rebuild_byte_budget() {
         .execute(&store.pool)
         .await
         .unwrap();
-    let error = store.rebuild_search_index().await.unwrap_err().to_string();
-    assert!(error.contains("exceeds rebuild byte budget"));
+    store.rebuild_search_index().await.unwrap();
     let size: i64 =
         sqlx::query_scalar("SELECT OCTET_LENGTH(paths) FROM search_documents WHERE info_hash=?")
             .bind(hash)
             .fetch_one(&store.pool)
             .await
             .unwrap();
-    assert!(size > 280000 && size < 1024 * 1024);
+    assert!(size > 1024 * 1024);
 }
 
 #[tokio::test]
@@ -120,7 +119,7 @@ async fn mysql_catalogue_concurrent_load() {
                 hash[19] = n;
                 let start = Instant::now();
                 store
-                    .persist_hash_discovery(&hash, "load", false)
+                    .persist_hash_discovery(&hash, "load", &[], 64)
                     .await
                     .unwrap();
                 if n % 8 == 0 {
@@ -256,7 +255,7 @@ impl Store {
         count: i64,
         source: &str,
     ) -> Result<i64, Error> {
-        self.persist_hash_discovery(&hash, source, false).await?;
+        self.persist_hash_discovery(&hash, source, &[], 64).await?;
         sqlx::query("UPDATE torrents SET name=?,total_size=?,file_count=? WHERE info_hash=?")
             .bind(name)
             .bind(size)
@@ -508,7 +507,7 @@ async fn mysql_readonly_web_and_query_timeout() {
     );
     assert_eq!(web.get_stats().await.unwrap().total_torrents, 1);
     assert!(web
-        .persist_hash_discovery(&[8; 20], "dht", false)
+        .persist_hash_discovery(&[8; 20], "dht", &[], 64)
         .await
         .is_err());
     let started = Instant::now();
@@ -566,4 +565,242 @@ async fn mysql_rollback_schema_mismatch_and_large_document() {
         .await
         .unwrap();
     assert!(store.check().await.is_err());
+}
+
+#[test]
+fn search_limits_and_normalization() {
+    let limits = SearchLimits::for_packet(64 * 1024 * 1024).unwrap();
+    assert_eq!(limits.document_bytes, SEARCH_DOCUMENT_BYTES);
+    assert_eq!(limits.batch_bytes, SEARCH_BATCH_BYTES);
+    let limits = SearchLimits::for_packet(128 * 1024).unwrap();
+    assert_eq!(limits.document_bytes, 112 * 1024);
+    assert_eq!(limits.batch_bytes, 112 * 1024);
+    assert!(SearchLimits::for_packet(SEARCH_PACKET_HEADROOM).is_err());
+    let mut text = String::new();
+    assert!(append_search_text(&mut text, "  Ａ-東京", 10));
+    assert!(append_search_text(&mut text, " /中文 ", 15));
+    assert_eq!(text, normalize_search("  Ａ-東京 /中文 "));
+    let mut expansion = String::new();
+    assert!(!append_search_text(&mut expansion, "㍿", 11));
+    assert!(expansion.len() <= 11);
+    let mut exact = String::new();
+    assert!(append_search_text(&mut exact, "㍿", 12));
+    assert_eq!(exact, "株式会社");
+}
+
+#[tokio::test]
+#[ignore = "requires BTFIND_TEST_DATABASE_URL; run scripts/test-mysql.sh"]
+async fn mysql_ingested_large_documents_rebuild_exactly() {
+    let store = Store::open_test_database().await.unwrap();
+    let files = vec![
+        (format!("{} 終端文件", "東京/".repeat(180_000)), 1),
+        ("㍿/ ＡＢＣ /last-file".into(), 2),
+    ];
+    let large_name = format!("{} 名前末尾", "日本語 ＡＢＣ ".repeat(80_000));
+    for hash in [[51; 20], [52; 20]] {
+        store
+            .commit_metadata(&hash, &large_name, 1, 3, &files)
+            .await
+            .unwrap();
+    }
+    let before: Vec<(String, String, String)> =
+        sqlx::query_as("SELECT info_hash,name,paths FROM search_documents ORDER BY info_hash")
+            .fetch_all(&store.pool)
+            .await
+            .unwrap();
+    assert_eq!(before.len(), 2);
+    assert!(before
+        .iter()
+        .all(|(_, _, paths)| paths.len() > SEARCH_BATCH_BYTES));
+    store.rebuild_search_index().await.unwrap();
+    let after: Vec<(String, String, String)> =
+        sqlx::query_as("SELECT info_hash,name,paths FROM search_documents ORDER BY info_hash")
+            .fetch_all(&store.pool)
+            .await
+            .unwrap();
+    assert_eq!(before, after);
+    assert_eq!(
+        store
+            .search_torrents("終端文件", 10, "rank")
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    let too_large = "a".repeat(SEARCH_DOCUMENT_BYTES + 1);
+    let error = store
+        .commit_metadata(&[51; 20], "replacement", 1, 1, &[(too_large.clone(), 1)])
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("exceeds document byte limit"));
+    let unchanged: Vec<(String, String, String)> =
+        sqlx::query_as("SELECT info_hash,name,paths FROM search_documents ORDER BY info_hash")
+            .fetch_all(&store.pool)
+            .await
+            .unwrap();
+    assert_eq!(before, unchanged);
+    sqlx::query("UPDATE files SET path=? WHERE torrent_id=?")
+        .bind(too_large)
+        .bind(hex::encode([51; 20]))
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    assert!(store
+        .rebuild_search_index()
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("exceeds document byte limit"));
+    let unchanged: Vec<(String, String, String)> =
+        sqlx::query_as("SELECT info_hash,name,paths FROM search_documents ORDER BY info_hash")
+            .fetch_all(&store.pool)
+            .await
+            .unwrap();
+    assert_eq!(before, unchanged);
+}
+
+#[tokio::test]
+#[ignore = "requires BTFIND_TEST_DATABASE_URL; run scripts/test-mysql.sh"]
+async fn mysql_discovery_peers_are_atomic_and_replayable() {
+    let store = Store::open_test_database().await.unwrap();
+    let hash = [61; 20];
+    let peers = vec![
+        PeerContact {
+            addr: "8.8.8.8:6881".parse().unwrap(),
+        },
+        PeerContact {
+            addr: "8.8.4.4:6881".parse().unwrap(),
+        },
+    ];
+    store
+        .persist_runtime_batch(
+            &[CrawlStatsEvent::HashObserved {
+                info_hash: hash,
+                source: crate::types::DiscoverySource::AnnouncePeer,
+                has_peers: true,
+            }],
+            None,
+            "observation-before-discovery",
+        )
+        .await
+        .unwrap();
+    assert_eq!(store.get_stats().await.unwrap().total_torrents, 0);
+    store.execute_batch_for_test("CREATE TRIGGER reject_peer BEFORE INSERT ON hash_job_peers FOR EACH ROW SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='peer failure'").await.unwrap();
+    assert!(store
+        .persist_hash_discovery(&hash, "announce_peer", &peers, 8)
+        .await
+        .is_err());
+    assert!(store.get_torrent(&hash).await.unwrap().is_none());
+    assert!(store.due_hash_jobs(10).await.unwrap().is_empty());
+    assert!(store.hash_job_peers(&hash, 8).await.unwrap().is_empty());
+    assert_eq!(store.get_stats().await.unwrap().total_torrents, 0);
+    store
+        .execute_batch_for_test("DROP TRIGGER reject_peer")
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        store
+            .persist_hash_discovery(&hash, "announce_peer", &peers, 8)
+            .await
+            .unwrap();
+    }
+    let reopened = Store::connect_options((*store.pool.connect_options()).clone(), 2, 9000)
+        .await
+        .unwrap();
+    assert_eq!(reopened.get_stats().await.unwrap().total_torrents, 1);
+    assert_eq!(reopened.due_hash_jobs(10).await.unwrap().len(), 1);
+    let mut recovered = reopened.hash_job_peers(&hash, 8).await.unwrap();
+    recovered.sort_by_key(|p| p.addr);
+    let mut expected = peers.clone();
+    expected.sort_by_key(|p| p.addr);
+    assert_eq!(recovered, expected);
+    let sources: String =
+        sqlx::query_scalar("SELECT discovery_sources FROM hash_jobs WHERE info_hash=?")
+            .bind(hex::encode(hash))
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+    assert_eq!(sources, "announce_peer");
+    store
+        .commit_metadata(&hash, "complete", 1, 1, &[("file".into(), 1)])
+        .await
+        .unwrap();
+    store
+        .persist_hash_discovery(&hash, "announce_peer", &peers, 8)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.hash_job_schedule_for_test(&hash).await.unwrap().0,
+        "complete"
+    );
+    assert_eq!(store.get_stats().await.unwrap().total_torrents, 1);
+}
+
+#[tokio::test]
+#[ignore = "requires BTFIND_TEST_DATABASE_URL; run scripts/test-mysql.sh"]
+async fn mysql_discovery_retention_failure_rolls_back_and_concurrent_peers_merge() {
+    let store = Store::open_test_database().await.unwrap();
+    let hash = [62; 20];
+    let first = PeerContact {
+        addr: "8.8.8.8:6881".parse().unwrap(),
+    };
+    store
+        .persist_hash_discovery(&hash, "first", std::slice::from_ref(&first), 1)
+        .await
+        .unwrap();
+    store
+        .update_hash_job_failure(&hash, "waiting_peers", 3, 123, "waiting")
+        .await
+        .unwrap();
+    store.execute_batch_for_test("CREATE TRIGGER reject_retention BEFORE DELETE ON hash_job_peers FOR EACH ROW SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='retention failure'").await.unwrap();
+    let second = PeerContact {
+        addr: "1.1.1.1:6881".parse().unwrap(),
+    };
+    assert!(store
+        .persist_hash_discovery(&hash, "second", &[second], 1)
+        .await
+        .is_err());
+    assert_eq!(store.hash_job_peers(&hash, 8).await.unwrap(), vec![first]);
+    assert_eq!(
+        store.hash_job_schedule_for_test(&hash).await.unwrap(),
+        ("waiting_peers".into(), 3, 123)
+    );
+    let source: String = sqlx::query_scalar("SELECT source FROM torrents WHERE info_hash=?")
+        .bind(hex::encode(hash))
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+    assert_eq!(source, "first");
+    store
+        .execute_batch_for_test("DROP TRIGGER reject_retention")
+        .await
+        .unwrap();
+    let mut workers = tokio::task::JoinSet::new();
+    for port in 7000..7008 {
+        let worker = store.clone();
+        workers.spawn(async move {
+            let peer = PeerContact {
+                addr: format!("9.9.9.9:{port}").parse().unwrap(),
+            };
+            worker
+                .persist_hash_discovery(&hash, "concurrent", &[peer], 16)
+                .await
+                .unwrap();
+        });
+    }
+    while let Some(result) = workers.join_next().await {
+        result.unwrap();
+    }
+    assert_eq!(store.hash_job_peers(&hash, 16).await.unwrap().len(), 9);
+    assert_eq!(
+        store.hash_job_schedule_for_test(&hash).await.unwrap().0,
+        "queued"
+    );
+    assert_eq!(store.get_stats().await.unwrap().total_torrents, 1);
+    store
+        .persist_hash_discovery(&hash, "peerless", &[], 4)
+        .await
+        .unwrap();
+    assert_eq!(store.hash_job_peers(&hash, 16).await.unwrap().len(), 4);
 }

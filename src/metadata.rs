@@ -1068,22 +1068,15 @@ pub async fn run_metadata_fetcher(
                 };
                 let info_hash = discovery.info_hash;
                 let peers = discovery.peers;
-                let has_peers = !peers.is_empty();
                 let source = discovery.source;
                 let mut retry_delay = Duration::from_millis(100);
                 loop {
-                    let persistence = (async {
-                    store.persist_hash_discovery(
+                    let persistence = store.persist_hash_discovery(
                         &info_hash,
                         source.as_str(),
-                        has_peers,
-                    ).await?;
-                    store.persist_hash_job_peers(
-                        &info_hash,
                         &peers,
                         max_peers_per_hash,
-                    ).await
-                }).await;
+                    ).await;
                     match persistence {
                         Ok(()) => break,
                         Err(error) => {
@@ -1280,11 +1273,7 @@ mod tests {
             addr: "8.8.8.8:6881".parse().unwrap(),
         };
         store
-            .persist_hash_discovery(&info_hash, "test", true)
-            .await
-            .unwrap();
-        store
-            .persist_hash_job_peers(&info_hash, std::slice::from_ref(&peer), 8)
+            .persist_hash_discovery(&info_hash, "test", std::slice::from_ref(&peer), 8)
             .await
             .unwrap();
         store
@@ -1296,7 +1285,7 @@ mod tests {
 
         let outcome = process_hash_round(
             info_hash,
-            vec![peer],
+            vec![peer.clone()],
             store.clone(),
             stats_tx,
             FetchRoundConfig {
@@ -1326,7 +1315,7 @@ mod tests {
             addr: "8.8.4.4:6881".parse().unwrap(),
         };
         store
-            .persist_hash_discovery(&info_hash, "test", true)
+            .persist_hash_discovery(&info_hash, "test", std::slice::from_ref(&peer), 8)
             .await
             .unwrap();
         store
@@ -1341,7 +1330,7 @@ mod tests {
 
         let outcome = process_hash_round(
             info_hash,
-            vec![peer],
+            vec![peer.clone()],
             store.clone(),
             stats_tx,
             FetchRoundConfig {
@@ -1362,14 +1351,14 @@ mod tests {
         assert_eq!(next_attempt_at, 0);
 
         store
-            .persist_hash_discovery(&info_hash, "sample_infohashes", false)
+            .persist_hash_discovery(&info_hash, "sample_infohashes", &[], 8)
             .await
             .unwrap();
         let (status, _, _) = store.hash_job_schedule_for_test(&info_hash).await.unwrap();
         assert_eq!(status, "waiting_peers");
 
         store
-            .persist_hash_discovery(&info_hash, "announce_peer", true)
+            .persist_hash_discovery(&info_hash, "announce_peer", std::slice::from_ref(&peer), 8)
             .await
             .unwrap();
         let (status, _, _) = store.hash_job_schedule_for_test(&info_hash).await.unwrap();
