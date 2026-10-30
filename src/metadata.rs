@@ -726,6 +726,48 @@ struct JobOutcome {
     parked: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JobAdmission {
+    Accepted,
+    NoPeers,
+    AtCapacity,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn admit_job_peers(
+    jobs: &mut HashMap<InfoHash, HashJob>,
+    ready: &mut VecDeque<InfoHash>,
+    ready_set: &mut HashSet<InfoHash>,
+    info_hash: InfoHash,
+    peers: Vec<PeerContact>,
+    attempt_count: u32,
+    max_active_hash_jobs: usize,
+    max_peers_per_hash: usize,
+) -> JobAdmission {
+    if let Some(job) = jobs.get_mut(&info_hash) {
+        job.attempt_count = job.attempt_count.max(attempt_count);
+        let added = job.merge_peers(peers, max_peers_per_hash);
+        if added > 0 && !job.running && ready_set.insert(info_hash) {
+            ready.push_back(info_hash);
+        }
+        return JobAdmission::Accepted;
+    }
+    if peers.is_empty() {
+        return JobAdmission::NoPeers;
+    }
+    if jobs.len() >= max_active_hash_jobs {
+        return JobAdmission::AtCapacity;
+    }
+    let mut job = HashJob::new(attempt_count);
+    if job.merge_peers(peers, max_peers_per_hash) == 0 {
+        return JobAdmission::NoPeers;
+    }
+    jobs.insert(info_hash, job);
+    ready_set.insert(info_hash);
+    ready.push_back(info_hash);
+    JobAdmission::Accepted
+}
+
 struct FetchRoundConfig {
     peer_timeout: Duration,
     retry_after_hours: u32,
@@ -1164,19 +1206,21 @@ pub async fn run_metadata_fetcher(
                         }
                     }
                 }
-                if !jobs.contains_key(&info_hash) && jobs.len() >= max_active_hash_jobs {
-                    if stats_tx
+                if admit_job_peers(
+                    &mut jobs,
+                    &mut ready,
+                    &mut ready_set,
+                    info_hash,
+                    peers,
+                    0,
+                    max_active_hash_jobs,
+                    max_peers_per_hash,
+                ) == JobAdmission::AtCapacity
+                    && stats_tx
                         .try_send(CrawlStatsEvent::DiscoveryBackpressure)
                         .is_err()
-                    {
-                        tracing::warn!("metadata backpressure statistic was not accepted");
-                    }
-                    continue;
-                }
-                let job = jobs.entry(info_hash).or_insert_with(|| HashJob::new(0));
-                let added = job.merge_peers(peers, max_peers_per_hash);
-                if added > 0 && !job.running && ready_set.insert(info_hash) {
-                    ready.push_back(info_hash);
+                {
+                    tracing::warn!("metadata backpressure statistic was not accepted");
                 }
             }
             _ = retry_tick.tick() => {
@@ -1195,22 +1239,23 @@ pub async fn run_metadata_fetcher(
                 }
                 if let Ok(records) = due {
                     for (record, peers) in records {
-                        if jobs.len() >= max_active_hash_jobs && !jobs.contains_key(&record.info_hash) {
-                            continue;
-                        }
-                        tracing::debug!(
-                            "restoring {} metadata job {} after {:?}",
-                            record.status,
-                            hex::encode(record.info_hash),
-                            (record.next_attempt_at, record.last_failure)
+                        let admission = admit_job_peers(
+                            &mut jobs,
+                            &mut ready,
+                            &mut ready_set,
+                            record.info_hash,
+                            peers,
+                            record.attempt_count,
+                            max_active_hash_jobs,
+                            max_peers_per_hash,
                         );
-                        let job = jobs
-                            .entry(record.info_hash)
-                            .or_insert_with(|| HashJob::new(record.attempt_count));
-                        job.attempt_count = job.attempt_count.max(record.attempt_count);
-                        let added = job.merge_peers(peers, max_peers_per_hash);
-                        if added > 0 && !job.running && ready_set.insert(record.info_hash) {
-                            ready.push_back(record.info_hash);
+                        if admission == JobAdmission::Accepted {
+                            tracing::debug!(
+                                "restoring {} metadata job {} after {:?}",
+                                record.status,
+                                hex::encode(record.info_hash),
+                                (record.next_attempt_at, record.last_failure)
+                            );
                         }
                     }
                 }
@@ -1290,6 +1335,176 @@ mod tests {
         assert_eq!(ready.pop_front(), Some(info_hash));
         assert_eq!(jobs.get(&info_hash).unwrap().attempt_count, 3);
         assert!(!jobs.get(&info_hash).unwrap().running);
+    }
+
+    #[test]
+    fn peerless_discoveries_do_not_consume_active_job_capacity() {
+        let max_active = 2;
+        let mut jobs = HashMap::new();
+        let mut ready = VecDeque::new();
+        let mut ready_set = HashSet::new();
+
+        for i in 0..=(max_active as u8) {
+            assert_eq!(
+                admit_job_peers(
+                    &mut jobs,
+                    &mut ready,
+                    &mut ready_set,
+                    [i; 20],
+                    Vec::new(),
+                    0,
+                    max_active,
+                    8,
+                ),
+                JobAdmission::NoPeers
+            );
+        }
+        assert!(jobs.is_empty());
+        assert!(ready.is_empty());
+
+        let actionable = [0xA1; 20];
+        let peer = PeerContact {
+            addr: "8.8.8.8:6881".parse().unwrap(),
+        };
+        assert_eq!(
+            admit_job_peers(
+                &mut jobs,
+                &mut ready,
+                &mut ready_set,
+                actionable,
+                vec![peer],
+                0,
+                max_active,
+                8,
+            ),
+            JobAdmission::Accepted
+        );
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(ready.pop_front(), Some(actionable));
+    }
+
+    #[test]
+    fn peerless_hash_becomes_schedulable_when_peers_arrive() {
+        let info_hash = [0xB2; 20];
+        let mut jobs = HashMap::new();
+        let mut ready = VecDeque::new();
+        let mut ready_set = HashSet::new();
+
+        assert_eq!(
+            admit_job_peers(
+                &mut jobs,
+                &mut ready,
+                &mut ready_set,
+                info_hash,
+                Vec::new(),
+                0,
+                8,
+                8,
+            ),
+            JobAdmission::NoPeers
+        );
+        assert!(!jobs.contains_key(&info_hash));
+
+        let peer = PeerContact {
+            addr: "8.8.8.8:6881".parse().unwrap(),
+        };
+        assert_eq!(
+            admit_job_peers(
+                &mut jobs,
+                &mut ready,
+                &mut ready_set,
+                info_hash,
+                vec![peer],
+                0,
+                8,
+                8,
+            ),
+            JobAdmission::Accepted
+        );
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(ready.pop_front(), Some(info_hash));
+    }
+
+    #[test]
+    fn peerless_retry_restores_do_not_consume_active_job_capacity() {
+        let mut jobs = HashMap::new();
+        let mut ready = VecDeque::new();
+        let mut ready_set = HashSet::new();
+
+        for i in 0..4 {
+            assert_eq!(
+                admit_job_peers(
+                    &mut jobs,
+                    &mut ready,
+                    &mut ready_set,
+                    [0xC0 + i; 20],
+                    Vec::new(),
+                    4,
+                    1,
+                    8,
+                ),
+                JobAdmission::NoPeers
+            );
+        }
+        assert!(jobs.is_empty());
+
+        let info_hash = [0xD3; 20];
+        let peer = PeerContact {
+            addr: "8.8.8.8:6881".parse().unwrap(),
+        };
+        assert_eq!(
+            admit_job_peers(
+                &mut jobs,
+                &mut ready,
+                &mut ready_set,
+                info_hash,
+                vec![peer],
+                7,
+                1,
+                8,
+            ),
+            JobAdmission::Accepted
+        );
+        assert_eq!(jobs[&info_hash].attempt_count, 7);
+        assert_eq!(ready.pop_front(), Some(info_hash));
+    }
+
+    #[test]
+    fn at_capacity_rejects_new_actionable_jobs() {
+        let mut jobs = HashMap::new();
+        let mut ready = VecDeque::new();
+        let mut ready_set = HashSet::new();
+        let peer = PeerContact {
+            addr: "8.8.8.8:6881".parse().unwrap(),
+        };
+
+        assert_eq!(
+            admit_job_peers(
+                &mut jobs,
+                &mut ready,
+                &mut ready_set,
+                [0xE1; 20],
+                vec![peer.clone()],
+                0,
+                1,
+                8,
+            ),
+            JobAdmission::Accepted
+        );
+        assert_eq!(
+            admit_job_peers(
+                &mut jobs,
+                &mut ready,
+                &mut ready_set,
+                [0xE2; 20],
+                vec![peer],
+                0,
+                1,
+                8,
+            ),
+            JobAdmission::AtCapacity
+        );
+        assert_eq!(jobs.len(), 1);
     }
 
     #[test]

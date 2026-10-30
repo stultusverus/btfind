@@ -739,6 +739,39 @@ async fn mysql_discovery_peers_are_atomic_and_replayable() {
 
 #[tokio::test]
 #[ignore = "requires BTFIND_TEST_DATABASE_URL; run scripts/test-mysql.sh"]
+async fn mysql_peerless_hash_jobs_are_not_due() {
+    let store = Store::open_test_database().await.unwrap();
+    let peerless = [71; 20];
+    let actionable = [72; 20];
+    store
+        .persist_hash_discovery(&peerless, "sample_infohashes", &[], 8)
+        .await
+        .unwrap();
+    let peer = PeerContact {
+        addr: "8.8.8.8:6881".parse().unwrap(),
+    };
+    store
+        .persist_hash_discovery(&actionable, "announce_peer", std::slice::from_ref(&peer), 8)
+        .await
+        .unwrap();
+
+    let due = store.due_hash_jobs(1).await.unwrap();
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].info_hash, actionable);
+    let due = store.due_hash_jobs(10).await.unwrap();
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].info_hash, actionable);
+
+    store
+        .persist_hash_discovery(&peerless, "announce_peer", &[peer], 8)
+        .await
+        .unwrap();
+    let due = store.due_hash_jobs(10).await.unwrap();
+    assert_eq!(due.len(), 2);
+}
+
+#[tokio::test]
+#[ignore = "requires BTFIND_TEST_DATABASE_URL; run scripts/test-mysql.sh"]
 async fn mysql_discovery_retention_failure_rolls_back_and_concurrent_peers_merge() {
     let store = Store::open_test_database().await.unwrap();
     let hash = [62; 20];

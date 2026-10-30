@@ -1300,7 +1300,7 @@ mod tests {
         }
         assert_eq!(store.get_stats().await.unwrap().total_torrents, 1);
         assert_eq!(store.incomplete_info_hashes(10).await.unwrap(), vec![hash]);
-        assert_eq!(store.due_hash_jobs(10).await.unwrap()[0].info_hash, hash);
+        assert!(store.due_hash_jobs(10).await.unwrap().is_empty());
         assert!(store.hash_job_peers(&hash, 8).await.unwrap().is_empty());
         let discovery = peer_discovery(hash);
         store
@@ -1308,6 +1308,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(store.get_stats().await.unwrap().total_torrents, 1);
+        assert_eq!(store.due_hash_jobs(10).await.unwrap()[0].info_hash, hash);
         assert_eq!(
             store.hash_job_peers(&hash, 8).await.unwrap(),
             discovery.peers
