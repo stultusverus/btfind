@@ -1,14 +1,31 @@
-use crate::types::{CrawlStatsEvent, InfoHash, NodeContact, NodeId};
-use rusqlite::types::Value;
-use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
-use std::collections::BTreeMap;
-use std::net::SocketAddrV4;
-use std::path::Path;
-use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use crate::types::{CrawlStatsEvent, InfoHash, NodeContact, NodeId, PeerContact};
+use sqlx::{
+    mysql::{MySqlConnectOptions, MySqlPoolOptions, MySqlRow, MySqlSslMode},
+    MySql, MySqlConnection, MySqlPool, QueryBuilder, Row,
+};
+use std::{
+    collections::BTreeMap,
+    net::SocketAddrV4,
+    str::FromStr,
+    time::{Duration, Instant},
+};
 
-const CURRENT_SCHEMA_VERSION: i64 = 4;
+use futures_util::TryStreamExt;
+use unicode_normalization::UnicodeNormalization;
 
+pub type Error = sqlx::Error;
+pub fn invalid(message: impl Into<String>) -> Error {
+    Error::Protocol(message.into())
+}
+pub fn now() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+pub fn decode_hash(s: &str) -> Result<InfoHash, Error> {
+    hex::decode(s)
+        .map_err(|_| invalid("invalid stored hash"))?
+        .try_into()
+        .map_err(|_| invalid("invalid stored hash length"))
+}
 #[derive(Debug)]
 pub struct TorrentRecord {
     pub info_hash: InfoHash,
@@ -25,36 +42,28 @@ pub struct TorrentRecord {
     pub last_attempt: i64,
     pub metadata_complete: bool,
 }
-
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, serde::Serialize, sqlx::FromRow, PartialEq, Eq)]
 pub struct CrawlStats {
     pub total_torrents: i64,
     pub total_metadata_complete: i64,
     pub total_files: i64,
     pub total_size: i64,
 }
-
-#[derive(Debug)]
+#[derive(Debug, sqlx::FromRow)]
 #[allow(dead_code)]
 pub struct CrawlStatRecord {
-    #[allow(dead_code)]
     pub id: i64,
-    #[allow(dead_code)]
     pub timestamp: i64,
     pub nodes_known: Option<i64>,
-    #[allow(dead_code)]
     pub queries_sent: Option<i64>,
-    #[allow(dead_code)]
     pub info_hashes_found: Option<i64>,
     pub metadata_fetched: Option<i64>,
 }
-
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, sqlx::FromRow)]
 pub struct MetadataFailureCount {
     pub reason: String,
     pub count: i64,
 }
-
 #[derive(Debug, Clone)]
 pub struct HashJobRecord {
     pub info_hash: InfoHash,
@@ -63,7 +72,6 @@ pub struct HashJobRecord {
     pub next_attempt_at: i64,
     pub last_failure: Option<String>,
 }
-
 #[derive(Debug, Clone, Copy)]
 pub struct RuntimeSnapshot {
     pub nodes_known: i64,
@@ -71,30 +79,26 @@ pub struct RuntimeSnapshot {
     pub info_hashes_found: i64,
     pub metadata_fetched: i64,
 }
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerRetryEligibility {
     Eligible,
     RetryAt(i64),
     Rejected,
 }
-
+#[derive(Clone, Debug)]
 pub struct Store {
-    conn: Mutex<Connection>,
+    pub(crate) pool: MySqlPool,
 }
-
 #[derive(Debug)]
 pub struct TorrentSearchPage {
     pub results: Vec<TorrentRecord>,
-    pub total: i64,
+    pub has_next: bool,
 }
-
 #[derive(Debug)]
 pub struct FileSearchPage {
     pub results: Vec<(String, i64)>,
-    pub total: i64,
+    pub has_next: bool,
 }
-
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TorrentSearchFilters {
     pub complete_only: bool,
@@ -103,2939 +107,832 @@ pub struct TorrentSearchFilters {
 }
 
 impl Store {
-    pub fn open(path: &Path) -> Result<Self, rusqlite::Error> {
-        let conn = Connection::open(path)?;
-        let store = Store {
-            conn: Mutex::new(conn),
-        };
-        store.init_schema()?;
-        store.backfill_fts_if_needed()?;
-        Ok(store)
+    pub async fn connect(config: &crate::config::DatabaseConfig, web: bool) -> Result<Self, Error> {
+        Self::connect_with_timeout(config, web, 9000).await
     }
-
-    #[allow(dead_code)]
-    pub fn open_in_memory() -> Result<Self, rusqlite::Error> {
-        let conn = Connection::open_in_memory()?;
-        let store = Store {
-            conn: Mutex::new(conn),
-        };
-        store.init_schema()?;
-        Ok(store)
-    }
-
-    fn init_schema(&self) -> Result<(), rusqlite::Error> {
-        let mut conn = self.conn.lock().expect("store connection mutex poisoned");
-        conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "foreign_keys", "ON")?;
-        let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if version > CURRENT_SCHEMA_VERSION {
-            return Err(rusqlite::Error::InvalidParameterName(format!(
-                "database schema version {} is newer than supported version {}",
-                version, CURRENT_SCHEMA_VERSION
-            )));
-        }
-
-        for target in (version + 1)..=CURRENT_SCHEMA_VERSION {
-            let tx = conn.transaction()?;
-            match target {
-                1 => Self::migration_1(&tx)?,
-                2 => Self::migration_2(&tx)?,
-                3 => Self::migration_3(&tx)?,
-                4 => Self::migration_4(&tx)?,
-                _ => unreachable!("migration target is bounded by CURRENT_SCHEMA_VERSION"),
-            }
-            tx.pragma_update(None, "user_version", target)?;
-            tx.commit()?;
-        }
-        Ok(())
-    }
-
-    fn migration_1(conn: &Connection) -> Result<(), rusqlite::Error> {
-        conn.execute_batch(
-            "
-            CREATE TABLE IF NOT EXISTS torrents (
-                info_hash         TEXT PRIMARY KEY,
-                name              TEXT,
-                piece_length      INTEGER,
-                total_size        INTEGER NOT NULL DEFAULT 0,
-                file_count        INTEGER NOT NULL DEFAULT 0,
-                source            TEXT NOT NULL DEFAULT 'unknown',
-                first_seen        INTEGER NOT NULL,
-                last_seen         INTEGER NOT NULL,
-                last_attempt      INTEGER NOT NULL DEFAULT 0,
-                metadata_complete INTEGER NOT NULL DEFAULT 0
-            );
-
-            CREATE TABLE IF NOT EXISTS files (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                torrent_id  TEXT NOT NULL REFERENCES torrents(info_hash) ON DELETE CASCADE,
-                path        TEXT NOT NULL,
-                size        INTEGER NOT NULL
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_torrents_first_seen ON torrents(first_seen);
-            CREATE INDEX IF NOT EXISTS idx_torrents_last_seen ON torrents(last_seen);
-            CREATE INDEX IF NOT EXISTS idx_torrents_name ON torrents(name);
-            CREATE INDEX IF NOT EXISTS idx_files_torrent ON files(torrent_id);
-
-            CREATE TABLE IF NOT EXISTS crawl_stats (
-                id                INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp         INTEGER NOT NULL,
-                nodes_known       INTEGER,
-                queries_sent      INTEGER,
-                info_hashes_found INTEGER,
-                metadata_fetched  INTEGER
-            );
-
-            CREATE TABLE IF NOT EXISTS metadata_peer_attempts (
-                info_hash    TEXT NOT NULL REFERENCES torrents(info_hash) ON DELETE CASCADE,
-                peer_addr    TEXT NOT NULL,
-                last_attempt INTEGER NOT NULL,
-                last_error   TEXT,
-                PRIMARY KEY (info_hash, peer_addr)
-            );
-
-            CREATE TABLE IF NOT EXISTS metadata_failure_counts (
-                reason TEXT PRIMARY KEY,
-                count  INTEGER NOT NULL DEFAULT 0
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_metadata_peer_attempts_hash
-                ON metadata_peer_attempts(info_hash);
-
-            CREATE TABLE IF NOT EXISTS dht_nodes (
-                id        TEXT PRIMARY KEY,
-                addr      TEXT NOT NULL,
-                last_seen INTEGER NOT NULL
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_dht_nodes_last_seen ON dht_nodes(last_seen);
-
-            CREATE VIRTUAL TABLE IF NOT EXISTS torrent_fts USING fts5(
-                info_hash UNINDEXED,
-                name,
-                paths,
-                tokenize = 'trigram'
-            );
-            ",
-        )?;
-
-        let has_last_attempt = {
-            let mut stmt = conn.prepare("PRAGMA table_info(torrents)")?;
-            let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
-            let mut found = false;
-            for column in columns {
-                if column? == "last_attempt" {
-                    found = true;
-                    break;
-                }
-            }
-            found
-        };
-
-        if !has_last_attempt {
-            conn.execute(
-                "ALTER TABLE torrents ADD COLUMN last_attempt INTEGER NOT NULL DEFAULT 0",
-                [],
-            )?;
-        }
-
-        Ok(())
-    }
-
-    fn migration_2(conn: &Connection) -> Result<(), rusqlite::Error> {
-        conn.execute_batch(
-            "
-            CREATE TABLE IF NOT EXISTS hash_jobs (
-                info_hash             TEXT PRIMARY KEY REFERENCES torrents(info_hash) ON DELETE CASCADE,
-                status                TEXT NOT NULL DEFAULT 'queued',
-                attempt_count         INTEGER NOT NULL DEFAULT 0,
-                next_attempt_at       INTEGER NOT NULL DEFAULT 0,
-                last_failure          TEXT,
-                last_success_at       INTEGER,
-                last_new_peer_at      INTEGER,
-                discovery_sources     TEXT NOT NULL DEFAULT '',
-                updated_at            INTEGER NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS sample_observations (
-                info_hash        TEXT PRIMARY KEY REFERENCES torrents(info_hash) ON DELETE CASCADE,
-                first_seen       INTEGER NOT NULL,
-                last_seen        INTEGER NOT NULL,
-                sample_count     INTEGER NOT NULL DEFAULT 1,
-                sampling_node_id TEXT,
-                sampling_addr    TEXT,
-                sweep_id         INTEGER
-            );
-
-            CREATE TABLE IF NOT EXISTS app_state (
-                key   TEXT PRIMARY KEY,
-                value BLOB NOT NULL
-            );
-            ",
-        )?;
-        Ok(())
-    }
-
-    fn migration_3(conn: &Connection) -> Result<(), rusqlite::Error> {
-        conn.execute_batch(
-            "
-            CREATE INDEX IF NOT EXISTS idx_hash_jobs_schedule
-                ON hash_jobs(status, next_attempt_at);
-            CREATE INDEX IF NOT EXISTS idx_sample_observations_last_seen
-                ON sample_observations(last_seen);
-            ",
-        )?;
-        Ok(())
-    }
-
-    fn migration_4(conn: &Connection) -> Result<(), rusqlite::Error> {
-        conn.execute_batch(
-            "
-            CREATE TABLE IF NOT EXISTS hash_job_peers (
-                info_hash TEXT NOT NULL REFERENCES torrents(info_hash) ON DELETE CASCADE,
-                peer_addr TEXT NOT NULL,
-                last_seen INTEGER NOT NULL,
-                PRIMARY KEY (info_hash, peer_addr)
-            );
-            CREATE INDEX IF NOT EXISTS idx_hash_job_peers_seen
-                ON hash_job_peers(info_hash, last_seen DESC);
-            ",
-        )?;
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    pub fn upsert_torrent(
-        &self,
-        info_hash: InfoHash,
-        name: Option<String>,
-        total_size: i64,
-        file_count: i64,
-        source: &str,
-    ) -> Result<i64, rusqlite::Error> {
-        let conn = self.conn.lock().expect("store connection mutex poisoned");
-        let hash_hex = hex::encode(info_hash);
-        let now = chrono::Utc::now().timestamp();
-
-        let existing: Option<(i64, bool)> = match conn.query_row(
-            "SELECT first_seen, metadata_complete FROM torrents WHERE info_hash = ?1",
-            params![hash_hex],
-            |row| Ok((row.get(0)?, row.get::<_, i32>(1)? != 0)),
-        ) {
-            Ok(row) => Some(row),
-            Err(rusqlite::Error::QueryReturnedNoRows) => None,
-            Err(e) => return Err(e),
-        };
-
-        let (first_seen, metadata_complete) = match existing {
-            Some((fs, mc)) => (fs, mc),
-            None => (now, false),
-        };
-
-        if existing.is_some() && name.is_none() && total_size == 0 && file_count == 0 {
-            conn.execute(
-                "UPDATE torrents SET last_seen = ?1, source = ?2 WHERE info_hash = ?3",
-                params![now, source, hash_hex],
-            )?;
-            return Ok(0);
-        }
-
-        conn.execute(
-            "INSERT INTO torrents (info_hash, name, total_size, file_count, source, first_seen, last_seen, metadata_complete)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-             ON CONFLICT(info_hash) DO UPDATE SET
-                 name = COALESCE(?2, name),
-                 total_size = CASE WHEN ?3 != 0 THEN ?3 ELSE total_size END,
-                 file_count = CASE WHEN ?4 != 0 THEN ?4 ELSE file_count END,
-                 source = ?5,
-                 last_seen = ?7,
-                 metadata_complete = MAX(metadata_complete, ?8)",
-            params![
-                hash_hex,
-                name,
-                total_size,
-                file_count,
-                source,
-                first_seen,
-                now,
-                if metadata_complete { 1i32 } else { 0i32 },
-            ],
-        )?;
-        let rowid = conn.last_insert_rowid();
-        Self::refresh_torrent_fts_locked(&conn, &hash_hex)?;
-        Ok(rowid)
-    }
-
-    #[allow(dead_code)]
-    pub fn mark_metadata_complete(
-        &self,
-        info_hash: &InfoHash,
-        name: &str,
-        piece_length: i64,
-        total_size: i64,
-        file_count: i64,
-    ) -> Result<(), rusqlite::Error> {
-        let conn = self.conn.lock().expect("store connection mutex poisoned");
-        let hash_hex = hex::encode(info_hash);
-        let updated = conn.execute(
-            "UPDATE torrents SET name = ?2, piece_length = ?3, total_size = ?4, file_count = ?5, metadata_complete = 1, last_seen = unixepoch()
-             WHERE info_hash = ?1",
-            params![hash_hex, name, piece_length, total_size, file_count],
-        )?;
-        if updated == 0 {
-            return Err(rusqlite::Error::QueryReturnedNoRows);
-        }
-        Self::refresh_torrent_fts_locked(&conn, &hash_hex)?;
-        Ok(())
-    }
-
-    pub fn commit_metadata(
-        &self,
-        info_hash: &InfoHash,
-        name: &str,
-        piece_length: i64,
-        total_size: i64,
-        files: &[(String, i64)],
-    ) -> Result<(), rusqlite::Error> {
-        let mut conn = self.conn.lock().expect("store connection mutex poisoned");
-        let tx = conn.transaction()?;
-        let hash_hex = hex::encode(info_hash);
-        let now = chrono::Utc::now().timestamp();
-        let file_count = i64::try_from(files.len())
-            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(0, i64::MAX))?;
-
-        tx.execute(
-            "INSERT INTO torrents (
-                info_hash, name, piece_length, total_size, file_count, source,
-                first_seen, last_seen, last_attempt, metadata_complete
-             ) VALUES (?1, ?2, ?3, ?4, ?5, 'dht', ?6, ?6, ?6, 1)
-             ON CONFLICT(info_hash) DO UPDATE SET
-                name = excluded.name,
-                piece_length = excluded.piece_length,
-                total_size = excluded.total_size,
-                file_count = excluded.file_count,
-                last_seen = excluded.last_seen,
-                metadata_complete = 1",
-            params![hash_hex, name, piece_length, total_size, file_count, now],
-        )?;
-        tx.execute("DELETE FROM files WHERE torrent_id = ?1", params![hash_hex])?;
+    pub(crate) async fn connect_with_timeout(
+        config: &crate::config::DatabaseConfig,
+        web: bool,
+        select_timeout_ms: u32,
+    ) -> Result<Self, Error> {
+        let url = std::env::var("BTFIND_DATABASE_URL")
+            .map_err(|_| invalid("set BTFIND_DATABASE_URL to a MySQL connection URL"))?;
+        let mut options = MySqlConnectOptions::from_str(&url)
+            .map_err(|_| invalid("invalid BTFIND_DATABASE_URL"))?;
+        options = options.ssl_mode(if config.allow_insecure_local {
+            MySqlSslMode::Disabled
+        } else {
+            MySqlSslMode::VerifyIdentity
+        });
+        if config.allow_insecure_local
+            && !matches!(options.get_host(), "127.0.0.1" | "localhost" | "::1")
         {
-            let mut stmt =
-                tx.prepare("INSERT INTO files (torrent_id, path, size) VALUES (?1, ?2, ?3)")?;
-            for (path, size) in files {
-                if path.is_empty() || *size < 0 {
-                    return Err(rusqlite::Error::InvalidParameterName(
-                        "metadata files require a non-empty path and non-negative size".to_string(),
-                    ));
-                }
-                stmt.execute(params![hash_hex, path, size])?;
-            }
-        }
-        Self::refresh_torrent_fts_locked(&tx, &hash_hex)?;
-        tx.execute(
-            "INSERT INTO hash_jobs (
-                info_hash, status, last_success_at, updated_at
-             ) VALUES (?1, 'complete', ?2, ?2)
-             ON CONFLICT(info_hash) DO UPDATE SET
-                status = 'complete',
-                last_failure = NULL,
-                last_success_at = excluded.last_success_at,
-                updated_at = excluded.updated_at",
-            params![hash_hex, now],
-        )?;
-        tx.commit()?;
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    pub fn insert_files(
-        &self,
-        info_hash: &InfoHash,
-        files: &[(String, i64)],
-    ) -> Result<(), rusqlite::Error> {
-        let mut conn = self.conn.lock().expect("store connection mutex poisoned");
-        let hash_hex = hex::encode(info_hash);
-
-        let tx = conn.transaction()?;
-        tx.execute("DELETE FROM files WHERE torrent_id = ?1", params![hash_hex])?;
-
-        {
-            let mut stmt =
-                tx.prepare("INSERT INTO files (torrent_id, path, size) VALUES (?1, ?2, ?3)")?;
-            for (path, size) in files {
-                stmt.execute(params![hash_hex, path, size])?;
-            }
-        }
-
-        Self::refresh_torrent_fts_locked(&tx, &hash_hex)?;
-        tx.commit()?;
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    pub fn get_torrent(
-        &self,
-        info_hash: &InfoHash,
-    ) -> Result<Option<TorrentRecord>, rusqlite::Error> {
-        let conn = self.conn.lock().expect("store connection mutex poisoned");
-        let hash_hex = hex::encode(info_hash);
-
-        let mut stmt = conn.prepare(
-            "SELECT info_hash, name, piece_length, total_size, file_count, source, first_seen, last_seen, last_attempt, metadata_complete
-             FROM torrents WHERE info_hash = ?1",
-        )?;
-
-        let mut rows = stmt.query_map(params![hash_hex], row_to_torrent)?;
-        match rows.next() {
-            Some(Ok(record)) => Ok(Some(record)),
-            Some(Err(e)) => Err(e),
-            None => Ok(None),
-        }
-    }
-
-    pub fn search_torrents(
-        &self,
-        query: &str,
-        limit: usize,
-        sort_by: &str,
-    ) -> Result<Vec<TorrentRecord>, rusqlite::Error> {
-        self.search_torrents_filtered(query, limit, sort_by, TorrentSearchFilters::default())
-    }
-
-    pub fn search_torrents_filtered(
-        &self,
-        query: &str,
-        limit: usize,
-        sort_by: &str,
-        filters: TorrentSearchFilters,
-    ) -> Result<Vec<TorrentRecord>, rusqlite::Error> {
-        Ok(self
-            .search_torrents_filtered_page(query, limit, 0, sort_by, filters)?
-            .results)
-    }
-
-    pub fn search_torrents_filtered_page(
-        &self,
-        query: &str,
-        limit: usize,
-        offset: usize,
-        sort_by: &str,
-        filters: TorrentSearchFilters,
-    ) -> Result<TorrentSearchPage, rusqlite::Error> {
-        let conn = self.conn.lock().expect("store connection mutex poisoned");
-        let query_trimmed = query.trim();
-
-        if query_trimmed.is_empty() {
-            let order = sort_order_sql(sort_by);
-            let mut base_sql =
-                "SELECT info_hash, name, piece_length, total_size, file_count, source, first_seen, last_seen, last_attempt, metadata_complete
-                 FROM torrents t"
-                    .to_string();
-            let mut params = Vec::new();
-            append_filter_clauses(&mut base_sql, &mut params, false, "t", filters);
-            let mut count_sql = "SELECT COUNT(*) FROM torrents t".to_string();
-            let mut count_params = Vec::new();
-            append_filter_clauses(&mut count_sql, &mut count_params, false, "t", filters);
-            let total = count_search_results(&conn, &count_sql, count_params)?;
-            let mut sql = base_sql;
-            sql.push_str(&format!(
-                " ORDER BY {}
-                 LIMIT ? OFFSET ?",
-                order
+            return Err(invalid(
+                "allow_insecure_local is restricted to loopback hosts",
             ));
-            params.push(Value::from(limit as i64));
-            params.push(Value::from(offset as i64));
-            let mut stmt = conn.prepare(&sql)?;
-            let rows = stmt.query_map(params_from_iter(params), row_to_torrent)?;
-            let mut results = Vec::new();
-            for row in rows {
-                results.push(row?);
-            }
-            return Ok(TorrentSearchPage { results, total });
         }
-
-        if query_trimmed.chars().count() < 3 {
-            let pattern = format!("%{}%", escape_like_literal(query_trimmed));
-            let effective_sort = if sort_by == "rank" {
-                "last_seen"
+        if let Some(ca) = &config.tls_ca {
+            options = options.ssl_ca(ca);
+        }
+        Self::connect_options(
+            options,
+            if web {
+                config.web_pool_size
             } else {
-                sort_by
-            };
-            let order = sort_order_sql(effective_sort);
-            let mut base_sql =
-                "SELECT info_hash, name, piece_length, total_size, file_count, source, first_seen, last_seen, last_attempt, metadata_complete
-                 FROM torrents t
-                 WHERE (COALESCE(t.name, '') LIKE ?1 ESCAPE '\\'
-                    OR EXISTS (
-                        SELECT 1 FROM files f
-                        WHERE f.torrent_id = t.info_hash
-                          AND f.path LIKE ?1 ESCAPE '\\'
-                    ))"
-                    .to_string();
-            let mut params = vec![Value::from(pattern.clone())];
-            append_filter_clauses(&mut base_sql, &mut params, true, "t", filters);
-            let mut count_sql = "SELECT COUNT(*) FROM torrents t
-                 WHERE (COALESCE(t.name, '') LIKE ?1 ESCAPE '\\'
-                    OR EXISTS (
-                        SELECT 1 FROM files f
-                        WHERE f.torrent_id = t.info_hash
-                          AND f.path LIKE ?1 ESCAPE '\\'
-                    ))"
-            .to_string();
-            let mut count_params = vec![Value::from(pattern)];
-            append_filter_clauses(&mut count_sql, &mut count_params, true, "t", filters);
-            let total = count_search_results(&conn, &count_sql, count_params)?;
-            let mut sql = base_sql;
-            sql.push_str(&format!(
-                " ORDER BY {}
-                 LIMIT ? OFFSET ?",
-                order
-            ));
-            params.push(Value::from(limit as i64));
-            params.push(Value::from(offset as i64));
-            let mut stmt = conn.prepare(&sql)?;
-            let rows = stmt.query_map(params_from_iter(params), row_to_torrent)?;
-            let mut results = Vec::new();
-            for row in rows {
-                results.push(row?);
-            }
-            return Ok(TorrentSearchPage { results, total });
-        }
-
-        let fts_query = fts_literal_query(query_trimmed);
-
-        if sort_by == "rank" {
-            let mut base_sql = "SELECT t.info_hash, t.name, t.piece_length, t.total_size, t.file_count, t.source, t.first_seen, t.last_seen, t.last_attempt, t.metadata_complete
-                       FROM torrent_fts f
-                       JOIN torrents t ON t.info_hash = f.info_hash
-                       WHERE torrent_fts MATCH ?"
-                .to_string();
-            let mut params = vec![Value::from(fts_query.clone())];
-            append_filter_clauses(&mut base_sql, &mut params, true, "t", filters);
-            let mut count_sql = "SELECT COUNT(*)
-                       FROM torrent_fts f
-                       JOIN torrents t ON t.info_hash = f.info_hash
-                       WHERE torrent_fts MATCH ?"
-                .to_string();
-            let mut count_params = vec![Value::from(fts_query)];
-            append_filter_clauses(&mut count_sql, &mut count_params, true, "t", filters);
-            let total = count_search_results(&conn, &count_sql, count_params)?;
-            let mut sql = base_sql;
-            sql.push_str(
-                " ORDER BY bm25(torrent_fts, 1.0, 5.0, 1.0), t.last_seen DESC
-                       LIMIT ? OFFSET ?",
-            );
-            params.push(Value::from(limit as i64));
-            params.push(Value::from(offset as i64));
-            let mut stmt = conn.prepare(&sql)?;
-            let rows = stmt.query_map(params_from_iter(params), row_to_torrent)?;
-            let mut results = Vec::new();
-            for row in rows {
-                results.push(row?);
-            }
-            return Ok(TorrentSearchPage { results, total });
-        }
-
-        let order = sort_order_sql(sort_by);
-        let mut base_sql =
-            "SELECT t.info_hash, t.name, t.piece_length, t.total_size, t.file_count, t.source, t.first_seen, t.last_seen, t.last_attempt, t.metadata_complete
-             FROM torrent_fts f
-             JOIN torrents t ON t.info_hash = f.info_hash
-             WHERE torrent_fts MATCH ?"
-                .to_string();
-        let mut params = vec![Value::from(fts_query.clone())];
-        append_filter_clauses(&mut base_sql, &mut params, true, "t", filters);
-        let mut count_sql = "SELECT COUNT(*)
-             FROM torrent_fts f
-             JOIN torrents t ON t.info_hash = f.info_hash
-             WHERE torrent_fts MATCH ?"
-            .to_string();
-        let mut count_params = vec![Value::from(fts_query)];
-        append_filter_clauses(&mut count_sql, &mut count_params, true, "t", filters);
-        let total = count_search_results(&conn, &count_sql, count_params)?;
-        let mut sql = base_sql;
-        sql.push_str(&format!(
-            " ORDER BY {}
-             LIMIT ? OFFSET ?",
-            order
-        ));
-        params.push(Value::from(limit as i64));
-        params.push(Value::from(offset as i64));
-
-        let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(params_from_iter(params), row_to_torrent)?;
-        let mut results = Vec::new();
-        for row in rows {
-            results.push(row?);
-        }
-        Ok(TorrentSearchPage { results, total })
-    }
-
-    pub fn get_stats(&self) -> Result<CrawlStats, rusqlite::Error> {
-        let conn = self.conn.lock().expect("store connection mutex poisoned");
-        conn.query_row(
-            "SELECT
-                COUNT(*) as total,
-                COALESCE(SUM(CASE WHEN metadata_complete = 1 THEN 1 ELSE 0 END), 0) as complete,
-                COALESCE((SELECT COUNT(*) FROM files), 0) as files_total,
-                COALESCE(SUM(total_size), 0) as total_size
-             FROM torrents",
-            [],
-            |row| {
-                Ok(CrawlStats {
-                    total_torrents: row.get(0)?,
-                    total_metadata_complete: row.get(1)?,
-                    total_files: row.get(2)?,
-                    total_size: row.get(3)?,
-                })
+                config.pool_size
             },
+            select_timeout_ms,
         )
+        .await
     }
-
-    #[allow(dead_code)]
-    pub fn insert_crawl_stat(
+    async fn connect_options(
+        options: MySqlConnectOptions,
+        size: u32,
+        select_timeout_ms: u32,
+    ) -> Result<Self, Error> {
+        let pool = MySqlPoolOptions::new()
+            .max_connections(size)
+            .acquire_timeout(Duration::from_secs(5))
+            .after_connect(move |conn, _| {
+                Box::pin(async move {
+                    sqlx::query(&format!(
+                        "SET SESSION max_execution_time={select_timeout_ms}"
+                    ))
+                    .execute(&mut *conn)
+                    .await?;
+                    for statement in [
+                        "SET SESSION innodb_lock_wait_timeout=5",
+                        "SET SESSION innodb_ft_enable_stopword=OFF",
+                        "SET SESSION time_zone='+00:00'",
+                    ] {
+                        sqlx::query(statement).execute(&mut *conn).await?;
+                    }
+                    Ok(())
+                })
+            })
+            .connect_with(options)
+            .await?;
+        Ok(Self { pool })
+    }
+    pub async fn migrate(&self) -> Result<(), Error> {
+        self.check_parser().await?;
+        sqlx::migrate!()
+            .run(&self.pool)
+            .await
+            .map_err(|e| invalid(e.to_string()))
+    }
+    async fn check_parser(&self) -> Result<(), Error> {
+        let size: i64 = sqlx::query_scalar("SELECT @@ngram_token_size")
+            .fetch_one(&self.pool)
+            .await?;
+        if size != 2 {
+            return Err(invalid("ngram_token_size must be 2"));
+        }
+        Ok(())
+    }
+    pub(crate) async fn check_schema(&self) -> Result<(), Error> {
+        self.check_parser().await?;
+        let rows =
+            sqlx::query("SELECT version, checksum, success FROM _sqlx_migrations ORDER BY version")
+                .fetch_all(&self.pool)
+                .await?;
+        let migrations = sqlx::migrate!();
+        if rows.len() != migrations.iter().count() {
+            return Err(invalid(
+                "schema mismatch; run btfind db migrate with the matching binary",
+            ));
+        }
+        for (row, migration) in rows.iter().zip(migrations.iter()) {
+            if row.try_get::<i64, _>("version")? != migration.version
+                || !row.try_get::<bool, _>("success")?
+                || row.try_get::<Vec<u8>, _>("checksum")?.as_slice() != migration.checksum.as_ref()
+            {
+                return Err(invalid(
+                    "schema migration checksum mismatch or incomplete migration",
+                ));
+            }
+        }
+        Ok(())
+    }
+    pub async fn check(&self) -> Result<(), Error> {
+        self.check_schema().await
+    }
+    #[cfg(test)]
+    pub async fn get_torrent(&self, hash: &InfoHash) -> Result<Option<TorrentRecord>, Error> {
+        self.get_torrent_by_hex(&hex::encode(hash)).await
+    }
+    pub async fn get_torrent_by_hex(&self, hash: &str) -> Result<Option<TorrentRecord>, Error> {
+        sqlx::query("SELECT * FROM torrents WHERE info_hash=?")
+            .bind(hash.to_ascii_lowercase())
+            .fetch_optional(&self.pool)
+            .await?
+            .as_ref()
+            .map(row_to_torrent)
+            .transpose()
+    }
+    pub async fn get_stats(&self) -> Result<CrawlStats, Error> {
+        sqlx::query_as("SELECT total_torrents,total_metadata_complete,total_files,total_size FROM catalog_totals WHERE id=1").fetch_one(&self.pool).await
+    }
+    pub async fn commit_metadata(
         &self,
-        nodes_known: i64,
-        queries_sent: i64,
-        info_hashes_found: i64,
-        metadata_fetched: i64,
-    ) -> Result<i64, rusqlite::Error> {
-        let conn = self.conn.lock().expect("store connection mutex poisoned");
-        let now = chrono::Utc::now().timestamp();
-        conn.execute(
-            "INSERT INTO crawl_stats (timestamp, nodes_known, queries_sent, info_hashes_found, metadata_fetched)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![now, nodes_known, queries_sent, info_hashes_found, metadata_fetched],
-        )?;
-        Ok(conn.last_insert_rowid())
+        hash: &InfoHash,
+        name: &str,
+        piece_length: i64,
+        total_size: i64,
+        files: &[(String, i64)],
+    ) -> Result<(), Error> {
+        if files.iter().any(|(p, s)| p.is_empty() || *s < 0) || total_size < 0 || piece_length < 0 {
+            return Err(invalid("invalid metadata file or size"));
+        }
+        let count = i64::try_from(files.len()).map_err(|_| invalid("too many files"))?;
+        let h = hex::encode(hash);
+        for attempt in 0..4 {
+            let result = async {
+                let mut tx = self.pool.begin().await?;
+                lock_totals(&mut tx).await?;
+                discover(&mut tx, hash, "dht", false).await?;
+                let old = sqlx::query("SELECT total_size,metadata_complete FROM torrents WHERE info_hash=? FOR UPDATE").bind(&h).fetch_one(&mut *tx).await?;
+                let deleted = sqlx::query("DELETE FROM files WHERE torrent_id=?").bind(&h).execute(&mut *tx).await?.rows_affected() as i64;
+                sqlx::query("UPDATE torrents SET name=?,piece_length=?,total_size=?,file_count=?,last_seen=?,metadata_complete=1 WHERE info_hash=?")
+                    .bind(name).bind(piece_length).bind(total_size).bind(count).bind(now()).bind(&h).execute(&mut *tx).await?;
+                for chunk in files.chunks(128) {
+                    let mut q = QueryBuilder::<MySql>::new("INSERT INTO files(torrent_id,path,size) ");
+                    q.push_values(chunk, |mut b,(p,s)| { b.push_bind(&h).push_bind(p).push_bind(*s); });
+                    q.build().execute(&mut *tx).await?;
+                }
+                refresh_search(&mut tx, &h).await?;
+                sqlx::query("UPDATE hash_jobs SET status='complete',last_failure=NULL,last_success_at=?,updated_at=? WHERE info_hash=?").bind(now()).bind(now()).bind(&h).execute(&mut *tx).await?;
+                sqlx::query("UPDATE catalog_totals SET total_metadata_complete=total_metadata_complete+?,total_files=total_files+?,total_size=total_size+? WHERE id=1")
+                    .bind(i64::from(!old.try_get::<bool,_>("metadata_complete")?)).bind(count-deleted).bind(total_size-old.try_get::<i64,_>("total_size")?).execute(&mut *tx).await?;
+                tx.commit().await
+            }.await;
+            match result {
+                Err(e) if retryable(&e) && attempt < 3 => backoff(attempt).await,
+                other => return other,
+            }
+        }
+        unreachable!("bounded retry loop returns")
     }
-
-    pub fn persist_runtime_batch(
+    pub async fn persist_hash_discovery(
+        &self,
+        hash: &InfoHash,
+        source: &str,
+        peers: &[PeerContact],
+        limit: usize,
+    ) -> Result<(), Error> {
+        let addresses: Vec<String> = peers
+            .iter()
+            .take(limit)
+            .map(|p| p.addr.to_string())
+            .collect();
+        let h = hex::encode(hash);
+        let mut tx = self.pool.begin().await?;
+        lock_totals(&mut tx).await?;
+        discover(&mut tx, hash, source, !addresses.is_empty()).await?;
+        for chunk in addresses.chunks(128) {
+            let mut insert = QueryBuilder::<MySql>::new(
+                "INSERT INTO hash_job_peers(info_hash,peer_addr,last_seen) ",
+            );
+            insert.push_values(chunk, |mut row, addr| {
+                row.push_bind(&h).push_bind(addr).push_bind(now());
+            });
+            insert.push(" ON DUPLICATE KEY UPDATE last_seen=VALUES(last_seen)");
+            insert.build().execute(&mut *tx).await?;
+        }
+        let excess: Vec<String> = sqlx::query_scalar("SELECT peer_addr FROM hash_job_peers WHERE info_hash=? ORDER BY last_seen DESC,peer_addr LIMIT 18446744073709551615 OFFSET ?")
+            .bind(&h).bind(limit as u64).fetch_all(&mut *tx).await?;
+        for chunk in excess.chunks(128) {
+            let mut delete =
+                QueryBuilder::<MySql>::new("DELETE FROM hash_job_peers WHERE info_hash=");
+            delete.push_bind(&h).push(" AND peer_addr IN (");
+            let mut values = delete.separated(",");
+            for addr in chunk {
+                values.push_bind(addr);
+            }
+            delete.push(")");
+            delete.build().execute(&mut *tx).await?;
+        }
+        tx.commit().await
+    }
+    pub async fn persist_runtime_batch(
         &self,
         events: &[CrawlStatsEvent],
         snapshot: Option<RuntimeSnapshot>,
-    ) -> Result<(), rusqlite::Error> {
-        let mut failures = BTreeMap::<&str, i64>::new();
-        let mut nodes = BTreeMap::<NodeId, SocketAddrV4>::new();
-        let mut hashes = Vec::<(InfoHash, &'static str, bool)>::new();
-        let mut samples = BTreeMap::<InfoHash, (NodeId, SocketAddrV4, u64, i64)>::new();
-
+        receipt: &str,
+    ) -> Result<(), Error> {
+        let mut tx = self.pool.begin().await?;
+        lock_totals(&mut tx).await?;
+        let exists: Option<String> =
+            sqlx::query_scalar("SELECT id FROM persistence_receipts WHERE id=?")
+                .bind(receipt)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if exists.is_some() {
+            tx.rollback().await?;
+            return Ok(());
+        }
+        sqlx::query("INSERT INTO persistence_receipts(id,created_at) VALUES (?,?)")
+            .bind(receipt)
+            .bind(now())
+            .execute(&mut *tx)
+            .await?;
+        let mut nodes = BTreeMap::new();
         for event in events {
-            match *event {
+            match event {
                 CrawlStatsEvent::MetadataFetchFailed { reason } => {
-                    *failures.entry(reason.as_str()).or_default() += 1;
+                    sqlx::query("INSERT INTO metadata_failure_counts(reason,count) VALUES (?,1) ON DUPLICATE KEY UPDATE count=count+1").bind(reason.as_str()).execute(&mut *tx).await?;
                 }
                 CrawlStatsEvent::DhtNodeSeen { id, addr } => {
-                    nodes.insert(id, addr);
+                    nodes.insert(*id, *addr);
                 }
                 CrawlStatsEvent::HashObserved {
                     info_hash,
                     source,
-                    has_peers,
-                } => merge_hash_observation(&mut hashes, info_hash, source.as_str(), has_peers),
+                    has_peers: false,
+                } => discover(&mut tx, info_hash, source.as_str(), false).await?,
                 CrawlStatsEvent::SampleObserved {
                     info_hash,
                     node_id,
                     addr,
                     round_id,
                 } => {
-                    merge_hash_observation(&mut hashes, info_hash, "sample_infohashes", false);
-                    samples
-                        .entry(info_hash)
-                        .and_modify(|sample| {
-                            sample.0 = node_id;
-                            sample.1 = addr;
-                            sample.2 = round_id;
-                            sample.3 += 1;
-                        })
-                        .or_insert((node_id, addr, round_id, 1));
+                    discover(&mut tx, info_hash, "sample_infohashes", false).await?;
+                    sqlx::query("INSERT INTO sample_observations(info_hash,first_seen,last_seen,sampling_node_id,sampling_addr,sweep_id) VALUES (?,?,?,?,?,?) ON DUPLICATE KEY UPDATE last_seen=VALUES(last_seen),sample_count=sample_count+1,sampling_node_id=VALUES(sampling_node_id),sampling_addr=VALUES(sampling_addr),sweep_id=VALUES(sweep_id)")
+                        .bind(hex::encode(info_hash)).bind(now()).bind(now()).bind(hex::encode(node_id)).bind(addr.to_string()).bind(i64::try_from(*round_id).unwrap_or(i64::MAX)).execute(&mut *tx).await?;
                 }
                 _ => {}
             }
         }
-
-        let mut conn = self.conn.lock().expect("store connection mutex poisoned");
-        let tx = conn.transaction()?;
-        let now = chrono::Utc::now().timestamp();
-
-        for (reason, count) in failures {
-            tx.execute(
-                "INSERT INTO metadata_failure_counts (reason, count)
-                 VALUES (?1, ?2)
-                 ON CONFLICT(reason) DO UPDATE SET count = count + excluded.count",
-                params![reason, count],
-            )?;
-        }
         for (id, addr) in nodes {
-            tx.execute(
-                "INSERT INTO dht_nodes (id, addr, last_seen)
-                 VALUES (?1, ?2, ?3)
-                 ON CONFLICT(id) DO UPDATE SET
-                    addr = excluded.addr,
-                    last_seen = excluded.last_seen",
-                params![hex::encode(id), addr.to_string(), now],
-            )?;
+            sqlx::query("INSERT INTO dht_nodes VALUES (?,?,?) ON DUPLICATE KEY UPDATE addr=VALUES(addr),last_seen=VALUES(last_seen)").bind(hex::encode(id)).bind(addr.to_string()).bind(now()).execute(&mut *tx).await?;
         }
-        for (info_hash, source, has_peers) in hashes {
-            persist_hash_discovery_tx(&tx, &info_hash, source, has_peers, now)?;
+        if let Some(s) = snapshot {
+            sqlx::query("INSERT INTO crawl_stats(timestamp,nodes_known,queries_sent,info_hashes_found,metadata_fetched) VALUES (?,?,?,?,?)").bind(now()).bind(s.nodes_known).bind(s.queries_sent).bind(s.info_hashes_found).bind(s.metadata_fetched).execute(&mut *tx).await?;
         }
-        for (info_hash, (node_id, addr, round_id, count)) in samples {
-            tx.execute(
-                "INSERT INTO sample_observations (
-                    info_hash, first_seen, last_seen, sample_count,
-                    sampling_node_id, sampling_addr, sweep_id
-                 ) VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6)
-                 ON CONFLICT(info_hash) DO UPDATE SET
-                    last_seen = excluded.last_seen,
-                    sample_count = sample_count + excluded.sample_count,
-                    sampling_node_id = excluded.sampling_node_id,
-                    sampling_addr = excluded.sampling_addr,
-                    sweep_id = excluded.sweep_id",
-                params![
-                    hex::encode(info_hash),
-                    now,
-                    count,
-                    hex::encode(node_id),
-                    addr.to_string(),
-                    i64::try_from(round_id).unwrap_or(i64::MAX)
-                ],
-            )?;
-        }
-        if let Some(snapshot) = snapshot {
-            tx.execute(
-                "INSERT INTO crawl_stats (
-                    timestamp, nodes_known, queries_sent, info_hashes_found, metadata_fetched
-                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    now,
-                    snapshot.nodes_known,
-                    snapshot.queries_sent,
-                    snapshot.info_hashes_found,
-                    snapshot.metadata_fetched
-                ],
-            )?;
-        }
-        tx.commit()?;
+        tx.commit().await
+    }
+    pub async fn acknowledge_receipt(&self, receipt: &str) -> Result<(), Error> {
+        sqlx::query("UPDATE persistence_receipts SET acknowledged_at=? WHERE id=? AND acknowledged_at IS NULL")
+            .bind(now()).bind(receipt).execute(&self.pool).await?;
         Ok(())
     }
-
-    #[allow(dead_code)]
-    pub fn get_crawl_history(&self, limit: usize) -> Result<Vec<CrawlStatRecord>, rusqlite::Error> {
-        let conn = self.conn.lock().expect("store connection mutex poisoned");
-        let mut stmt = conn.prepare(
-            "SELECT id, timestamp, nodes_known, queries_sent, info_hashes_found, metadata_fetched
-             FROM crawl_stats
-             ORDER BY timestamp DESC
-             LIMIT ?1",
-        )?;
-        let rows = stmt.query_map(params![limit as i64], |row| {
-            Ok(CrawlStatRecord {
-                id: row.get(0)?,
-                timestamp: row.get(1)?,
-                nodes_known: row.get(2)?,
-                queries_sent: row.get(3)?,
-                info_hashes_found: row.get(4)?,
-                metadata_fetched: row.get(5)?,
-            })
-        })?;
-        let mut results = Vec::new();
-        for row in rows {
-            results.push(row?);
-        }
-        Ok(results)
+    pub async fn prune_receipts(&self) -> Result<i64, Error> {
+        self.prune_rows("persistence_receipts", "acknowledged_at", now() - 7 * 86400)
+            .await
     }
-
-    pub fn prune_old_torrents(&self, days: i64) -> Result<i64, rusqlite::Error> {
-        let conn = self.conn.lock().expect("store connection mutex poisoned");
-        let cutoff = chrono::Utc::now().timestamp() - days * 86400;
-
-        let mut hashes = Vec::new();
-        {
-            let mut stmt = conn.prepare("SELECT info_hash FROM torrents WHERE last_seen < ?1")?;
-            let rows = stmt.query_map(params![cutoff], |row| row.get::<_, String>(0))?;
-            for row in rows {
-                hashes.push(row?);
-            }
-        }
-
-        for h in &hashes {
-            conn.execute("DELETE FROM torrent_fts WHERE info_hash = ?1", params![h])?;
-        }
-        let removed = conn.execute("DELETE FROM torrents WHERE last_seen < ?1", params![cutoff])?;
-        Ok(removed as i64)
-    }
-
-    pub fn incomplete_info_hashes(&self, limit: usize) -> Result<Vec<InfoHash>, rusqlite::Error> {
-        let conn = self.conn.lock().expect("store connection mutex poisoned");
-        let mut stmt = conn.prepare(
-            "SELECT info_hash
-             FROM torrents
-             WHERE metadata_complete = 0
-             ORDER BY last_seen DESC, first_seen DESC, info_hash DESC
-             LIMIT ?1",
-        )?;
-        let rows = stmt.query_map(params![limit as i64], |row| {
-            let hash_hex: String = row.get(0)?;
-            info_hash_from_db_hex(&hash_hex)
-        })?;
-        let mut hashes = Vec::new();
-        for row in rows {
-            hashes.push(row?);
-        }
-        Ok(hashes)
-    }
-
-    pub fn persist_hash_discovery(
+    pub async fn update_hash_job_failure(
         &self,
-        info_hash: &InfoHash,
-        source: &str,
-        has_new_peers: bool,
-    ) -> Result<(), rusqlite::Error> {
-        let mut conn = self.conn.lock().expect("store connection mutex poisoned");
-        let tx = conn.transaction()?;
-        let now = chrono::Utc::now().timestamp();
-        persist_hash_discovery_tx(&tx, info_hash, source, has_new_peers, now)?;
-        tx.commit()?;
-        Ok(())
-    }
-
-    pub fn update_hash_job_failure(
-        &self,
-        info_hash: &InfoHash,
+        hash: &InfoHash,
         status: &str,
-        attempt_count: u32,
-        next_attempt_at: i64,
+        attempts: u32,
+        next: i64,
         failure: &str,
-    ) -> Result<(), rusqlite::Error> {
-        let conn = self.conn.lock().expect("store connection mutex poisoned");
-        conn.execute(
-            "UPDATE hash_jobs SET
-                status = ?2,
-                attempt_count = ?3,
-                next_attempt_at = ?4,
-                last_failure = ?5,
-                updated_at = unixepoch()
-             WHERE info_hash = ?1",
-            params![
-                hex::encode(info_hash),
-                status,
-                i64::from(attempt_count),
-                next_attempt_at,
-                failure
-            ],
-        )?;
+    ) -> Result<(), Error> {
+        sqlx::query("UPDATE hash_jobs SET status=?,attempt_count=?,next_attempt_at=?,last_failure=?,updated_at=? WHERE info_hash=? AND status<>'complete'").bind(status).bind(i64::from(attempts)).bind(next).bind(failure).bind(now()).bind(hex::encode(hash)).execute(&self.pool).await?;
         Ok(())
     }
-
-    pub fn persist_hash_job_peers(
+    pub async fn hash_job_peers(
         &self,
-        info_hash: &InfoHash,
-        peers: &[crate::types::PeerContact],
+        hash: &InfoHash,
         limit: usize,
-    ) -> Result<(), rusqlite::Error> {
-        if peers.is_empty() {
-            return Ok(());
-        }
-        let mut conn = self.conn.lock().expect("store connection mutex poisoned");
-        let tx = conn.transaction()?;
-        let hash_hex = hex::encode(info_hash);
-        let now = chrono::Utc::now().timestamp();
-        {
-            let mut stmt = tx.prepare(
-                "INSERT INTO hash_job_peers (info_hash, peer_addr, last_seen)
-                 VALUES (?1, ?2, ?3)
-                 ON CONFLICT(info_hash, peer_addr) DO UPDATE SET last_seen = excluded.last_seen",
-            )?;
-            for peer in peers.iter().take(limit) {
-                stmt.execute(params![hash_hex, peer.addr.to_string(), now])?;
-            }
-        }
-        tx.execute(
-            "DELETE FROM hash_job_peers
-             WHERE info_hash = ?1 AND peer_addr NOT IN (
-                 SELECT peer_addr FROM hash_job_peers
-                 WHERE info_hash = ?1
-                 ORDER BY last_seen DESC
-                 LIMIT ?2
-             )",
-            params![hash_hex, limit as i64],
-        )?;
-        tx.commit()?;
-        Ok(())
-    }
-
-    pub fn hash_job_peers(
-        &self,
-        info_hash: &InfoHash,
-        limit: usize,
-    ) -> Result<Vec<crate::types::PeerContact>, rusqlite::Error> {
-        let conn = self.conn.lock().expect("store connection mutex poisoned");
-        let mut stmt = conn.prepare(
-            "SELECT peer_addr FROM hash_job_peers
-             WHERE info_hash = ?1
-             ORDER BY last_seen DESC
-             LIMIT ?2",
-        )?;
-        let rows = stmt.query_map(params![hex::encode(info_hash), limit as i64], |row| {
-            let address: String = row.get(0)?;
-            let addr = address.parse::<SocketAddrV4>().map_err(|error| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    0,
-                    rusqlite::types::Type::Text,
-                    Box::new(error),
-                )
-            })?;
-            Ok(crate::types::PeerContact { addr })
-        })?;
-        rows.collect()
-    }
-
-    pub fn due_hash_jobs(&self, limit: usize) -> Result<Vec<HashJobRecord>, rusqlite::Error> {
-        let conn = self.conn.lock().expect("store connection mutex poisoned");
-        let mut stmt = conn.prepare(
-            "SELECT info_hash, status, attempt_count, next_attempt_at, last_failure
-             FROM hash_jobs
-             WHERE status IN ('queued', 'retry_at') AND next_attempt_at <= unixepoch()
-             ORDER BY next_attempt_at, updated_at
-             LIMIT ?1",
-        )?;
-        let rows = stmt.query_map(params![limit as i64], |row| {
-            let hash_hex: String = row.get(0)?;
-            let attempt_count: i64 = row.get(2)?;
-            Ok(HashJobRecord {
-                info_hash: info_hash_from_db_hex(&hash_hex)?,
-                status: row.get(1)?,
-                attempt_count: u32::try_from(attempt_count).unwrap_or(u32::MAX),
-                next_attempt_at: row.get(3)?,
-                last_failure: row.get(4)?,
+    ) -> Result<Vec<PeerContact>, Error> {
+        let addresses:Vec<String>=sqlx::query_scalar("SELECT peer_addr FROM hash_job_peers WHERE info_hash=? ORDER BY last_seen DESC,peer_addr LIMIT ?").bind(hex::encode(hash)).bind(limit as u64).fetch_all(&self.pool).await?;
+        addresses
+            .iter()
+            .map(|a| {
+                Ok(PeerContact {
+                    addr: a
+                        .parse()
+                        .map_err(|_| invalid("invalid stored peer address"))?,
+                })
             })
-        })?;
-        rows.collect()
+            .collect()
     }
-
-    pub fn load_or_create_node_id(&self) -> Result<NodeId, rusqlite::Error> {
-        let conn = self.conn.lock().expect("store connection mutex poisoned");
-        let existing = conn.query_row(
-            "SELECT value FROM app_state WHERE key = 'node_id'",
-            [],
-            |row| row.get::<_, Vec<u8>>(0),
-        );
-        match existing {
-            Ok(bytes) if bytes.len() == crate::types::NODE_ID_LEN => {
-                let mut id = [0u8; crate::types::NODE_ID_LEN];
-                id.copy_from_slice(&bytes);
-                Ok(id)
-            }
-            Ok(_) => Err(rusqlite::Error::InvalidParameterName(
-                "stored node_id has an invalid length".to_string(),
-            )),
-            Err(rusqlite::Error::QueryReturnedNoRows) => {
-                let id = crate::types::random_node_id();
-                conn.execute(
-                    "INSERT INTO app_state (key, value) VALUES ('node_id', ?1)",
-                    params![id.as_slice()],
-                )?;
-                Ok(id)
-            }
-            Err(error) => Err(error),
-        }
+    pub async fn hash_job_is_terminal(&self, hash: &InfoHash) -> Result<bool, Error> {
+        let terminal: Option<bool> = sqlx::query_scalar("SELECT status IN ('complete','invalid','unsupported') FROM hash_jobs WHERE info_hash=?")
+            .bind(hex::encode(hash)).fetch_optional(&self.pool).await?;
+        Ok(terminal.unwrap_or(false))
     }
-
-    #[cfg(test)]
-    pub fn upsert_dht_node(
+    pub async fn due_hash_jobs(&self, limit: usize) -> Result<Vec<HashJobRecord>, Error> {
+        sqlx::query("SELECT * FROM hash_jobs WHERE status IN ('queued','retry_at') AND next_attempt_at<=? ORDER BY next_attempt_at,updated_at,info_hash LIMIT ?").bind(now()).bind(limit as u64).fetch_all(&self.pool).await?.iter().map(|r| Ok(HashJobRecord {
+            info_hash:decode_hash(r.try_get("info_hash")?)?,status:r.try_get("status")?,attempt_count:u32::try_from(r.try_get::<i64,_>("attempt_count")?).map_err(|_| invalid("invalid attempt count"))?,next_attempt_at:r.try_get("next_attempt_at")?,last_failure:r.try_get("last_failure")?
+        })).collect()
+    }
+    pub async fn incomplete_info_hashes(&self, limit: usize) -> Result<Vec<InfoHash>, Error> {
+        let hashes:Vec<String>=sqlx::query_scalar("SELECT info_hash FROM torrents WHERE metadata_complete=0 ORDER BY last_seen DESC,info_hash DESC LIMIT ?").bind(limit as u64).fetch_all(&self.pool).await?;
+        hashes.iter().map(|h| decode_hash(h)).collect()
+    }
+    pub async fn load_or_create_node_id(&self) -> Result<NodeId, Error> {
+        let id = crate::types::random_node_id();
+        sqlx::query("INSERT INTO app_state (`key`,value) VALUES ('node_id',?) ON DUPLICATE KEY UPDATE `key`=`key`").bind(id.as_slice()).execute(&self.pool).await?;
+        let bytes: Vec<u8> =
+            sqlx::query_scalar("SELECT value FROM app_state WHERE `key`='node_id'")
+                .fetch_one(&self.pool)
+                .await?;
+        bytes
+            .try_into()
+            .map_err(|_| invalid("stored node_id has an invalid length"))
+    }
+    pub async fn recent_dht_nodes(
         &self,
-        node_id: &NodeId,
-        addr: SocketAddrV4,
-    ) -> Result<(), rusqlite::Error> {
-        let conn = self.conn.lock().expect("store connection mutex poisoned");
-        let now = chrono::Utc::now().timestamp();
-        conn.execute(
-            "INSERT INTO dht_nodes (id, addr, last_seen)
-             VALUES (?1, ?2, ?3)
-             ON CONFLICT(id) DO UPDATE SET
-                addr = excluded.addr,
-                last_seen = excluded.last_seen",
-            params![hex::encode(node_id), addr.to_string(), now],
-        )?;
-        Ok(())
-    }
-
-    pub fn recent_dht_nodes(
-        &self,
-        max_age: Duration,
+        age: Duration,
         limit: usize,
-    ) -> Result<Vec<NodeContact>, rusqlite::Error> {
-        let conn = self.conn.lock().expect("store connection mutex poisoned");
-        let cutoff = chrono::Utc::now().timestamp() - max_age.as_secs() as i64;
-        let mut stmt = conn.prepare(
-            "SELECT id, addr, last_seen
-             FROM dht_nodes
-             WHERE last_seen >= ?1
-             ORDER BY last_seen DESC
-             LIMIT ?2",
-        )?;
-        let rows = stmt.query_map(params![cutoff, limit as i64], row_to_dht_node)?;
-        let mut nodes = Vec::new();
-        for row in rows {
-            nodes.push(row?);
-        }
-        Ok(nodes)
+    ) -> Result<Vec<NodeContact>, Error> {
+        sqlx::query("SELECT id,addr,last_seen FROM dht_nodes WHERE last_seen>=? ORDER BY last_seen DESC,id LIMIT ?").bind(now()-age.as_secs() as i64).bind(limit as u64).fetch_all(&self.pool).await?.iter().map(|r| Ok(NodeContact {
+            id:decode_hash(r.try_get("id")?)?, addr:r.try_get::<&str,_>("addr")?.parse::<SocketAddrV4>().map_err(|_| invalid("invalid stored node address"))?, last_seen:Instant::now(), last_seen_unix:r.try_get("last_seen")?,
+        })).collect()
     }
-
-    pub fn prune_stale_dht_nodes(&self, max_age: Duration) -> Result<i64, rusqlite::Error> {
-        let conn = self.conn.lock().expect("store connection mutex poisoned");
-        let cutoff = chrono::Utc::now().timestamp() - max_age.as_secs() as i64;
-        let removed = conn.execute(
-            "DELETE FROM dht_nodes WHERE last_seen < ?1",
-            params![cutoff],
-        )?;
-        Ok(removed as i64)
-    }
-
-    pub fn set_peer_attempt(
-        &self,
-        info_hash: &InfoHash,
-        peer_addr: &str,
-        last_error: Option<&str>,
-    ) -> Result<(), rusqlite::Error> {
-        let conn = self.conn.lock().expect("store connection mutex poisoned");
-        let hash_hex = hex::encode(info_hash);
-        let now = chrono::Utc::now().timestamp();
-
-        conn.execute(
-            "INSERT INTO metadata_peer_attempts (info_hash, peer_addr, last_attempt, last_error)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(info_hash, peer_addr) DO UPDATE SET
-                 last_attempt = excluded.last_attempt,
-                 last_error = excluded.last_error",
-            params![hash_hex, peer_addr, now, last_error],
-        )?;
-        conn.execute(
-            "UPDATE torrents SET last_attempt = ?1 WHERE info_hash = ?2",
-            params![now, hash_hex],
-        )?;
-        Ok(())
-    }
-
-    #[cfg(test)]
-    pub fn should_skip_peer_retry(
-        &self,
-        info_hash: &InfoHash,
-        peer_addr: &str,
-        retry_after_hours: u32,
-    ) -> Result<bool, rusqlite::Error> {
-        Ok(!matches!(
-            self.peer_retry_eligibility(info_hash, peer_addr, retry_after_hours)?,
-            PeerRetryEligibility::Eligible
-        ))
-    }
-
-    pub fn peer_retry_eligibility(
-        &self,
-        info_hash: &InfoHash,
-        peer_addr: &str,
-        retry_after_hours: u32,
-    ) -> Result<PeerRetryEligibility, rusqlite::Error> {
-        let conn = self.conn.lock().expect("store connection mutex poisoned");
-        let attempt = conn
-            .query_row(
-                "SELECT last_attempt, last_error
-                 FROM metadata_peer_attempts
-                 WHERE info_hash = ?1 AND peer_addr = ?2",
-                params![hex::encode(info_hash), peer_addr],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
-            )
-            .optional()?;
-        let Some((last_attempt, last_error)) = attempt else {
-            return Ok(PeerRetryEligibility::Eligible);
-        };
-        if last_error.as_deref() == Some("metadata hash mismatch") {
-            return Ok(PeerRetryEligibility::Rejected);
-        }
-        let retry_at = last_attempt.saturating_add(i64::from(retry_after_hours) * 3600);
-        if retry_after_hours > 0 && retry_at > chrono::Utc::now().timestamp() {
-            Ok(PeerRetryEligibility::RetryAt(retry_at))
-        } else {
-            Ok(PeerRetryEligibility::Eligible)
+    async fn prune_rows(&self, table: &str, field: &str, cutoff: i64) -> Result<i64, Error> {
+        let mut total = 0;
+        loop {
+            let n = sqlx::query(&format!("DELETE FROM {table} WHERE {field}<? LIMIT 500"))
+                .bind(cutoff)
+                .execute(&self.pool)
+                .await?
+                .rows_affected();
+            total += n as i64;
+            if n < 500 {
+                return Ok(total);
+            }
+            tokio::task::yield_now().await;
         }
     }
-
-    #[cfg(test)]
-    pub fn hash_job_schedule_for_test(
-        &self,
-        info_hash: &InfoHash,
-    ) -> Result<(String, u32, i64), rusqlite::Error> {
-        let conn = self.conn.lock().expect("store connection mutex poisoned");
-        conn.query_row(
-            "SELECT status, attempt_count, next_attempt_at
-             FROM hash_jobs WHERE info_hash = ?1",
-            params![hex::encode(info_hash)],
-            |row| {
-                let attempt_count: i64 = row.get(1)?;
-                Ok((
-                    row.get(0)?,
-                    u32::try_from(attempt_count).unwrap_or(u32::MAX),
-                    row.get(2)?,
-                ))
-            },
+    pub async fn prune_stale_dht_nodes(&self, age: Duration) -> Result<i64, Error> {
+        self.prune_rows("dht_nodes", "last_seen", now() - age.as_secs() as i64)
+            .await
+    }
+    pub async fn prune_stale_peer_attempts(&self, age: Duration) -> Result<i64, Error> {
+        self.prune_rows(
+            "metadata_peer_attempts",
+            "last_attempt",
+            now() - age.as_secs() as i64,
         )
+        .await
     }
-
-    pub fn prune_stale_peer_attempts(&self, max_age: Duration) -> Result<i64, rusqlite::Error> {
-        let conn = self.conn.lock().expect("store connection mutex poisoned");
-        let cutoff = chrono::Utc::now().timestamp() - max_age.as_secs() as i64;
-        let removed = conn.execute(
-            "DELETE FROM metadata_peer_attempts WHERE last_attempt < ?1",
-            params![cutoff],
-        )?;
-        Ok(removed as i64)
-    }
-
-    #[cfg(test)]
-    pub fn increment_metadata_failure(&self, reason: &str) -> Result<(), rusqlite::Error> {
-        let conn = self.conn.lock().expect("store connection mutex poisoned");
-        conn.execute(
-            "INSERT INTO metadata_failure_counts (reason, count)
-             VALUES (?1, 1)
-             ON CONFLICT(reason) DO UPDATE SET count = count + 1",
-            params![reason],
-        )?;
-        Ok(())
-    }
-
-    pub fn get_metadata_failure_counts(
+    pub async fn set_peer_attempt(
         &self,
-    ) -> Result<Vec<MetadataFailureCount>, rusqlite::Error> {
-        let conn = self.conn.lock().expect("store connection mutex poisoned");
-        let mut stmt = conn.prepare(
-            "SELECT reason, count
-             FROM metadata_failure_counts
-             ORDER BY count DESC, reason ASC",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            Ok(MetadataFailureCount {
-                reason: row.get(0)?,
-                count: row.get(1)?,
-            })
-        })?;
-        let mut counts = Vec::new();
-        for row in rows {
-            counts.push(row?);
-        }
-        Ok(counts)
+        hash: &InfoHash,
+        addr: &str,
+        error: Option<&str>,
+    ) -> Result<(), Error> {
+        let mut tx = self.pool.begin().await?;
+        let h = hex::encode(hash);
+        sqlx::query("UPDATE torrents SET last_attempt=? WHERE info_hash=?")
+            .bind(now())
+            .bind(&h)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("INSERT INTO metadata_peer_attempts VALUES (?,?,?,?) ON DUPLICATE KEY UPDATE last_attempt=VALUES(last_attempt),last_error=VALUES(last_error)").bind(&h).bind(addr).bind(now()).bind(error).execute(&mut *tx).await?;
+        tx.commit().await
     }
-
-    fn refresh_torrent_fts_locked(
-        conn: &Connection,
-        info_hash_hex: &str,
-    ) -> Result<(), rusqlite::Error> {
-        conn.execute(
-            "DELETE FROM torrent_fts WHERE info_hash = ?1",
-            params![info_hash_hex],
-        )?;
-
-        let name: Option<String> = conn
-            .query_row(
-                "SELECT name FROM torrents WHERE info_hash = ?1 AND metadata_complete = 1",
-                params![info_hash_hex],
-                |row| row.get(0),
-            )
-            .ok();
-
-        if name.is_none() || name.as_deref() == Some("") {
-            let file_count: i64 = conn.query_row(
-                "SELECT COUNT(*) FROM files WHERE torrent_id = ?1",
-                params![info_hash_hex],
-                |row| row.get(0),
-            )?;
-            if file_count == 0 {
-                return Ok(());
-            }
-        }
-
-        let mut paths = Vec::new();
-        {
-            let mut stmt =
-                conn.prepare("SELECT path FROM files WHERE torrent_id = ?1 ORDER BY path")?;
-            let rows = stmt.query_map(params![info_hash_hex], |row| row.get::<_, String>(0))?;
-            for row in rows {
-                paths.push(row?);
-            }
-        }
-        let paths_joined = paths.join(" ");
-
-        let name_val = name.unwrap_or_default();
-
-        conn.execute(
-            "INSERT INTO torrent_fts (info_hash, name, paths) VALUES (?1, ?2, ?3)",
-            params![info_hash_hex, name_val, paths_joined],
-        )?;
-
-        Ok(())
-    }
-
-    #[allow(dead_code)]
-    pub fn refresh_torrent_fts(&self, info_hash: &InfoHash) -> Result<(), rusqlite::Error> {
-        let conn = self.conn.lock().expect("store connection mutex poisoned");
-        let hash_hex = hex::encode(info_hash);
-        Self::refresh_torrent_fts_locked(&conn, &hash_hex)
-    }
-
-    pub fn rebuild_search_index(&self) -> Result<(), rusqlite::Error> {
-        let conn = self.conn.lock().expect("store connection mutex poisoned");
-        conn.execute("DELETE FROM torrent_fts", [])?;
-
-        let mut hashes = Vec::new();
-        {
-            let mut stmt =
-                conn.prepare("SELECT info_hash FROM torrents WHERE metadata_complete = 1")?;
-            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-            for row in rows {
-                hashes.push(row?);
-            }
-        }
-
-        for hash_hex in &hashes {
-            Self::refresh_torrent_fts_locked(&conn, hash_hex)?;
-        }
-
-        Ok(())
-    }
-
-    fn backfill_fts_if_needed(&self) -> Result<(), rusqlite::Error> {
-        let conn = self.conn.lock().expect("store connection mutex poisoned");
-
-        let fts_count: i64 =
-            conn.query_row("SELECT COUNT(*) FROM torrent_fts", [], |row| row.get(0))?;
-        if fts_count > 0 {
-            return Ok(());
-        }
-
-        let complete_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM torrents WHERE metadata_complete = 1",
-            [],
-            |row| row.get(0),
-        )?;
-
-        if complete_count == 0 {
-            return Ok(());
-        }
-
-        drop(conn);
-        self.rebuild_search_index()
-    }
-
-    #[allow(dead_code)]
-    pub fn get_files(&self, info_hash: &InfoHash) -> Result<Vec<(String, i64)>, rusqlite::Error> {
-        let conn = self.conn.lock().expect("store connection mutex poisoned");
-        let hash_hex = hex::encode(info_hash);
-        let mut stmt =
-            conn.prepare("SELECT path, size FROM files WHERE torrent_id = ?1 ORDER BY path")?;
-        let rows = stmt.query_map(params![hash_hex], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-        })?;
-        let mut results = Vec::new();
-        for row in rows {
-            results.push(row?);
-        }
-        Ok(results)
-    }
-
-    pub fn search_files_page(
+    pub async fn peer_retry_eligibility(
         &self,
-        info_hash: &InfoHash,
+        hash: &InfoHash,
+        addr: &str,
+        hours: u32,
+    ) -> Result<PeerRetryEligibility, Error> {
+        let r:Option<(i64,Option<String>)>=sqlx::query_as("SELECT last_attempt,last_error FROM metadata_peer_attempts WHERE info_hash=? AND peer_addr=?").bind(hex::encode(hash)).bind(addr).fetch_optional(&self.pool).await?;
+        match r {
+            None => Ok(PeerRetryEligibility::Eligible),
+            Some((_, Some(e))) if e == "metadata hash mismatch" => {
+                Ok(PeerRetryEligibility::Rejected)
+            }
+            Some((t, _)) => {
+                let until = t.saturating_add(i64::from(hours) * 3600);
+                Ok(if hours > 0 && until > now() {
+                    PeerRetryEligibility::RetryAt(until)
+                } else {
+                    PeerRetryEligibility::Eligible
+                })
+            }
+        }
+    }
+    pub async fn get_crawl_history(&self, limit: usize) -> Result<Vec<CrawlStatRecord>, Error> {
+        sqlx::query_as("SELECT * FROM crawl_stats ORDER BY id DESC LIMIT ?")
+            .bind(limit as u64)
+            .fetch_all(&self.pool)
+            .await
+    }
+    pub async fn get_metadata_failure_counts(&self) -> Result<Vec<MetadataFailureCount>, Error> {
+        sqlx::query_as(
+            "SELECT reason,count FROM metadata_failure_counts ORDER BY count DESC,reason",
+        )
+        .fetch_all(&self.pool)
+        .await
+    }
+    pub async fn prune_old_torrents(&self, days: i64) -> Result<i64, Error> {
+        let cutoff = now().saturating_sub(days.saturating_mul(86400));
+        let mut total = 0;
+        loop {
+            let mut tx = self.pool.begin().await?;
+            lock_totals(&mut tx).await?;
+            let rows=sqlx::query("SELECT info_hash,total_size,metadata_complete FROM torrents WHERE last_seen<? ORDER BY last_seen,info_hash LIMIT 128 FOR UPDATE").bind(cutoff).fetch_all(&mut *tx).await?;
+            if rows.is_empty() {
+                tx.rollback().await?;
+                return Ok(total);
+            }
+            for r in rows {
+                let h: String = r.try_get("info_hash")?;
+                let files = sqlx::query("DELETE FROM files WHERE torrent_id=?")
+                    .bind(&h)
+                    .execute(&mut *tx)
+                    .await?
+                    .rows_affected() as i64;
+                sqlx::query("DELETE FROM torrents WHERE info_hash=?")
+                    .bind(&h)
+                    .execute(&mut *tx)
+                    .await?;
+                sqlx::query("UPDATE catalog_totals SET total_torrents=total_torrents-1,total_metadata_complete=total_metadata_complete-?,total_files=total_files-?,total_size=total_size-? WHERE id=1").bind(i64::from(r.try_get::<bool,_>("metadata_complete")?)).bind(files).bind(r.try_get::<i64,_>("total_size")?).execute(&mut *tx).await?;
+                total += 1;
+            }
+            tx.commit().await?;
+        }
+    }
+    pub async fn search_torrents(
+        &self,
+        query: &str,
+        limit: usize,
+        sort: &str,
+    ) -> Result<Vec<TorrentRecord>, Error> {
+        Ok(self
+            .search_torrents_filtered_page(query, limit, 0, sort, TorrentSearchFilters::default())
+            .await?
+            .results)
+    }
+    pub async fn search_torrents_filtered_page(
+        &self,
         query: &str,
         limit: usize,
         offset: usize,
-    ) -> Result<FileSearchPage, rusqlite::Error> {
-        let conn = self.conn.lock().expect("store connection mutex poisoned");
-        let hash_hex = hex::encode(info_hash);
-        let query_trimmed = query.trim();
-
-        let (total, mut stmt, params) = if query_trimmed.is_empty() {
-            let total = conn.query_row(
-                "SELECT COUNT(*) FROM files WHERE torrent_id = ?1",
-                params![hash_hex],
-                |row| row.get(0),
-            )?;
-            let stmt = conn.prepare(
-                "SELECT path, size FROM files
-                 WHERE torrent_id = ?1
-                 ORDER BY path COLLATE NOCASE, path, id
-                 LIMIT ?2 OFFSET ?3",
-            )?;
-            (
-                total,
-                stmt,
-                vec![
-                    Value::from(hash_hex),
-                    Value::from(limit as i64),
-                    Value::from(offset as i64),
-                ],
-            )
+        sort: &str,
+        filters: TorrentSearchFilters,
+    ) -> Result<TorrentSearchPage, Error> {
+        let terms = search_query(query).map_err(invalid)?;
+        let order = match sort {
+            "rank" if !terms.is_empty() => "score DESC,t.last_seen DESC,t.info_hash",
+            "rank" | "last_seen" => "t.last_seen DESC,t.info_hash DESC",
+            "first_seen" => "t.first_seen DESC,t.info_hash DESC",
+            "total_size" => "t.total_size DESC,t.info_hash DESC",
+            "name" => "t.name,t.info_hash",
+            _ => return Err(invalid("invalid sort")),
+        };
+        let mut q = QueryBuilder::<MySql>::new("SELECT /*+ MAX_EXECUTION_TIME(9000) */ t.*");
+        if !terms.is_empty() && sort == "rank" {
+            q.push(", MATCH(s.name,s.paths) AGAINST (")
+                .push_bind(&terms)
+                .push(" IN BOOLEAN MODE)+5*MATCH(s.name) AGAINST (")
+                .push_bind(&terms)
+                .push(" IN BOOLEAN MODE) AS score");
+        }
+        q.push(" FROM torrents t");
+        if !terms.is_empty() {
+            q.push(" JOIN search_documents s ON s.info_hash=t.info_hash WHERE MATCH(s.name,s.paths) AGAINST (").push_bind(&terms).push(" IN BOOLEAN MODE)");
         } else {
-            let pattern = format!("%{}%", escape_like_literal(query_trimmed));
-            let total = conn.query_row(
-                "SELECT COUNT(*) FROM files
-                 WHERE torrent_id = ?1 AND path LIKE ?2 ESCAPE '\\' COLLATE NOCASE",
-                params![hash_hex, pattern],
-                |row| row.get(0),
-            )?;
-            let stmt = conn.prepare(
-                "SELECT path, size FROM files
-                 WHERE torrent_id = ?1 AND path LIKE ?2 ESCAPE '\\' COLLATE NOCASE
-                 ORDER BY path COLLATE NOCASE, path, id
-                 LIMIT ?3 OFFSET ?4",
-            )?;
-            (
-                total,
-                stmt,
-                vec![
-                    Value::from(hash_hex),
-                    Value::from(pattern),
-                    Value::from(limit as i64),
-                    Value::from(offset as i64),
-                ],
-            )
-        };
-
-        let rows = stmt.query_map(params_from_iter(params), |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-        })?;
-        let mut results = Vec::new();
-        for row in rows {
-            results.push(row?);
+            q.push(" WHERE 1=1");
         }
-        Ok(FileSearchPage { results, total })
+        if filters.complete_only {
+            q.push(" AND t.metadata_complete=1");
+        }
+        if let Some(s) = filters.min_size {
+            q.push(" AND t.total_size>=").push_bind(s);
+        }
+        if let Some(s) = filters.max_size {
+            q.push(" AND t.total_size<=").push_bind(s);
+        }
+        q.push(" ORDER BY ")
+            .push(order)
+            .push(" LIMIT ")
+            .push_bind(limit.saturating_add(1) as u64)
+            .push(" OFFSET ")
+            .push_bind(offset as u64);
+        let mut results = q
+            .build()
+            .fetch_all(&self.pool)
+            .await?
+            .iter()
+            .map(row_to_torrent)
+            .collect::<Result<Vec<_>, _>>()?;
+        let has_next = results.len() > limit;
+        results.truncate(limit);
+        Ok(TorrentSearchPage { results, has_next })
     }
-
-    #[allow(dead_code)]
-    pub fn get_torrent_by_hex(
+    pub async fn search_files_page(
         &self,
-        info_hash_hex: &str,
-    ) -> Result<Option<TorrentRecord>, rusqlite::Error> {
-        let conn = self.conn.lock().expect("store connection mutex poisoned");
-        let mut stmt = conn.prepare(
-            "SELECT info_hash, name, piece_length, total_size, file_count, source, first_seen, last_seen, last_attempt, metadata_complete
-             FROM torrents WHERE info_hash = ?1",
-        )?;
-        let mut rows = stmt.query_map(params![info_hash_hex], row_to_torrent)?;
-        match rows.next() {
-            Some(Ok(record)) => Ok(Some(record)),
-            Some(Err(e)) => Err(e),
-            None => Ok(None),
-        }
+        hash: &InfoHash,
+        query: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<FileSearchPage, Error> {
+        let pattern = format!(
+            "%{}%",
+            query
+                .replace('!', "!!")
+                .replace('%', "!%")
+                .replace('_', "!_")
+        );
+        let mut results:Vec<(String,i64)>=sqlx::query_as("SELECT /*+ MAX_EXECUTION_TIME(9000) */ path,size FROM files WHERE torrent_id=? AND path LIKE ? ESCAPE '!' ORDER BY path,id LIMIT ? OFFSET ?").bind(hex::encode(hash)).bind(pattern).bind(limit.saturating_add(1) as u64).bind(offset as u64).fetch_all(&self.pool).await?;
+        let has_next = results.len() > limit;
+        results.truncate(limit);
+        Ok(FileSearchPage { results, has_next })
     }
-}
-
-fn merge_hash_observation(
-    hashes: &mut Vec<(InfoHash, &'static str, bool)>,
-    info_hash: InfoHash,
-    source: &'static str,
-    has_peers: bool,
-) {
-    if let Some(observation) = hashes
-        .iter_mut()
-        .find(|observation| observation.0 == info_hash && observation.1 == source)
-    {
-        observation.2 |= has_peers;
-    } else {
-        hashes.push((info_hash, source, has_peers));
+    pub async fn reconcile(&self) -> Result<(), Error> {
+        let mut tx = self.pool.begin().await?;
+        lock_totals(&mut tx).await?;
+        sqlx::query("UPDATE catalog_totals SET total_torrents=(SELECT COUNT(*) FROM torrents),total_metadata_complete=(SELECT COUNT(*) FROM torrents WHERE metadata_complete=1),total_files=(SELECT COUNT(*) FROM files),total_size=(SELECT COALESCE(SUM(total_size),0) FROM torrents) WHERE id=1").execute(&mut *tx).await?;
+        tx.commit().await
     }
-}
-
-fn persist_hash_discovery_tx(
-    tx: &rusqlite::Transaction<'_>,
-    info_hash: &InfoHash,
-    source: &str,
-    has_new_peers: bool,
-    now: i64,
-) -> Result<(), rusqlite::Error> {
-    let hash_hex = hex::encode(info_hash);
-    tx.execute(
-        "INSERT INTO torrents (
-            info_hash, source, first_seen, last_seen, metadata_complete
-         ) VALUES (?1, ?2, ?3, ?3, 0)
-         ON CONFLICT(info_hash) DO UPDATE SET
-            source = excluded.source,
-            last_seen = excluded.last_seen",
-        params![hash_hex, source, now],
-    )?;
-    tx.execute(
-        "INSERT INTO hash_jobs (
-            info_hash, status, last_new_peer_at, discovery_sources, updated_at
-         ) VALUES (?1, 'queued', ?2, ?3, ?4)
-         ON CONFLICT(info_hash) DO UPDATE SET
-            status = CASE
-                WHEN hash_jobs.status IN ('complete', 'invalid', 'unsupported')
-                THEN hash_jobs.status
-                WHEN hash_jobs.status = 'waiting_peers' AND ?2 IS NULL
-                THEN hash_jobs.status
-                ELSE 'queued'
-            END,
-            next_attempt_at = CASE WHEN ?2 IS NOT NULL THEN 0 ELSE hash_jobs.next_attempt_at END,
-            last_new_peer_at = COALESCE(?2, hash_jobs.last_new_peer_at),
-            discovery_sources = CASE
-                WHEN instr(',' || hash_jobs.discovery_sources || ',', ',' || ?3 || ',') > 0
-                THEN hash_jobs.discovery_sources
-                WHEN hash_jobs.discovery_sources = '' THEN ?3
-                ELSE hash_jobs.discovery_sources || ',' || ?3
-            END,
-            updated_at = excluded.updated_at",
-        params![hash_hex, has_new_peers.then_some(now), source, now],
-    )?;
-    Ok(())
-}
-
-#[cfg(test)]
-impl Store {
-    pub(crate) fn execute_batch_for_test(&self, sql: &str) -> Result<(), rusqlite::Error> {
-        self.conn
-            .lock()
-            .expect("store connection mutex poisoned")
-            .execute_batch(sql)
-    }
-}
-
-fn sort_order_sql(sort_by: &str) -> &'static str {
-    match sort_by {
-        "first_seen" => "first_seen DESC",
-        "total_size" => "total_size DESC",
-        "name" => "name ASC",
-        _ => "last_seen DESC",
-    }
-}
-
-fn append_filter_clauses(
-    sql: &mut String,
-    params: &mut Vec<Value>,
-    has_where: bool,
-    alias: &str,
-    filters: TorrentSearchFilters,
-) {
-    let mut needs_and = has_where;
-    if filters.complete_only {
-        append_filter_prefix(sql, &mut needs_and);
-        sql.push_str(alias);
-        sql.push_str(".metadata_complete = 1");
-    }
-    if let Some(min_size) = filters.min_size {
-        append_filter_prefix(sql, &mut needs_and);
-        sql.push_str(alias);
-        sql.push_str(".total_size >= ?");
-        params.push(Value::from(min_size));
-    }
-    if let Some(max_size) = filters.max_size {
-        append_filter_prefix(sql, &mut needs_and);
-        sql.push_str(alias);
-        sql.push_str(".total_size <= ?");
-        params.push(Value::from(max_size));
-    }
-}
-
-fn append_filter_prefix(sql: &mut String, needs_and: &mut bool) {
-    if *needs_and {
-        sql.push_str(" AND ");
-    } else {
-        sql.push_str(" WHERE ");
-        *needs_and = true;
-    }
-}
-
-fn count_search_results(
-    conn: &Connection,
-    sql: &str,
-    params: Vec<Value>,
-) -> Result<i64, rusqlite::Error> {
-    conn.query_row(sql, params_from_iter(params), |row| row.get(0))
-}
-
-fn fts_literal_query(input: &str) -> String {
-    format!("\"{}\"", input.replace('"', "\"\""))
-}
-
-fn escape_like_literal(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    for ch in input.chars() {
-        match ch {
-            '%' | '_' | '\\' => {
-                out.push('\\');
-                out.push(ch);
+    pub async fn rebuild_search_index(&self) -> Result<(), Error> {
+        let limits = SearchLimits::load(&mut *self.pool.acquire().await?).await?;
+        sqlx::query("DELETE s FROM search_documents s JOIN torrents t ON t.info_hash=s.info_hash WHERE (t.metadata_complete=0 OR t.name IS NULL) AND NOT EXISTS (SELECT 1 FROM files f WHERE f.torrent_id=s.info_hash)")
+            .execute(&self.pool).await?;
+        let mut after = String::new();
+        let mut rebuilt = 0usize;
+        loop {
+            let hashes: Vec<String> = sqlx::query_scalar(
+                "(SELECT info_hash FROM torrents WHERE metadata_complete=1 AND name IS NOT NULL AND info_hash>? ORDER BY info_hash LIMIT 128) UNION (SELECT DISTINCT torrent_id AS info_hash FROM files WHERE torrent_id>? ORDER BY torrent_id LIMIT 128) ORDER BY info_hash LIMIT 128",
+            )
+            .bind(&after)
+            .bind(&after)
+            .fetch_all(&self.pool)
+            .await?;
+            if hashes.is_empty() {
+                return self.analyze().await;
             }
-            _ => out.push(ch),
-        }
-    }
-    out
-}
-
-fn row_to_torrent(row: &rusqlite::Row) -> rusqlite::Result<TorrentRecord> {
-    let hash_hex: String = row.get(0)?;
-    let info_hash = info_hash_from_db_hex(&hash_hex)?;
-
-    Ok(TorrentRecord {
-        info_hash,
-        name: row.get(1)?,
-        piece_length: row.get(2)?,
-        total_size: row.get(3)?,
-        file_count: row.get(4)?,
-        source: row.get(5)?,
-        first_seen: row.get(6)?,
-        last_seen: row.get(7)?,
-        last_attempt: row.get(8)?,
-        metadata_complete: row.get::<_, i32>(9)? != 0,
-    })
-}
-
-fn info_hash_from_db_hex(hash_hex: &str) -> rusqlite::Result<InfoHash> {
-    let hash_bytes = hex::decode(hash_hex).map_err(|e| {
-        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
-    })?;
-    if hash_bytes.len() != 20 {
-        return Err(rusqlite::Error::FromSqlConversionFailure(
-            0,
-            rusqlite::types::Type::Text,
-            Box::new(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "info_hash must be 20 bytes",
-            )),
-        ));
-    }
-    let mut info_hash: InfoHash = [0u8; 20];
-    info_hash.copy_from_slice(&hash_bytes);
-    Ok(info_hash)
-}
-
-fn row_to_dht_node(row: &rusqlite::Row) -> rusqlite::Result<NodeContact> {
-    let node_hex: String = row.get(0)?;
-    let node_bytes = hex::decode(&node_hex).map_err(|e| {
-        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
-    })?;
-    if node_bytes.len() != 20 {
-        return Err(rusqlite::Error::FromSqlConversionFailure(
-            0,
-            rusqlite::types::Type::Text,
-            Box::new(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "node id must be 20 bytes",
-            )),
-        ));
-    }
-    let mut id: NodeId = [0u8; 20];
-    id.copy_from_slice(&node_bytes);
-
-    let addr_text: String = row.get(1)?;
-    let addr = addr_text.parse::<SocketAddrV4>().map_err(|e| {
-        rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(e))
-    })?;
-    let last_seen_unix: i64 = row.get(2)?;
-    let age_secs = chrono::Utc::now()
-        .timestamp()
-        .saturating_sub(last_seen_unix)
-        .unsigned_abs();
-
-    Ok(NodeContact {
-        id,
-        addr,
-        last_seen: Instant::now()
-            .checked_sub(Duration::from_secs(age_secs))
-            .unwrap_or_else(Instant::now),
-        last_seen_unix,
-    })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_schema_version_is_current_and_future_versions_are_rejected() {
-        let store = Store::open_in_memory().unwrap();
-        let version: i64 = store
-            .conn
-            .lock()
-            .unwrap()
-            .pragma_query_value(None, "user_version", |row| row.get(0))
-            .unwrap();
-        assert_eq!(version, CURRENT_SCHEMA_VERSION);
-
-        let connection = Connection::open_in_memory().unwrap();
-        connection
-            .pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION + 1)
-            .unwrap();
-        let future = Store {
-            conn: Mutex::new(connection),
-        };
-        assert!(future.init_schema().is_err());
-    }
-
-    #[test]
-    fn test_commit_metadata_creates_and_atomically_replaces_files() {
-        let store = Store::open_in_memory().unwrap();
-        let hash = [0x91; 20];
-        store
-            .commit_metadata(
-                &hash,
-                "first",
-                16_384,
-                3,
-                &[("a".to_string(), 1), ("b".to_string(), 2)],
-            )
-            .unwrap();
-        assert!(store.get_torrent(&hash).unwrap().unwrap().metadata_complete);
-        assert_eq!(store.get_files(&hash).unwrap().len(), 2);
-
-        store
-            .commit_metadata(&hash, "second", 32_768, 4, &[("c".to_string(), 4)])
-            .unwrap();
-        assert_eq!(store.get_files(&hash).unwrap(), vec![("c".to_string(), 4)]);
-        assert_eq!(
-            store.get_torrent(&hash).unwrap().unwrap().name.as_deref(),
-            Some("second")
-        );
-    }
-
-    #[test]
-    fn test_commit_metadata_failure_rolls_back_torrent_and_files() {
-        let store = Store::open_in_memory().unwrap();
-        let hash = [0x92; 20];
-        store
-            .commit_metadata(&hash, "old", 16_384, 1, &[("old".to_string(), 1)])
-            .unwrap();
-        store
-            .execute_batch_for_test(
-                "CREATE TRIGGER reject_new_file BEFORE INSERT ON files
-                 WHEN NEW.path = 'reject'
-                 BEGIN SELECT RAISE(ABORT, 'forced failure'); END;",
-            )
-            .unwrap();
-        assert!(store
-            .commit_metadata(&hash, "new", 32_768, 2, &[("reject".to_string(), 2)],)
-            .is_err());
-        assert_eq!(
-            store.get_files(&hash).unwrap(),
-            vec![("old".to_string(), 1)]
-        );
-        assert_eq!(
-            store.get_torrent(&hash).unwrap().unwrap().name.as_deref(),
-            Some("old")
-        );
-    }
-
-    #[test]
-    fn test_stable_node_identity_is_reused() {
-        let store = Store::open_in_memory().unwrap();
-        let first = store.load_or_create_node_id().unwrap();
-        assert_eq!(store.load_or_create_node_id().unwrap(), first);
-    }
-
-    fn test_db() -> Store {
-        Store::open_in_memory().expect("should open in-memory db")
-    }
-
-    #[test]
-    fn test_insert_and_get_torrent() {
-        let store = test_db();
-        let info_hash: InfoHash = [1u8; 20];
-
-        let id = store
-            .upsert_torrent(info_hash, Some("test torrent".into()), 1024, 2, "dht")
-            .expect("should insert");
-        assert!(id > 0);
-
-        let torrent = store.get_torrent(&info_hash).expect("should get");
-        assert!(torrent.is_some());
-        let t = torrent.unwrap();
-        assert_eq!(t.name, Some("test torrent".to_string()));
-        assert_eq!(t.total_size, 1024);
-        assert_eq!(t.file_count, 2);
-        assert!(!t.metadata_complete);
-    }
-
-    #[test]
-    fn test_insert_duplicate_info_hash() {
-        let store = test_db();
-        let info_hash = [2u8; 20];
-
-        store.upsert_torrent(info_hash, None, 0, 0, "dht").unwrap();
-        store
-            .upsert_torrent(info_hash, Some("updated".into()), 2048, 3, "dht")
-            .unwrap();
-
-        let t = store.get_torrent(&info_hash).unwrap().unwrap();
-        assert_eq!(t.name, Some("updated".to_string()));
-        assert_eq!(t.total_size, 2048);
-    }
-
-    #[test]
-    fn test_search_torrents() {
-        let store = test_db();
-        let h1 = [1u8; 20];
-        let h2 = [2u8; 20];
-        let h3 = [3u8; 20];
-
-        store
-            .upsert_torrent(h1, Some("ubuntu iso".into()), 1_000_000, 1, "dht")
-            .unwrap();
-        store
-            .upsert_torrent(h2, Some("debian iso".into()), 2_000_000, 1, "dht")
-            .unwrap();
-        store
-            .upsert_torrent(h3, Some("fedora iso".into()), 3_000_000, 1, "dht")
-            .unwrap();
-
-        store
-            .mark_metadata_complete(&h1, "ubuntu iso", 262144, 1_000_000, 1)
-            .unwrap();
-        store
-            .insert_files(&h1, &[("ubuntu.iso".into(), 1_000_000)])
-            .unwrap();
-        store.refresh_torrent_fts(&h1).unwrap();
-
-        store
-            .mark_metadata_complete(&h2, "debian iso", 262144, 2_000_000, 1)
-            .unwrap();
-        store
-            .insert_files(&h2, &[("debian.iso".into(), 2_000_000)])
-            .unwrap();
-        store.refresh_torrent_fts(&h2).unwrap();
-
-        store
-            .mark_metadata_complete(&h3, "fedora iso", 262144, 3_000_000, 1)
-            .unwrap();
-        store
-            .insert_files(&h3, &[("fedora.iso".into(), 3_000_000)])
-            .unwrap();
-        store.refresh_torrent_fts(&h3).unwrap();
-
-        let results = store.search_torrents("ubuntu", 10, "last_seen").unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].name.as_deref(), Some("ubuntu iso"));
-
-        let results = store.search_torrents("iso", 10, "last_seen").unwrap();
-        assert_eq!(results.len(), 3);
-    }
-
-    #[test]
-    fn test_prune() {
-        let store = test_db();
-        store.upsert_torrent([1u8; 20], None, 0, 0, "dht").unwrap();
-
-        // Manually set last_seen to old
-        store
-            .conn
-            .lock()
-            .expect("store connection mutex poisoned")
-            .execute(
-                "UPDATE torrents SET last_seen = unixepoch() - 86400 * 100 WHERE info_hash = ?1",
-                rusqlite::params![hex::encode([1u8; 20])],
-            )
-            .unwrap();
-
-        let removed = store.prune_old_torrents(90).unwrap();
-        assert_eq!(removed, 1);
-    }
-
-    #[test]
-    fn test_stats() {
-        let store = test_db();
-        store
-            .upsert_torrent([1u8; 20], Some("a".into()), 1000, 1, "dht")
-            .unwrap();
-        store
-            .upsert_torrent([2u8; 20], Some("b".into()), 2000, 2, "dht")
-            .unwrap();
-
-        let stats = store.get_stats().unwrap();
-        assert!(stats.total_torrents >= 2);
-    }
-
-    #[test]
-    fn test_crawl_stat_insert() {
-        let store = test_db();
-        let id = store.insert_crawl_stat(100, 50, 25, 5).unwrap();
-        assert!(id > 0);
-
-        let history = store.get_crawl_history(10).unwrap();
-        assert_eq!(history.len(), 1);
-        assert_eq!(history[0].nodes_known, Some(100));
-        assert_eq!(history[0].metadata_fetched, Some(5));
-    }
-
-    #[test]
-    fn test_fk_cascade() {
-        let store = test_db();
-        let info_hash = [0xAAu8; 20];
-        let hash_hex = hex::encode(info_hash);
-
-        store
-            .upsert_torrent(info_hash, Some("test".into()), 1000, 1, "dht")
-            .unwrap();
-        store
-            .insert_files(
-                &info_hash,
-                &[
-                    ("file1.txt".to_string(), 500),
-                    ("file2.txt".to_string(), 500),
-                ],
-            )
-            .unwrap();
-
-        // Verify files exist
-        let count: i64 = store
-            .conn
-            .lock()
-            .expect("store connection mutex poisoned")
-            .query_row(
-                "SELECT COUNT(*) FROM files WHERE torrent_id = ?1",
-                rusqlite::params![hash_hex],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(count, 2);
-
-        // Delete torrent, verify files cascade
-        store
-            .conn
-            .lock()
-            .expect("store connection mutex poisoned")
-            .execute(
-                "DELETE FROM torrents WHERE info_hash = ?1",
-                rusqlite::params![hash_hex],
-            )
-            .unwrap();
-
-        let count: i64 = store
-            .conn
-            .lock()
-            .expect("store connection mutex poisoned")
-            .query_row(
-                "SELECT COUNT(*) FROM files WHERE torrent_id = ?1",
-                rusqlite::params![hash_hex],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(count, 0);
-    }
-
-    #[test]
-    fn test_upsert_preserves_files() {
-        let store = test_db();
-        let info_hash = [0xBBu8; 20];
-        let hash_hex = hex::encode(info_hash);
-
-        store
-            .upsert_torrent(info_hash, Some("test".into()), 1000, 1, "dht")
-            .unwrap();
-        store
-            .insert_files(&info_hash, &[("file1.txt".to_string(), 500)])
-            .unwrap();
-
-        store
-            .upsert_torrent(info_hash, Some("updated name".into()), 2000, 2, "dht")
-            .unwrap();
-
-        let count: i64 = store
-            .conn
-            .lock()
-            .expect("store connection mutex poisoned")
-            .query_row(
-                "SELECT COUNT(*) FROM files WHERE torrent_id = ?1",
-                rusqlite::params![hash_hex],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(count, 1, "files should survive upsert");
-
-        let t = store.get_torrent(&info_hash).unwrap().unwrap();
-        assert_eq!(t.name, Some("updated name".to_string()));
-        assert_eq!(t.total_size, 2000);
-    }
-
-    #[test]
-    fn test_invalid_stored_hash_returns_error() {
-        let store = test_db();
-        let bad_hex = "not_a_hex_string!!";
-        // Insert a row with an invalid info_hash directly
-        store
-            .conn
-            .lock()
-            .expect("store connection mutex poisoned")
-            .execute(
-                "INSERT INTO torrents (info_hash, name, first_seen, last_seen) VALUES (?1, ?2, unixepoch(), unixepoch())",
-                rusqlite::params![bad_hex, "bad hash test"],
-            )
-            .unwrap();
-        let result = store.conn.lock().expect("store connection mutex poisoned").query_row(
-            "SELECT info_hash, name, piece_length, total_size, file_count, source, first_seen, last_seen, last_attempt, metadata_complete FROM torrents WHERE info_hash = ?1",
-            rusqlite::params![bad_hex],
-            row_to_torrent,
-        );
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_open_migrates_old_schema_with_last_attempt() {
-        fn remove_old_schema_temp_files() {
-            if let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .is_some_and(|name| {
-                            name.starts_with("btfind-old-schema-") && name.contains(".sqlite")
-                        })
-                    {
-                        std::fs::remove_file(path).ok();
-                    }
+            let mut documents = Vec::new();
+            let mut bytes = 0;
+            for hash in &hashes {
+                let Some(document) = search_document(
+                    &mut *self.pool.acquire().await?,
+                    hash,
+                    limits.document_bytes,
+                )
+                .await?
+                else {
+                    continue;
+                };
+                let size = document.0.len() + document.1.len() + document.2.len() + 128;
+                if !documents.is_empty() && bytes + size > limits.batch_bytes {
+                    self.replace_search_documents(&documents).await?;
+                    rebuilt += documents.len();
+                    documents.clear();
+                    bytes = 0;
+                }
+                bytes += size;
+                documents.push(document);
+                if bytes >= limits.batch_bytes {
+                    self.replace_search_documents(&documents).await?;
+                    rebuilt += documents.len();
+                    documents.clear();
+                    bytes = 0;
                 }
             }
+            if !documents.is_empty() {
+                self.replace_search_documents(&documents).await?;
+                rebuilt += documents.len();
+            }
+            after = hashes.last().expect("nonempty search batch").clone();
+            tracing::info!(rebuilt, "rebuilt search documents");
         }
-
-        struct TempSqliteFiles {
-            path: std::path::PathBuf,
+    }
+    async fn replace_search_documents(
+        &self,
+        documents: &[(String, String, String)],
+    ) -> Result<(), Error> {
+        let mut tx = self.pool.begin().await?;
+        let mut delete =
+            QueryBuilder::<MySql>::new("DELETE FROM search_documents WHERE info_hash IN (");
+        let mut parameters = delete.separated(",");
+        for (hash, _, _) in documents {
+            parameters.push_bind(hash);
         }
-
-        impl Drop for TempSqliteFiles {
-            fn drop(&mut self) {
-                std::fs::remove_file(&self.path).ok();
-                std::fs::remove_file(format!("{}-wal", self.path.display())).ok();
-                std::fs::remove_file(format!("{}-shm", self.path.display())).ok();
-                remove_old_schema_temp_files();
+        delete.push(")");
+        delete.build().execute(&mut *tx).await?;
+        let mut insert =
+            QueryBuilder::<MySql>::new("INSERT INTO search_documents(info_hash,name,paths) ");
+        insert.push_values(documents, |mut row, (hash, name, paths)| {
+            row.push_bind(hash).push_bind(name).push_bind(paths);
+        });
+        insert.build().execute(&mut *tx).await?;
+        tx.commit().await
+    }
+    pub async fn analyze(&self) -> Result<(), Error> {
+        let rows = sqlx::query("ANALYZE TABLE torrents,files,search_documents,hash_jobs")
+            .fetch_all(&self.pool)
+            .await?;
+        for row in rows {
+            let kind: String = row.try_get(2)?;
+            let message: String = row.try_get(3)?;
+            if kind == "error" {
+                return Err(invalid(format!("ANALYZE TABLE failed: {message}")));
+            }
+            if kind == "warning" {
+                tracing::warn!("ANALYZE TABLE: {message}");
             }
         }
-
-        remove_old_schema_temp_files();
-        let temp = TempSqliteFiles {
-            path: std::env::temp_dir().join(format!(
-                "btfind-old-schema-{}.sqlite",
-                chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
-            )),
-        };
-        {
-            let conn = Connection::open(&temp.path).unwrap();
-            conn.execute_batch(
-                "
-                CREATE TABLE torrents (
-                    info_hash         TEXT PRIMARY KEY,
-                    name              TEXT,
-                    piece_length      INTEGER,
-                    total_size        INTEGER NOT NULL DEFAULT 0,
-                    file_count        INTEGER NOT NULL DEFAULT 0,
-                    source            TEXT NOT NULL DEFAULT 'unknown',
-                    first_seen        INTEGER NOT NULL,
-                    last_seen         INTEGER NOT NULL,
-                    metadata_complete INTEGER NOT NULL DEFAULT 0
-                );
-                INSERT INTO torrents (info_hash, name, first_seen, last_seen)
-                VALUES ('dddddddddddddddddddddddddddddddddddddddd', 'old', unixepoch(), unixepoch());
-                ",
-            )
-            .unwrap();
-        }
-
-        let store = Store::open(&temp.path).unwrap();
-        let torrent = store.get_torrent(&[0xDDu8; 20]).unwrap().unwrap();
-        assert_eq!(torrent.name.as_deref(), Some("old"));
-        assert_eq!(torrent.last_attempt, 0);
-    }
-
-    #[test]
-    fn test_insert_files_rolls_back_after_insert_error() {
-        let store = test_db();
-        let info_hash = [0xEEu8; 20];
-        let hash_hex = hex::encode(info_hash);
-        store
-            .upsert_torrent(info_hash, Some("test".into()), 1000, 1, "dht")
-            .unwrap();
-        store
-            .insert_files(&info_hash, &[("keep.txt".to_string(), 1000)])
-            .unwrap();
-        store
-            .conn
-            .lock()
-            .expect("store connection mutex poisoned")
-            .execute_batch(
-                "
-                CREATE TRIGGER fail_file_insert
-                BEFORE INSERT ON files
-                BEGIN
-                    SELECT RAISE(ABORT, 'forced insert failure');
-                END;
-                ",
-            )
-            .unwrap();
-
-        let result = store.insert_files(&info_hash, &[("replace.txt".to_string(), 1)]);
-        assert!(result.is_err());
-
-        let files: Vec<(String, i64)> = {
-            let conn = store.conn.lock().expect("store connection mutex poisoned");
-            let mut stmt = conn
-                .prepare("SELECT path, size FROM files WHERE torrent_id = ?1 ORDER BY path")
-                .unwrap();
-            stmt.query_map(rusqlite::params![hash_hex], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-            })
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap()
-        };
-        assert_eq!(files, vec![("keep.txt".to_string(), 1000)]);
-    }
-
-    #[test]
-    fn test_peer_retry_suppression_is_per_peer() {
-        let store = test_db();
-        let info_hash: InfoHash = [0xCDu8; 20];
-        let peer_a = "1.1.1.1:6881";
-        let peer_b = "8.8.8.8:51413";
-
-        store.upsert_torrent(info_hash, None, 0, 0, "dht").unwrap();
-
-        assert!(!store
-            .should_skip_peer_retry(&info_hash, peer_a, 24)
-            .unwrap());
-
-        store
-            .set_peer_attempt(&info_hash, peer_a, Some("connect error"))
-            .unwrap();
-
-        assert!(store
-            .should_skip_peer_retry(&info_hash, peer_a, 24)
-            .unwrap());
-        assert!(!store
-            .should_skip_peer_retry(&info_hash, peer_b, 24)
-            .unwrap());
-        assert!(!store.should_skip_peer_retry(&info_hash, peer_a, 0).unwrap());
-    }
-
-    #[test]
-    fn test_recent_dht_nodes_filters_and_prunes_stale_nodes() {
-        let store = test_db();
-        let fresh_id = [0x10u8; 20];
-        let stale_id = [0x20u8; 20];
-        let fresh_addr = "8.8.8.8:6881".parse().unwrap();
-        let stale_addr = "1.1.1.1:6881".parse().unwrap();
-
-        store.upsert_dht_node(&fresh_id, fresh_addr).unwrap();
-        store.upsert_dht_node(&stale_id, stale_addr).unwrap();
-        store
-            .execute_batch_for_test(&format!(
-                "UPDATE dht_nodes SET last_seen = unixepoch() - 7200 WHERE id = '{}'",
-                hex::encode(stale_id)
-            ))
-            .unwrap();
-
-        let nodes = store
-            .recent_dht_nodes(std::time::Duration::from_secs(3600), 10)
-            .unwrap();
-        assert_eq!(nodes.len(), 1);
-        assert_eq!(nodes[0].id, fresh_id);
-        assert_eq!(nodes[0].addr, fresh_addr);
-
-        let pruned = store
-            .prune_stale_dht_nodes(std::time::Duration::from_secs(3600))
-            .unwrap();
-
-        assert_eq!(pruned, 1);
-        assert_eq!(
-            store
-                .recent_dht_nodes(std::time::Duration::from_secs(10_000), 10)
-                .unwrap()
-                .len(),
-            1
-        );
-    }
-
-    #[test]
-    fn test_incomplete_info_hashes_returns_only_unfinished_rows() {
-        let store = test_db();
-        let incomplete_old = [0x31u8; 20];
-        let incomplete_new = [0x32u8; 20];
-        let complete = [0x33u8; 20];
-
-        store
-            .upsert_torrent(incomplete_old, None, 0, 0, "dht")
-            .unwrap();
-        store
-            .upsert_torrent(incomplete_new, None, 0, 0, "dht")
-            .unwrap();
-        store.upsert_torrent(complete, None, 0, 0, "dht").unwrap();
-        store
-            .mark_metadata_complete(&complete, "done", 16384, 1, 1)
-            .unwrap();
-
-        let hashes = store.incomplete_info_hashes(10).unwrap();
-
-        assert_eq!(hashes, vec![incomplete_new, incomplete_old]);
-    }
-
-    #[test]
-    fn test_prune_stale_peer_attempts_removes_old_attempts() {
-        let store = test_db();
-        let info_hash = [0x34u8; 20];
-        let fresh_peer = "8.8.8.8:6881";
-        let stale_peer = "1.1.1.1:6881";
-        store.upsert_torrent(info_hash, None, 0, 0, "dht").unwrap();
-        store
-            .set_peer_attempt(&info_hash, fresh_peer, Some("timeout"))
-            .unwrap();
-        store
-            .set_peer_attempt(&info_hash, stale_peer, Some("connect"))
-            .unwrap();
-        store
-            .execute_batch_for_test(&format!(
-                "UPDATE metadata_peer_attempts SET last_attempt = unixepoch() - 7200 WHERE peer_addr = '{}'",
-                stale_peer
-            ))
-            .unwrap();
-
-        let pruned = store
-            .prune_stale_peer_attempts(std::time::Duration::from_secs(3600))
-            .unwrap();
-
-        assert_eq!(pruned, 1);
-        assert!(!store
-            .should_skip_peer_retry(&info_hash, stale_peer, 24)
-            .unwrap());
-        assert!(store
-            .should_skip_peer_retry(&info_hash, fresh_peer, 24)
-            .unwrap());
-    }
-
-    #[test]
-    fn test_metadata_failure_counts_increment_by_reason() {
-        let store = test_db();
-
-        store.increment_metadata_failure("connect").unwrap();
-        store.increment_metadata_failure("connect").unwrap();
-        store.increment_metadata_failure("timeout").unwrap();
-
-        let counts = store.get_metadata_failure_counts().unwrap();
-
-        assert_eq!(
-            counts
-                .iter()
-                .map(|record| (record.reason.as_str(), record.count))
-                .collect::<Vec<_>>(),
-            vec![("connect", 2), ("timeout", 1)]
-        );
-    }
-
-    #[test]
-    fn test_runtime_batch_coalesces_events_in_one_commit() {
-        let store = test_db();
-        let node_id = [0x71u8; 20];
-        let info_hash = [0x72u8; 20];
-        let first_addr = "8.8.8.8:6881".parse().unwrap();
-        let latest_addr = "8.8.4.4:6881".parse().unwrap();
-        let events = vec![
-            CrawlStatsEvent::MetadataFetchFailed {
-                reason: crate::types::MetadataFailureReason::Connect,
-            },
-            CrawlStatsEvent::MetadataFetchFailed {
-                reason: crate::types::MetadataFailureReason::Connect,
-            },
-            CrawlStatsEvent::DhtNodeSeen {
-                id: node_id,
-                addr: first_addr,
-            },
-            CrawlStatsEvent::DhtNodeSeen {
-                id: node_id,
-                addr: latest_addr,
-            },
-            CrawlStatsEvent::SampleObserved {
-                info_hash,
-                node_id,
-                addr: first_addr,
-                round_id: 1,
-            },
-            CrawlStatsEvent::SampleObserved {
-                info_hash,
-                node_id,
-                addr: latest_addr,
-                round_id: 2,
-            },
-        ];
-
-        store
-            .persist_runtime_batch(
-                &events,
-                Some(RuntimeSnapshot {
-                    nodes_known: 3,
-                    queries_sent: 4,
-                    info_hashes_found: 5,
-                    metadata_fetched: 6,
-                }),
-            )
-            .unwrap();
-
-        assert_eq!(store.get_metadata_failure_counts().unwrap()[0].count, 2);
-        assert_eq!(
-            store.recent_dht_nodes(Duration::from_secs(60), 1).unwrap()[0].addr,
-            latest_addr
-        );
-        let conn = store.conn.lock().unwrap();
-        let sample: (i64, String, i64) = conn
-            .query_row(
-                "SELECT sample_count, sampling_addr, sweep_id
-                 FROM sample_observations WHERE info_hash = ?1",
-                params![hex::encode(info_hash)],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .unwrap();
-        assert_eq!(sample, (2, latest_addr.to_string(), 2));
-        let snapshot: (i64, i64, i64, i64) = conn
-            .query_row(
-                "SELECT nodes_known, queries_sent, info_hashes_found, metadata_fetched
-                 FROM crawl_stats",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .unwrap();
-        assert_eq!(snapshot, (3, 4, 5, 6));
-    }
-
-    #[test]
-    fn test_mark_metadata_complete_errors_for_unknown_hash() {
-        let store = test_db();
-        let result = store.mark_metadata_complete(&[0xFAu8; 20], "missing", 16384, 42, 1);
-
-        assert!(matches!(result, Err(rusqlite::Error::QueryReturnedNoRows)));
-    }
-
-    #[test]
-    fn test_fts5_available() {
-        let store = test_db();
-        let conn = store.conn.lock().expect("store connection mutex poisoned");
-        let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='torrent_fts'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(count, 1);
-    }
-
-    #[test]
-    fn test_fts_search_by_name() {
-        let store = test_db();
-        let info_hash = [0xA1u8; 20];
-
-        store
-            .upsert_torrent(
-                info_hash,
-                Some("Ubuntu 24.04 LTS".into()),
-                4_000_000_000,
-                1,
-                "dht",
-            )
-            .unwrap();
-        store
-            .mark_metadata_complete(&info_hash, "Ubuntu 24.04 LTS", 262144, 4_000_000_000, 1)
-            .unwrap();
-        store
-            .insert_files(&info_hash, &[("ubuntu-24.04.iso".into(), 4_000_000_000)])
-            .unwrap();
-        store.refresh_torrent_fts(&info_hash).unwrap();
-
-        let results = store.search_torrents("Ubuntu", 10, "rank").unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].name.as_deref(), Some("Ubuntu 24.04 LTS"));
-    }
-
-    #[test]
-    fn test_fts_search_by_file_path() {
-        let store = test_db();
-        let info_hash = [0xA2u8; 20];
-
-        store
-            .upsert_torrent(
-                info_hash,
-                Some("Some Movie".into()),
-                2_000_000_000,
-                1,
-                "dht",
-            )
-            .unwrap();
-        store
-            .mark_metadata_complete(&info_hash, "Some Movie", 262144, 2_000_000_000, 1)
-            .unwrap();
-        store
-            .insert_files(
-                &info_hash,
-                &[("movies/action/some_movie.mkv".into(), 2_000_000_000)],
-            )
-            .unwrap();
-        store.refresh_torrent_fts(&info_hash).unwrap();
-
-        let results = store.search_torrents("action", 10, "rank").unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].name.as_deref(), Some("Some Movie"));
-    }
-
-    #[test]
-    fn test_fts_search_empty_query_returns_all() {
-        let store = test_db();
-
-        for i in 0u8..5 {
-            let info_hash = [i; 20];
-            store
-                .upsert_torrent(info_hash, Some(format!("torrent_{i}")), 1000, 1, "dht")
-                .unwrap();
-        }
-
-        let results = store.search_torrents("", 10, "last_seen").unwrap();
-        assert!(results.len() >= 5);
-    }
-
-    #[test]
-    fn test_fts_search_rank_sort() {
-        let store = test_db();
-
-        let h1 = [0xB1u8; 20];
-        let h2 = [0xB2u8; 20];
-
-        store
-            .upsert_torrent(h1, Some("Ubuntu Server LTS".into()), 1_000_000, 1, "dht")
-            .unwrap();
-        store
-            .mark_metadata_complete(&h1, "Ubuntu Server LTS", 262144, 1_000_000, 1)
-            .unwrap();
-        store
-            .insert_files(&h1, &[("ubuntu.iso".into(), 1_000_000)])
-            .unwrap();
-        store.refresh_torrent_fts(&h1).unwrap();
-
-        store
-            .upsert_torrent(h2, Some("Debian Linux".into()), 1_000_000, 1, "dht")
-            .unwrap();
-        store
-            .mark_metadata_complete(&h2, "Debian Linux", 262144, 1_000_000, 1)
-            .unwrap();
-        store
-            .insert_files(&h2, &[("debian/ubuntu.iso".into(), 1_000_000)])
-            .unwrap();
-        store.refresh_torrent_fts(&h2).unwrap();
-
-        let results = store.search_torrents("ubuntu", 10, "rank").unwrap();
-        assert!(!results.is_empty());
-        assert_eq!(results[0].name.as_deref(), Some("Ubuntu Server LTS"));
-    }
-
-    #[test]
-    fn test_fts_rebuild_index() {
-        let store = test_db();
-        let info_hash = [0xC1u8; 20];
-
-        store
-            .upsert_torrent(info_hash, Some("Test Torrent".into()), 1_000, 1, "dht")
-            .unwrap();
-        store
-            .mark_metadata_complete(&info_hash, "Test Torrent", 262144, 1_000, 1)
-            .unwrap();
-        store
-            .insert_files(&info_hash, &[("test/file.dat".into(), 1_000)])
-            .unwrap();
-
-        store
-            .conn
-            .lock()
-            .expect("store connection mutex poisoned")
-            .execute("DELETE FROM torrent_fts", [])
-            .unwrap();
-
-        store.rebuild_search_index().unwrap();
-
-        let results = store.search_torrents("file", 10, "rank").unwrap();
-        assert_eq!(results.len(), 1);
-    }
-
-    #[test]
-    fn test_fts_search_invalid_query_does_not_panic() {
-        let store = test_db();
-        let result = store.search_torrents("\"", 10, "rank");
-        assert!(result.is_err() || result.is_ok());
-    }
-
-    #[test]
-    fn test_get_files() {
-        let store = test_db();
-        let info_hash = [0xD1u8; 20];
-
-        store
-            .upsert_torrent(info_hash, Some("test".into()), 1000, 2, "dht")
-            .unwrap();
-        store
-            .insert_files(
-                &info_hash,
-                &[("a.txt".to_string(), 500), ("b.txt".to_string(), 500)],
-            )
-            .unwrap();
-
-        let files = store.get_files(&info_hash).unwrap();
-        assert_eq!(files.len(), 2);
-        assert_eq!(files[0].0, "a.txt");
-        assert_eq!(files[1].0, "b.txt");
-    }
-
-    #[test]
-    fn test_search_files_page_paginates_and_orders_paths() {
-        let store = test_db();
-        let info_hash = [0xD2u8; 20];
-        store
-            .upsert_torrent(info_hash, Some("test".into()), 1000, 4, "dht")
-            .unwrap();
-        store
-            .insert_files(
-                &info_hash,
-                &[
-                    ("z-last.txt".into(), 4),
-                    ("Beta.txt".into(), 2),
-                    ("alpha.txt".into(), 1),
-                    ("beta.txt".into(), 3),
-                ],
-            )
-            .unwrap();
-
-        let first = store.search_files_page(&info_hash, "", 2, 0).unwrap();
-        assert_eq!(first.total, 4);
-        assert_eq!(first.results[0].0, "alpha.txt");
-        assert_eq!(first.results[1].0, "Beta.txt");
-
-        let second = store.search_files_page(&info_hash, "", 2, 2).unwrap();
-        assert_eq!(second.total, 4);
-        assert_eq!(second.results[0].0, "beta.txt");
-        assert_eq!(second.results[1].0, "z-last.txt");
-
-        let empty = store.search_files_page(&info_hash, "", 2, 8).unwrap();
-        assert_eq!(empty.total, 4);
-        assert!(empty.results.is_empty());
-    }
-
-    #[test]
-    fn test_search_files_page_uses_case_insensitive_literal_filter() {
-        let store = test_db();
-        let info_hash = [0xD3u8; 20];
-        store
-            .upsert_torrent(info_hash, Some("test".into()), 1000, 3, "dht")
-            .unwrap();
-        store
-            .insert_files(
-                &info_hash,
-                &[
-                    ("Video/EPISODE_100%.mkv".into(), 1),
-                    ("Video/episode_200.mkv".into(), 2),
-                    ("notes.txt".into(), 3),
-                ],
-            )
-            .unwrap();
-
-        let case_match = store
-            .search_files_page(&info_hash, "episode", 10, 0)
-            .unwrap();
-        assert_eq!(case_match.total, 2);
-
-        let literal = store.search_files_page(&info_hash, "_100%", 10, 0).unwrap();
-        assert_eq!(literal.total, 1);
-        assert_eq!(literal.results[0].0, "Video/EPISODE_100%.mkv");
-    }
-
-    #[test]
-    fn test_get_torrent_by_hex() {
-        let store = test_db();
-        let info_hash = [0xE1u8; 20];
-        let hash_hex = hex::encode(info_hash);
-
-        store
-            .upsert_torrent(info_hash, Some("test".into()), 1000, 1, "dht")
-            .unwrap();
-
-        let t = store.get_torrent_by_hex(&hash_hex).unwrap().unwrap();
-        assert_eq!(t.name.as_deref(), Some("test"));
-
-        let missing = store
-            .get_torrent_by_hex("ffffffffffffffffffffffffffffffffffffffff")
-            .unwrap();
-        assert!(missing.is_none());
-    }
-
-    #[test]
-    fn test_fts_search_punctuation_ubuntu_version() {
-        let store = test_db();
-        let hash = [0xA6u8; 20];
-        store
-            .upsert_torrent(hash, Some("ubuntu-24.04".into()), 1_000_000, 1, "dht")
-            .unwrap();
-        store
-            .mark_metadata_complete(&hash, "ubuntu-24.04", 262144, 1_000_000, 1)
-            .unwrap();
-        store
-            .insert_files(&hash, &[("ubuntu.iso".into(), 1_000_000)])
-            .unwrap();
-
-        let results = store.search_torrents("ubuntu-24.04", 10, "rank").unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].name.as_deref(), Some("ubuntu-24.04"));
-    }
-
-    #[test]
-    fn test_fts_search_punctuation_dot() {
-        let store = test_db();
-        let hash = [0xA7u8; 20];
-        store
-            .upsert_torrent(hash, Some("foo.bar".into()), 1_000_000, 1, "dht")
-            .unwrap();
-        store
-            .mark_metadata_complete(&hash, "foo.bar", 262144, 1_000_000, 1)
-            .unwrap();
-        store
-            .insert_files(&hash, &[("foo.bar.zip".into(), 1_000_000)])
-            .unwrap();
-
-        let results = store.search_torrents("foo.bar", 10, "rank").unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].name.as_deref(), Some("foo.bar"));
-    }
-
-    #[test]
-    fn test_fts_search_punctuation_plus() {
-        let store = test_db();
-        let hash = [0xA8u8; 20];
-        store
-            .upsert_torrent(hash, Some("C++ Primer".into()), 1_000_000, 1, "dht")
-            .unwrap();
-        store
-            .mark_metadata_complete(&hash, "C++ Primer", 262144, 1_000_000, 1)
-            .unwrap();
-        store
-            .insert_files(&hash, &[("cpp_primer.pdf".into(), 1_000_000)])
-            .unwrap();
-
-        let results = store.search_torrents("C++", 10, "rank").unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].name.as_deref(), Some("C++ Primer"));
-    }
-
-    #[test]
-    fn test_fts_search_punctuation_brackets() {
-        let store = test_db();
-        let hash = [0xA9u8; 20];
-        store
-            .upsert_torrent(hash, Some("[SubsPlease] Show".into()), 1_000_000, 1, "dht")
-            .unwrap();
-        store
-            .mark_metadata_complete(&hash, "[SubsPlease] Show", 262144, 1_000_000, 1)
-            .unwrap();
-        store
-            .insert_files(&hash, &[("[SubsPlease] Show.mkv".into(), 1_000_000)])
-            .unwrap();
-
-        let results = store.search_torrents("[SubsPlease]", 10, "rank").unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].name.as_deref(), Some("[SubsPlease] Show"));
-    }
-
-    #[test]
-    fn test_fts_search_punctuation_slash() {
-        let store = test_db();
-        let hash = [0x55u8; 20];
-        store
-            .upsert_torrent(hash, Some("Movie".into()), 1_000_000, 1, "dht")
-            .unwrap();
-        store
-            .mark_metadata_complete(&hash, "Movie", 262144, 1_000_000, 1)
-            .unwrap();
-        store
-            .insert_files(&hash, &[("dir/file.mkv".into(), 1_000_000)])
-            .unwrap();
-
-        let results = store.search_torrents("dir/file.mkv", 10, "rank").unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].name.as_deref(), Some("Movie"));
-    }
-
-    #[test]
-    fn test_fts_freshness_immediate_file_path_search() {
-        let store = test_db();
-        let hash = [0xABu8; 20];
-        store
-            .upsert_torrent(hash, Some("Fresh Test".into()), 1_000, 1, "dht")
-            .unwrap();
-        store
-            .mark_metadata_complete(&hash, "Fresh Test", 262144, 1_000, 1)
-            .unwrap();
-        store
-            .insert_files(&hash, &[("video/unique-file-token-xyz.mkv".into(), 1_000)])
-            .unwrap();
-
-        let results = store
-            .search_torrents("unique-file-token-xyz", 10, "rank")
-            .unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].name.as_deref(), Some("Fresh Test"));
-    }
-
-    #[test]
-    fn test_fts_freshness_file_path_replacement() {
-        let store = test_db();
-        let hash = [0xACu8; 20];
-        store
-            .upsert_torrent(hash, Some("Replace Test".into()), 1_000, 1, "dht")
-            .unwrap();
-        store
-            .mark_metadata_complete(&hash, "Replace Test", 262144, 1_000, 1)
-            .unwrap();
-        store
-            .insert_files(&hash, &[("old-token-abc.txt".into(), 500)])
-            .unwrap();
-
-        let results = store.search_torrents("old-token-abc", 10, "rank").unwrap();
-        assert_eq!(results.len(), 1);
-
-        store
-            .insert_files(&hash, &[("new-token-xyz.txt".into(), 500)])
-            .unwrap();
-
-        let results = store.search_torrents("new-token-xyz", 10, "rank").unwrap();
-        assert_eq!(results.len(), 1);
-
-        let results = store.search_torrents("old-token-abc", 10, "rank").unwrap();
-        assert_eq!(results.len(), 0);
-    }
-
-    #[test]
-    fn test_fts_prune_removes_stale_entries() {
-        let store = test_db();
-        let hash = [0xADu8; 20];
-        let hash_hex = hex::encode(hash);
-
-        store
-            .upsert_torrent(hash, Some("PruneFts".into()), 1_000, 1, "dht")
-            .unwrap();
-        store
-            .mark_metadata_complete(&hash, "PruneFts", 262144, 1_000, 1)
-            .unwrap();
-        store
-            .insert_files(&hash, &[("unique-stale-token-qwe.mkv".into(), 1_000)])
-            .unwrap();
-
-        let results = store
-            .search_torrents("unique-stale-token-qwe", 10, "rank")
-            .unwrap();
-        assert_eq!(results.len(), 1);
-
-        store
-            .conn
-            .lock()
-            .expect("store connection mutex poisoned")
-            .execute(
-                "UPDATE torrents SET last_seen = unixepoch() - 86400 * 100 WHERE info_hash = ?1",
-                rusqlite::params![hash_hex],
-            )
-            .unwrap();
-
-        store.prune_old_torrents(90).unwrap();
-
-        let results = store
-            .search_torrents("unique-stale-token-qwe", 10, "rank")
-            .unwrap();
-        assert_eq!(results.len(), 0);
-    }
-
-    #[test]
-    fn test_fts_rank_weights_name_higher_than_paths() {
-        let store = test_db();
-        let h1 = [0xAEu8; 20];
-        let h2 = [0xAFu8; 20];
-
-        store
-            .upsert_torrent(h1, Some("ubuntu release".into()), 1_000_000, 1, "dht")
-            .unwrap();
-        store
-            .mark_metadata_complete(&h1, "ubuntu release", 262144, 1_000_000, 1)
-            .unwrap();
-        store
-            .insert_files(&h1, &[("release.iso".into(), 1_000_000)])
-            .unwrap();
-
-        store
-            .upsert_torrent(h2, Some("random release".into()), 1_000_000, 1, "dht")
-            .unwrap();
-        store
-            .mark_metadata_complete(&h2, "random release", 262144, 1_000_000, 1)
-            .unwrap();
-        store
-            .insert_files(&h2, &[("ubuntu.iso".into(), 1_000_000)])
-            .unwrap();
-
-        let results = store.search_torrents("ubuntu", 10, "rank").unwrap();
-        assert_eq!(results.len(), 2);
-        assert_eq!(
-            results[0].name.as_deref(),
-            Some("ubuntu release"),
-            "name match should rank higher than path match"
-        );
-    }
-
-    #[test]
-    fn test_filtered_search_complete_only_applies_before_limit() {
-        let store = test_db();
-        let incomplete = [0xC0u8; 20];
-        let complete = [0xC1u8; 20];
-
-        store
-            .upsert_torrent(incomplete, Some("alpha unknown".into()), 999, 0, "dht")
-            .unwrap();
-        store
-            .upsert_torrent(complete, Some("alpha complete".into()), 1_000, 1, "dht")
-            .unwrap();
-        store
-            .mark_metadata_complete(&complete, "alpha complete", 262144, 1_000, 1)
-            .unwrap();
-        store
-            .insert_files(&complete, &[("alpha/file.dat".into(), 1_000)])
-            .unwrap();
-
-        let results = store
-            .search_torrents_filtered(
-                "alpha",
-                1,
-                "last_seen",
-                TorrentSearchFilters {
-                    complete_only: true,
-                    min_size: None,
-                    max_size: None,
-                },
-            )
-            .unwrap();
-
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].name.as_deref(), Some("alpha complete"));
-        assert!(results[0].metadata_complete);
-    }
-
-    #[test]
-    fn test_filtered_empty_search_complete_only_applies_before_limit() {
-        let store = test_db();
-        let incomplete = [0xC5u8; 20];
-        let complete = [0xC6u8; 20];
-
-        store
-            .upsert_torrent(incomplete, Some("unknown".into()), 999, 0, "dht")
-            .unwrap();
-        store
-            .upsert_torrent(complete, Some("complete".into()), 1_000, 1, "dht")
-            .unwrap();
-        store
-            .mark_metadata_complete(&complete, "complete", 262144, 1_000, 1)
-            .unwrap();
-        store
-            .insert_files(&complete, &[("file.dat".into(), 1_000)])
-            .unwrap();
-
-        let results = store
-            .search_torrents_filtered(
-                "",
-                1,
-                "last_seen",
-                TorrentSearchFilters {
-                    complete_only: true,
-                    min_size: None,
-                    max_size: None,
-                },
-            )
-            .unwrap();
-
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].name.as_deref(), Some("complete"));
-        assert!(results[0].metadata_complete);
-    }
-
-    #[test]
-    fn test_filtered_search_page_returns_total_and_offset_results() {
-        let store = test_db();
-
-        for (idx, name) in ["alpha", "bravo", "charlie"].into_iter().enumerate() {
-            let hash = [0xD5u8 + idx as u8; 20];
-            store
-                .upsert_torrent(hash, Some(name.into()), 1_000, 1, "dht")
-                .unwrap();
-            store
-                .mark_metadata_complete(&hash, name, 262144, 1_000, 1)
-                .unwrap();
-            store
-                .insert_files(&hash, &[("file.dat".into(), 1_000)])
-                .unwrap();
-        }
-
-        let page = store
-            .search_torrents_filtered_page(
-                "",
-                2,
-                1,
-                "name",
-                TorrentSearchFilters {
-                    complete_only: true,
-                    min_size: None,
-                    max_size: None,
-                },
-            )
-            .unwrap();
-
-        assert_eq!(page.total, 3);
-        assert_eq!(page.results.len(), 2);
-        assert_eq!(page.results[0].name.as_deref(), Some("bravo"));
-        assert_eq!(page.results[1].name.as_deref(), Some("charlie"));
-    }
-
-    #[test]
-    fn test_filtered_search_size_range() {
-        let store = test_db();
-        let small = [0xC2u8; 20];
-        let medium = [0xC3u8; 20];
-        let large = [0xC4u8; 20];
-
-        for (hash, name, size) in [
-            (small, "linux small", 500),
-            (medium, "linux medium", 2_000),
-            (large, "linux large", 5_000),
-        ] {
-            store
-                .upsert_torrent(hash, Some(name.into()), size, 1, "dht")
-                .unwrap();
-            store
-                .mark_metadata_complete(&hash, name, 262144, size, 1)
-                .unwrap();
-            store
-                .insert_files(&hash, &[("linux/file.bin".into(), size)])
-                .unwrap();
-        }
-
-        let results = store
-            .search_torrents_filtered(
-                "linux",
-                10,
-                "total_size",
-                TorrentSearchFilters {
-                    complete_only: true,
-                    min_size: Some(1_000),
-                    max_size: Some(3_000),
-                },
-            )
-            .unwrap();
-
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].name.as_deref(), Some("linux medium"));
-    }
-
-    #[test]
-    fn test_search_short_query_like_name() {
-        let store = test_db();
-        let hash = [0xB0u8; 20];
-        store
-            .upsert_torrent(hash, Some("aBc".into()), 1_000, 1, "dht")
-            .unwrap();
-        store
-            .mark_metadata_complete(&hash, "aBc", 262144, 1_000, 1)
-            .unwrap();
-        store
-            .insert_files(&hash, &[("file.dat".into(), 1_000)])
-            .unwrap();
-
-        let results = store.search_torrents("a", 10, "last_seen").unwrap();
-        assert_eq!(results.len(), 1);
-    }
-
-    #[test]
-    fn test_search_short_query_like_path() {
-        let store = test_db();
-        let hash = [0x5Cu8; 20];
-        store
-            .upsert_torrent(hash, Some("Some Movie".into()), 1_000, 1, "dht")
-            .unwrap();
-        store
-            .mark_metadata_complete(&hash, "Some Movie", 262144, 1_000, 1)
-            .unwrap();
-        store
-            .insert_files(&hash, &[("xy/video.mkv".into(), 1_000)])
-            .unwrap();
-
-        let results = store.search_torrents("xy", 10, "last_seen").unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].name.as_deref(), Some("Some Movie"));
-    }
-
-    #[test]
-    fn test_search_literal_wildcard_percent() {
-        let store = test_db();
-        let hash_pct = [0x5Du8; 20];
-        let hash_reg = [0x5Eu8; 20];
-
-        store
-            .upsert_torrent(hash_pct, Some("100% done".into()), 1_000, 1, "dht")
-            .unwrap();
-        store
-            .mark_metadata_complete(&hash_pct, "100% done", 262144, 1_000, 1)
-            .unwrap();
-        store
-            .insert_files(&hash_pct, &[("file.dat".into(), 1_000)])
-            .unwrap();
-
-        store
-            .upsert_torrent(hash_reg, Some("other thing".into()), 1_000, 1, "dht")
-            .unwrap();
-        store
-            .mark_metadata_complete(&hash_reg, "other thing", 262144, 1_000, 1)
-            .unwrap();
-        store
-            .insert_files(&hash_reg, &[("data.bin".into(), 1_000)])
-            .unwrap();
-
-        let results = store.search_torrents("%", 10, "last_seen").unwrap();
-        assert_eq!(
-            results.len(),
-            1,
-            "should match only the torrent with literal %"
-        );
-        assert_eq!(results[0].name.as_deref(), Some("100% done"));
-    }
-
-    #[test]
-    fn test_search_literal_wildcard_underscore() {
-        let store = test_db();
-        let hash_us = [0xB4u8; 20];
-        let hash_reg = [0xB5u8; 20];
-
-        store
-            .upsert_torrent(hash_us, Some("my_file".into()), 1_000, 1, "dht")
-            .unwrap();
-        store
-            .mark_metadata_complete(&hash_us, "my_file", 262144, 1_000, 1)
-            .unwrap();
-        store
-            .insert_files(&hash_us, &[("data.bin".into(), 1_000)])
-            .unwrap();
-
-        store
-            .upsert_torrent(hash_reg, Some("another".into()), 1_000, 1, "dht")
-            .unwrap();
-        store
-            .mark_metadata_complete(&hash_reg, "another", 262144, 1_000, 1)
-            .unwrap();
-        store
-            .insert_files(&hash_reg, &[("file.bin".into(), 1_000)])
-            .unwrap();
-
-        let results = store.search_torrents("_", 10, "last_seen").unwrap();
-        assert_eq!(
-            results.len(),
-            1,
-            "should match only the torrent with literal _"
-        );
-        assert_eq!(results[0].name.as_deref(), Some("my_file"));
+        Ok(())
     }
 }
+async fn lock_totals(conn: &mut MySqlConnection) -> Result<(), Error> {
+    sqlx::query("SELECT id FROM catalog_totals WHERE id=1 FOR UPDATE")
+        .fetch_one(conn)
+        .await?;
+    Ok(())
+}
+async fn discover(
+    conn: &mut MySqlConnection,
+    hash: &InfoHash,
+    source: &str,
+    peers: bool,
+) -> Result<(), Error> {
+    let h = hex::encode(hash);
+    let exists: Option<String> =
+        sqlx::query_scalar("SELECT info_hash FROM torrents WHERE info_hash=?")
+            .bind(&h)
+            .fetch_optional(&mut *conn)
+            .await?;
+    sqlx::query("INSERT INTO torrents(info_hash,source,first_seen,last_seen) VALUES (?,?,?,?) ON DUPLICATE KEY UPDATE source=VALUES(source),last_seen=VALUES(last_seen)").bind(&h).bind(source).bind(now()).bind(now()).execute(&mut *conn).await?;
+    if exists.is_none() {
+        sqlx::query("UPDATE catalog_totals SET total_torrents=total_torrents+1 WHERE id=1")
+            .execute(&mut *conn)
+            .await?;
+    }
+    sqlx::query("INSERT INTO hash_jobs(info_hash,status,last_new_peer_at,discovery_sources,updated_at) VALUES (?,'queued',?,?,?) ON DUPLICATE KEY UPDATE status=CASE WHEN status IN ('complete','invalid','unsupported') THEN status WHEN status='waiting_peers' AND VALUES(last_new_peer_at) IS NULL THEN status ELSE 'queued' END,next_attempt_at=IF(VALUES(last_new_peer_at) IS NULL,next_attempt_at,0),last_new_peer_at=COALESCE(VALUES(last_new_peer_at),last_new_peer_at),discovery_sources=IF(FIND_IN_SET(VALUES(discovery_sources),discovery_sources)>0,discovery_sources,CONCAT_WS(',',NULLIF(discovery_sources,''),VALUES(discovery_sources))),updated_at=VALUES(updated_at)").bind(&h).bind(peers.then_some(now())).bind(source).bind(now()).execute(&mut *conn).await?;
+    Ok(())
+}
+const SEARCH_DOCUMENT_BYTES: usize = 16 * 1024 * 1024;
+const SEARCH_BATCH_BYTES: usize = 1024 * 1024;
+const SEARCH_PACKET_HEADROOM: u64 = 16 * 1024;
+
+struct SearchLimits {
+    document_bytes: usize,
+    batch_bytes: usize,
+}
+impl SearchLimits {
+    fn for_packet(packet: u64) -> Result<Self, Error> {
+        let document_bytes = packet
+            .saturating_sub(SEARCH_PACKET_HEADROOM)
+            .min(SEARCH_DOCUMENT_BYTES as u64) as usize;
+        if document_bytes < 1024 {
+            return Err(invalid(
+                "max_allowed_packet is too small for search indexing",
+            ));
+        }
+        Ok(Self {
+            document_bytes,
+            batch_bytes: document_bytes.min(SEARCH_BATCH_BYTES),
+        })
+    }
+    async fn load(conn: &mut MySqlConnection) -> Result<Self, Error> {
+        let packet: u64 = sqlx::query_scalar("SELECT @@max_allowed_packet")
+            .fetch_one(conn)
+            .await?;
+        Self::for_packet(packet)
+    }
+}
+#[derive(Debug)]
+struct SearchDocumentTooLarge {
+    hash: String,
+    budget: usize,
+}
+impl std::fmt::Display for SearchDocumentTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "search document {} exceeds document byte limit {}; document was not truncated",
+            self.hash, self.budget
+        )
+    }
+}
+impl std::error::Error for SearchDocumentTooLarge {}
+
+pub fn is_unsupported_search_document(error: &Error) -> bool {
+    matches!(error, Error::Encode(cause) if cause.is::<SearchDocumentTooLarge>())
+}
+fn document_too_large(hash: &str, budget: usize) -> Error {
+    Error::Encode(Box::new(SearchDocumentTooLarge {
+        hash: hash.to_owned(),
+        budget,
+    }))
+}
+fn append_search_text(output: &mut String, input: &str, budget: usize) -> bool {
+    let mut separator = !output.is_empty();
+    for c in input.nfkc() {
+        if !c.is_alphanumeric() {
+            separator = !output.is_empty();
+            continue;
+        }
+        let size = c.len_utf8() + usize::from(separator);
+        if output.len() + size > budget {
+            return false;
+        }
+        if separator {
+            output.push(' ');
+            separator = false;
+        }
+        output.push(c);
+    }
+    true
+}
+async fn search_document(
+    conn: &mut MySqlConnection,
+    hash: &str,
+    budget: usize,
+) -> Result<Option<(String, String, String)>, Error> {
+    let row = sqlx::query("SELECT CASE WHEN metadata_complete=1 THEN OCTET_LENGTH(name) ELSE 0 END AS bytes, CASE WHEN metadata_complete=1 AND OCTET_LENGTH(name)<=? THEN name ELSE NULL END AS name FROM torrents WHERE info_hash=?")
+        .bind(budget as u64).bind(hash).fetch_one(&mut *conn).await?;
+    let raw_bytes: Option<i64> = row.try_get("bytes")?;
+    let too_large = || document_too_large(hash, budget);
+    if raw_bytes.unwrap_or(0) > budget as i64 {
+        return Err(too_large());
+    }
+    let raw_name: Option<&str> = row.try_get("name")?;
+    let mut present = raw_name.is_some();
+    let content_budget = budget.checked_sub(hash.len() + 128).ok_or_else(too_large)?;
+    let mut name = String::new();
+    if !append_search_text(&mut name, raw_name.unwrap_or_default(), content_budget) {
+        return Err(too_large());
+    }
+    drop(row);
+    let mut paths = String::new();
+    let mut rows = sqlx::query("SELECT CASE WHEN OCTET_LENGTH(path)<=? THEN path ELSE NULL END AS path FROM files WHERE torrent_id=? ORDER BY id")
+        .bind(budget as u64).bind(hash).fetch(conn);
+    while let Some(row) = rows.try_next().await? {
+        present = true;
+        let path: Option<&str> = row.try_get("path")?;
+        if !append_search_text(
+            &mut paths,
+            path.ok_or_else(too_large)?,
+            content_budget - name.len(),
+        ) {
+            return Err(too_large());
+        }
+    }
+    Ok(present.then(|| (hash.to_owned(), name, paths)))
+}
+async fn refresh_search(conn: &mut MySqlConnection, h: &str) -> Result<(), Error> {
+    let limits = SearchLimits::load(conn).await?;
+    match search_document(conn, h, limits.document_bytes).await? {
+        Some((hash, name, paths)) => {
+            sqlx::query("INSERT INTO search_documents VALUES (?,?,?) ON DUPLICATE KEY UPDATE name=VALUES(name),paths=VALUES(paths)")
+                .bind(hash).bind(name).bind(paths).execute(conn).await?;
+        }
+        None => {
+            sqlx::query("DELETE FROM search_documents WHERE info_hash=?")
+                .bind(h)
+                .execute(conn)
+                .await?;
+        }
+    }
+    Ok(())
+}
+pub fn normalize_search(s: &str) -> String {
+    s.nfkc()
+        .collect::<String>()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+pub fn search_query(s: &str) -> Result<String, String> {
+    if s.trim().is_empty() {
+        return Ok(String::new());
+    }
+    if s.len() > 1024 {
+        return Err("search query is too long (maximum 1024 bytes)".into());
+    }
+    let normalized = normalize_search(s);
+    let terms: Vec<_> = normalized.split_whitespace().collect();
+    if terms.is_empty() || terms.iter().any(|s| s.chars().count() < 2) {
+        return Err("use at least two letters or characters in each search term".into());
+    }
+    Ok(terms
+        .iter()
+        .map(|s| format!("+\"{s}\""))
+        .collect::<Vec<_>>()
+        .join(" "))
+}
+fn row_to_torrent(r: &MySqlRow) -> Result<TorrentRecord, Error> {
+    Ok(TorrentRecord {
+        info_hash: decode_hash(r.try_get("info_hash")?)?,
+        name: r.try_get("name")?,
+        piece_length: r.try_get("piece_length")?,
+        total_size: r.try_get("total_size")?,
+        file_count: r.try_get("file_count")?,
+        source: r.try_get("source")?,
+        first_seen: r.try_get("first_seen")?,
+        last_seen: r.try_get("last_seen")?,
+        last_attempt: r.try_get("last_attempt")?,
+        metadata_complete: r.try_get("metadata_complete")?,
+    })
+}
+fn retryable(e: &Error) -> bool {
+    matches!(e,Error::Database(d) if matches!(d.code().as_deref(),Some("40001")))
+        || matches!(e, Error::Database(d) if d.try_downcast_ref::<sqlx::mysql::MySqlDatabaseError>().is_some_and(|e| e.number() == 1205))
+        || matches!(e, Error::Io(_) | Error::PoolTimedOut)
+}
+async fn backoff(attempt: u32) {
+    tokio::time::sleep(Duration::from_millis(100 * (1 << attempt))).await;
+}
+
+#[cfg(test)]
+mod tests;

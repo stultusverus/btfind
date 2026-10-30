@@ -6,7 +6,6 @@ const state = {
     results: [],
     expandedHash: null,
     details: new Map(),
-    total: 0,
     statsTotal: null,
     limit: 50,
     offset: 0,
@@ -55,7 +54,7 @@ async function loadStats() {
             statCard('Files', formatNumber(data.total_files)),
             statCard('Total size', formatSize(data.total_size)),
         ].join('');
-        if (state.total === 0 && state.results.length === 0 && !state.searchBusy) renderResults();
+        if (state.results.length === 0 && !state.searchBusy) renderResults();
     } catch (error) {
         els.stats.innerHTML = statCard('Statistics', 'Unavailable');
         console.error(error);
@@ -71,7 +70,7 @@ function statCard(label, value) {
 function loadControlsFromUrl() {
     const params = new URLSearchParams(window.location.search);
     const query = params.get('q') || '';
-    const rankEligible = Array.from(query.trim()).length >= 3;
+    const rankEligible = Array.from(query.trim()).length >= 2;
     const requestedSort = params.get('sort');
     const sort = SEARCH_SORTS.has(requestedSort) ? requestedSort : (rankEligible ? 'rank' : 'last_seen');
     const limit = Number(params.get('limit'));
@@ -98,7 +97,7 @@ function readNonNegativeInteger(value, fallback) {
 }
 
 function updateSortAvailability(autoSelect) {
-    const eligible = Array.from(els.query.value.trim()).length >= 3;
+    const eligible = Array.from(els.query.value.trim()).length >= 2;
     const rankOption = els.sort.querySelector('option[value="rank"]');
     rankOption.disabled = !eligible;
     if (!eligible && els.sort.value === 'rank') els.sort.value = 'last_seen';
@@ -141,7 +140,7 @@ function syncUrl(request, mode) {
 }
 
 async function search(options = {}) {
-    const { history = 'none', recoverPage = true } = options;
+    const { history = 'none' } = options;
     let request;
     try {
         request = buildSearchRequest();
@@ -166,13 +165,7 @@ async function search(options = {}) {
         const data = await resp.json();
         if (controller !== state.searchController) return;
 
-        if (recoverPage && data.results.length === 0 && data.total > 0 && state.offset > 0) {
-            state.offset = Math.floor((data.total - 1) / data.limit) * data.limit;
-            return search({ history: 'replace', recoverPage: false });
-        }
-
         state.results = data.results;
-        state.total = data.total;
         state.limit = data.limit;
         state.offset = data.offset;
         state.hasNext = data.has_next;
@@ -233,7 +226,7 @@ function filterChip(name, label) {
 function renderResults() {
     if (state.results.length === 0) {
         if (state.statsTotal === 0) renderEmpty('The database does not contain any torrents yet.');
-        else if (state.total === 0) renderEmpty('No torrents match this search.');
+        else if (state.results.length === 0) renderEmpty('No torrents match this search.');
         else renderEmpty('No results to display.');
         return;
     }
@@ -293,7 +286,7 @@ function filePanel(infoHash, detail) {
     const error = detail.filesError
         ? `<div class="status error">${escapeHtml(detail.filesError)}</div><button class="mini" type="button" data-files-retry="${escapeAttr(infoHash)}">Retry</button>`
         : '';
-    const shown = Math.min(files.length, detail.fileTotal || 0);
+    const shown = files.length;
     return `<form class="file-search" data-file-search="${escapeAttr(infoHash)}">
             <label class="visually-hidden" for="file-query-${escapeAttr(infoHash)}">Filter file paths</label>
             <div class="file-toolbar">
@@ -304,7 +297,7 @@ function filePanel(infoHash, detail) {
         ${error}
         <div class="file-list" aria-busy="${detail.filesLoading}">${list}</div>
         <div class="file-footer">
-            <span>Showing ${escapeHtml(formatNumber(shown))} of ${escapeHtml(formatNumber(detail.fileTotal || 0))} files</span>
+            <span>Showing ${escapeHtml(formatNumber(shown))} files</span>
             ${detail.hasMoreFiles ? `<button class="mini" type="button" data-files-more="${escapeAttr(infoHash)}"${detail.filesLoading ? ' disabled' : ''}>Show more</button>` : ''}
         </div>`;
 }
@@ -317,7 +310,7 @@ async function loadDetail(infoHash, force = false) {
     const existing = state.details.get(infoHash);
     if (existing && !force && (existing.loading || existing.summary)) return;
     if (existing && existing.fileController) existing.fileController.abort();
-    const detail = { loading: true, error: null, summary: null, files: [], fileTotal: 0, fileOffset: 0, fileQuery: '', filesLoading: false, filesError: null, hasMoreFiles: false, fileController: null };
+    const detail = { loading: true, error: null, summary: null, files: [], fileOffset: 0, fileQuery: '', filesLoading: false, filesError: null, hasMoreFiles: false, fileController: null };
     state.details.set(infoHash, detail);
     renderResults();
     try {
@@ -343,7 +336,6 @@ async function loadFiles(infoHash, reset) {
     if (reset) {
         detail.files = [];
         detail.fileOffset = 0;
-        detail.fileTotal = 0;
         detail.hasMoreFiles = false;
     }
     detail.filesLoading = true;
@@ -358,7 +350,6 @@ async function loadFiles(infoHash, reset) {
         const data = await resp.json();
         if (controller !== detail.fileController) return;
         detail.files = reset ? data.files : detail.files.concat(data.files);
-        detail.fileTotal = data.total;
         detail.fileOffset = data.offset + data.files.length;
         detail.hasMoreFiles = data.has_next;
     } catch (error) {
@@ -373,24 +364,25 @@ async function loadFiles(infoHash, reset) {
 }
 
 function renderPager() {
-    if (state.total === 0) {
+    if (state.results.length === 0 && state.offset === 0) {
         els.pager.hidden = true;
         return;
     }
     const start = state.offset + 1;
     const end = state.offset + state.results.length;
     els.pager.hidden = false;
-    els.pagerStatus.textContent = `Showing ${formatNumber(start)}–${formatNumber(end)} of ${formatNumber(state.total)}`;
+    els.pagerStatus.textContent = state.results.length
+        ? `Showing ${formatNumber(start)}–${formatNumber(end)}`
+        : 'No results on this page';
     els.prevPage.disabled = state.searchBusy || state.offset === 0;
     els.nextPage.disabled = state.searchBusy || !state.hasNext;
 }
 
 function resultStatus() {
-    if (state.total === 0) return 'No complete torrents found.';
+    if (state.results.length === 0) return 'No complete torrents found.';
     const currentPage = Math.floor(state.offset / state.limit) + 1;
-    const pageCount = Math.max(1, Math.ceil(state.total / state.limit));
     const labels = { rank: 'relevance', last_seen: 'recently seen', first_seen: 'recently added', total_size: 'largest', name: 'name' };
-    return `Page ${formatNumber(currentPage)} of ${formatNumber(pageCount)}, sorted by ${labels[state.effectiveSort] || state.effectiveSort}.`;
+    return `Page ${formatNumber(currentPage)}, sorted by ${labels[state.effectiveSort] || state.effectiveSort}.`;
 }
 
 function renderEmpty(message) {

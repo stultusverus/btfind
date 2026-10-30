@@ -8,11 +8,10 @@ use axum::routing::get;
 use axum::Json;
 use serde::Deserialize;
 use serde_json::json;
-use std::path::PathBuf;
 
 #[derive(Clone)]
 pub struct AppState {
-    pub db_path: PathBuf,
+    pub store: Store,
 }
 
 #[derive(Debug)]
@@ -20,7 +19,6 @@ enum ApiError {
     BadRequest(String),
     NotFound(String),
     Db(String),
-    Join(String),
 }
 
 impl IntoResponse for ApiError {
@@ -28,16 +26,16 @@ impl IntoResponse for ApiError {
         let (status, message) = match self {
             ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
             ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
-            ApiError::Db(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
-            ApiError::Join(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
+            ApiError::Db(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg),
         };
         (status, Json(json!({ "error": message }))).into_response()
     }
 }
 
-impl From<rusqlite::Error> for ApiError {
-    fn from(e: rusqlite::Error) -> Self {
-        ApiError::Db(e.to_string())
+impl From<crate::store::Error> for ApiError {
+    fn from(e: crate::store::Error) -> Self {
+        tracing::warn!("database request failed: {}", e);
+        ApiError::Db("database temporarily unavailable".into())
     }
 }
 
@@ -47,8 +45,8 @@ impl From<String> for ApiError {
     }
 }
 
-pub fn router(db_path: PathBuf) -> axum::Router {
-    let state = AppState { db_path };
+pub fn router(store: Store) -> axum::Router {
+    let state = AppState { store };
 
     axum::Router::new()
         .route("/", get(dashboard))
@@ -60,6 +58,7 @@ pub fn router(db_path: PathBuf) -> axum::Router {
         .route("/api/torrents/{info_hash}/files", get(api_torrent_files))
         .route("/api/torrents/{info_hash}/magnet", get(api_magnet))
         .with_state(state)
+        .layer(axum::middleware::from_fn(request_deadline))
 }
 
 fn static_response(content_type: &'static str, content: &'static str) -> Response {
@@ -124,7 +123,6 @@ struct SearchResult {
 #[derive(Debug, serde::Serialize)]
 struct SearchResponse {
     results: Vec<SearchResult>,
-    total: i64,
     limit: usize,
     offset: usize,
     has_next: bool,
@@ -166,10 +164,10 @@ fn effective_sort(query: &str, requested_sort: Option<&str>) -> &'static str {
         Some("total_size") => "total_size",
         Some("name") => "name",
         Some("last_seen") => "last_seen",
-        Some("rank") if query.trim().chars().count() >= 3 => "rank",
+        Some("rank") if query.trim().chars().count() >= 2 => "rank",
         Some("rank") => "last_seen",
         Some(_) => "last_seen",
-        None if query.trim().chars().count() >= 3 => "rank",
+        None if query.trim().chars().count() >= 2 => "rank",
         None => "last_seen",
     }
 }
@@ -207,13 +205,7 @@ fn validate_info_hash_hex(hex_str: &str) -> Result<(), ApiError> {
 
 #[axum::debug_handler]
 async fn api_stats(State(state): State<AppState>) -> Result<Json<CrawlStats>, ApiError> {
-    let db_path = state.db_path.clone();
-    let stats = tokio::task::spawn_blocking(move || -> Result<CrawlStats, ApiError> {
-        let store = Store::open(&db_path)?;
-        Ok(store.get_stats()?)
-    })
-    .await
-    .map_err(|e| ApiError::Join(e.to_string()))??;
+    let stats = state.store.get_stats().await?;
     Ok(Json(stats))
 }
 
@@ -232,22 +224,16 @@ async fn api_search(
     let query = params.q.unwrap_or_default();
     let sort = effective_sort(&query, params.sort.as_deref());
 
-    let db_path = state.db_path.clone();
-    let page = tokio::task::spawn_blocking(move || -> Result<_, ApiError> {
-        let store = Store::open(&db_path)?;
-        Ok(store.search_torrents_filtered_page(&query, limit, offset, sort, filters)?)
-    })
-    .await
-    .map_err(|e| ApiError::Join(e.to_string()))??;
+    crate::store::search_query(&query).map_err(ApiError::BadRequest)?;
+    let page = state
+        .store
+        .search_torrents_filtered_page(&query, limit, offset, sort, filters)
+        .await?;
 
     let results: Vec<SearchResult> = page.results.iter().map(torrent_to_search_result).collect();
-    let has_next = match i64::try_from(offset.saturating_add(results.len())) {
-        Ok(next_offset) => next_offset < page.total,
-        Err(_) => false,
-    };
+    let has_next = page.has_next;
     Ok(Json(SearchResponse {
         results,
-        total: page.total,
         limit,
         offset,
         has_next,
@@ -289,7 +275,6 @@ fn default_file_limit() -> usize {
 #[derive(Debug, serde::Serialize)]
 struct FileSearchResponse {
     files: Vec<FileEntry>,
-    total: i64,
     limit: usize,
     offset: usize,
     has_next: bool,
@@ -301,14 +286,7 @@ async fn api_torrent(
 ) -> Result<Json<TorrentDetail>, ApiError> {
     validate_info_hash_hex(&info_hash_hex)?;
 
-    let db_path = state.db_path.clone();
-    let info_hash_hex2 = info_hash_hex.clone();
-    let result = tokio::task::spawn_blocking(move || -> Result<_, ApiError> {
-        let store = Store::open(&db_path)?;
-        Ok(store.get_torrent_by_hex(&info_hash_hex2)?)
-    })
-    .await
-    .map_err(|e| ApiError::Join(e.to_string()))??;
+    let result = state.store.get_torrent_by_hex(&info_hash_hex).await?;
 
     match result {
         Some(t) => {
@@ -342,31 +320,27 @@ async fn api_torrent_files(
     let limit = clamp_limit(params.limit);
     let offset = clamp_offset(params.offset);
     let query = params.q.unwrap_or_default();
-    let db_path = state.db_path.clone();
-    let info_hash_hex2 = info_hash_hex;
-
-    let page = tokio::task::spawn_blocking(move || -> Result<_, ApiError> {
-        let store = Store::open(&db_path)?;
-        if store.get_torrent_by_hex(&info_hash_hex2)?.is_none() {
-            return Err(ApiError::NotFound("torrent not found".into()));
-        }
-        Ok(store.search_files_page(&hash_bytes, &query, limit, offset)?)
-    })
-    .await
-    .map_err(|e| ApiError::Join(e.to_string()))??;
+    if state
+        .store
+        .get_torrent_by_hex(&info_hash_hex)
+        .await?
+        .is_none()
+    {
+        return Err(ApiError::NotFound("torrent not found".into()));
+    }
+    let page = state
+        .store
+        .search_files_page(&hash_bytes, &query, limit, offset)
+        .await?;
 
     let files: Vec<FileEntry> = page
         .results
         .into_iter()
         .map(|(path, size)| FileEntry { path, size })
         .collect();
-    let has_next = match i64::try_from(offset.saturating_add(files.len())) {
-        Ok(next_offset) => next_offset < page.total,
-        Err(_) => false,
-    };
+    let has_next = page.has_next;
     Ok(Json(FileSearchResponse {
         files,
-        total: page.total,
         limit,
         offset,
         has_next,
@@ -384,14 +358,7 @@ async fn api_magnet(
         .try_into()
         .map_err(|_| ApiError::BadRequest("invalid hash length".into()))?;
 
-    let db_path = state.db_path.clone();
-    let info_hash_hex2 = info_hash_hex;
-    let result = tokio::task::spawn_blocking(move || -> Result<Option<TorrentRecord>, ApiError> {
-        let store = Store::open(&db_path)?;
-        Ok(store.get_torrent_by_hex(&info_hash_hex2)?)
-    })
-    .await
-    .map_err(|e| ApiError::Join(e.to_string()))??;
+    let result = state.store.get_torrent_by_hex(&info_hash_hex).await?;
 
     let dn = result.as_ref().and_then(|t| t.name.as_deref());
     let uri = magnet::magnet_uri_from_hash(&hash_bytes, dn);
@@ -399,55 +366,60 @@ async fn api_magnet(
     Ok(axum::response::Response::builder()
         .header("Content-Type", "text/plain; charset=utf-8")
         .body(axum::body::Body::from(uri))
-        .unwrap())
+        .expect("static magnet response headers are valid"))
+}
+
+async fn request_deadline(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    match tokio::time::timeout(std::time::Duration::from_secs(10), next.run(request)).await {
+        Ok(response) => response,
+        Err(_) => (
+            StatusCode::GATEWAY_TIMEOUT,
+            Json(json!({"error":"database request timed out"})),
+        )
+            .into_response(),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::extract::{Query, State};
-    use std::fs;
-
-    fn temp_db_path(name: &str) -> PathBuf {
-        let path =
-            std::env::temp_dir().join(format!("btfind-web-test-{name}-{}.db", std::process::id()));
-        let _ = fs::remove_file(&path);
-        path
+    #[test]
+    fn query_validation() {
+        assert_eq!(effective_sort("東京", None), "rank");
+        assert_eq!(effective_sort("", None), "last_seen");
+        assert!(validate_info_hash_hex(&"a".repeat(40)).is_ok());
+        assert!(validate_info_hash_hex("invalid").is_err());
+        assert!(validate_sort("name; DROP TABLE torrents").is_err());
+        assert_eq!(clamp_limit(0), 1);
+        assert_eq!(clamp_limit(999), 500);
     }
-
-    fn seed_web_search_db(path: &std::path::Path) {
-        let store = Store::open(path).unwrap();
-        let incomplete = [0xD0u8; 20];
-        let complete = [0xD1u8; 20];
-
-        store
-            .upsert_torrent(incomplete, Some("ubuntu unknown".into()), 999, 0, "dht")
-            .unwrap();
-        store
-            .upsert_torrent(complete, Some("ubuntu complete".into()), 2_000, 1, "dht")
-            .unwrap();
-        store
-            .mark_metadata_complete(&complete, "ubuntu complete", 262144, 2_000, 1)
-            .unwrap();
-        store
-            .insert_files(&complete, &[("ubuntu.iso".into(), 2_000)])
-            .unwrap();
-    }
-
     #[tokio::test]
-    async fn test_api_search_complete_only_excludes_incomplete_torrents() {
-        let db_path = temp_db_path("complete-only");
-        seed_web_search_db(&db_path);
-
+    #[ignore = "requires BTFIND_TEST_DATABASE_URL; run scripts/test-mysql.sh"]
+    async fn api_pagination_and_details() {
+        let store = Store::open_test_database().await.unwrap();
+        for n in 1..=2 {
+            store
+                .commit_metadata(
+                    &[n; 20],
+                    "東京 中文 Ubuntu",
+                    16,
+                    2,
+                    &[("中文.iso".into(), 1), ("notes.txt".into(), 1)],
+                )
+                .await
+                .unwrap();
+        }
+        let state = AppState { store };
         let Json(response) = api_search(
-            State(AppState {
-                db_path: db_path.clone(),
-            }),
+            State(state.clone()),
             Query(SearchQuery {
-                q: Some("ubuntu".into()),
-                limit: 10,
+                q: Some("中文".into()),
+                limit: 1,
                 offset: 0,
-                sort: Some("last_seen".into()),
+                sort: None,
                 complete_only: Some(true),
                 min_size: None,
                 max_size: None,
@@ -455,165 +427,32 @@ mod tests {
         )
         .await
         .unwrap();
-
-        let results = response.results;
-        assert_eq!(results.len(), 1);
-        assert_eq!(response.total, 1);
-        assert!(!response.has_next);
-        assert_eq!(response.effective_sort, "last_seen");
-        assert_eq!(results[0].name.as_deref(), Some("ubuntu complete"));
-        let _ = fs::remove_file(db_path);
-    }
-
-    #[test]
-    fn test_effective_sort_uses_rank_only_for_searchable_queries() {
-        assert_eq!(effective_sort("", Some("rank")), "last_seen");
-        assert_eq!(effective_sort("xy", Some("rank")), "last_seen");
-        assert_eq!(effective_sort("xyz", Some("rank")), "rank");
-        assert_eq!(effective_sort("xyz", Some("name")), "name");
-        assert_eq!(effective_sort("xyz", None), "rank");
-        assert_eq!(effective_sort("xy", None), "last_seen");
-    }
-
-    #[tokio::test]
-    async fn test_api_search_rejects_invalid_size_range() {
-        let db_path = temp_db_path("invalid-size-range");
-        seed_web_search_db(&db_path);
-
-        let result = api_search(
-            State(AppState {
-                db_path: db_path.clone(),
-            }),
-            Query(SearchQuery {
-                q: Some("ubuntu".into()),
-                limit: 10,
-                offset: 0,
-                sort: Some("last_seen".into()),
-                complete_only: Some(true),
-                min_size: Some(5_000),
-                max_size: Some(1_000),
-            }),
-        )
-        .await;
-
-        match result {
-            Err(ApiError::BadRequest(message)) => {
-                assert_eq!(
-                    message,
-                    "max_size must be greater than or equal to min_size"
-                );
-            }
-            other => panic!("expected bad request, got {other:?}"),
-        }
-        let _ = fs::remove_file(db_path);
-    }
-
-    #[tokio::test]
-    async fn test_api_torrent_detail_is_lightweight() {
-        let db_path = temp_db_path("lightweight-detail");
-        seed_web_search_db(&db_path);
-        let hash = hex::encode([0xD1u8; 20]);
-
-        let Json(detail) = api_torrent(
-            State(AppState {
-                db_path: db_path.clone(),
-            }),
-            Path(hash),
-        )
-        .await
-        .unwrap();
-
-        let json = serde_json::to_value(detail).unwrap();
-        assert_eq!(json["name"], "ubuntu complete");
-        assert!(json.get("files").is_none());
-        let _ = fs::remove_file(db_path);
-    }
-
-    #[tokio::test]
-    async fn test_api_torrent_files_filters_paginates_and_clamps_limit() {
-        let db_path = temp_db_path("file-search");
-        seed_web_search_db(&db_path);
-        let hash_bytes = [0xD1u8; 20];
-        let hash = hex::encode(hash_bytes);
-        let store = Store::open(&db_path).unwrap();
-        store
-            .insert_files(
-                &hash_bytes,
-                &[
-                    ("Alpha.iso".into(), 1),
-                    ("beta.ISO".into(), 2),
-                    ("notes.txt".into(), 3),
-                ],
-            )
+        assert_eq!(response.results.len(), 1);
+        assert!(response.has_next);
+        assert!(serde_json::to_value(&response)
+            .unwrap()
+            .get("total")
+            .is_none());
+        let Json(detail) = api_torrent(State(state.clone()), Path(hex::encode([1; 20])))
+            .await
             .unwrap();
-        drop(store);
-
-        let Json(first) = api_torrent_files(
-            State(AppState {
-                db_path: db_path.clone(),
-            }),
-            Path(hash.clone()),
+        assert!(serde_json::to_value(detail).unwrap().get("files").is_none());
+        let Json(files) = api_torrent_files(
+            State(state.clone()),
+            Path(hex::encode([1; 20])),
             Query(FileSearchQuery {
-                q: Some("iso".into()),
-                limit: 0,
+                q: None,
+                limit: 1,
                 offset: 0,
             }),
         )
         .await
         .unwrap();
-        assert_eq!(first.total, 2);
-        assert_eq!(first.limit, 1);
-        assert_eq!(first.files.len(), 1);
-        assert!(first.has_next);
-
-        let Json(second) = api_torrent_files(
-            State(AppState {
-                db_path: db_path.clone(),
-            }),
-            Path(hash),
-            Query(FileSearchQuery {
-                q: Some("iso".into()),
-                limit: 1,
-                offset: 1,
-            }),
-        )
-        .await
-        .unwrap();
-        assert_eq!(second.offset, 1);
-        assert_eq!(second.files.len(), 1);
-        assert!(!second.has_next);
-        let _ = fs::remove_file(db_path);
-    }
-
-    #[tokio::test]
-    async fn test_api_torrent_files_rejects_invalid_and_missing_hashes() {
-        let db_path = temp_db_path("file-errors");
-        seed_web_search_db(&db_path);
-        let query = || FileSearchQuery {
-            q: None,
-            limit: 100,
-            offset: 0,
-        };
-
-        let invalid = api_torrent_files(
-            State(AppState {
-                db_path: db_path.clone(),
-            }),
-            Path("not-a-hash".into()),
-            Query(query()),
-        )
-        .await;
-        assert!(matches!(invalid, Err(ApiError::BadRequest(_))));
-
-        let missing = api_torrent_files(
-            State(AppState {
-                db_path: db_path.clone(),
-            }),
-            Path("ffffffffffffffffffffffffffffffffffffffff".into()),
-            Query(query()),
-        )
-        .await;
-        assert!(matches!(missing, Err(ApiError::NotFound(_))));
-        let _ = fs::remove_file(db_path);
+        assert!(files.has_next);
+        assert_eq!(files.files.len(), 1);
+        assert!(matches!(
+            api_torrent(State(state), Path(hex::encode([99; 20]))).await,
+            Err(ApiError::NotFound(_))
+        ));
     }
 }

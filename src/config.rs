@@ -58,8 +58,16 @@ pub struct MetadataConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct DatabaseConfig {
-    #[serde(default = "default_db_path")]
-    pub path: String,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default = "default_pool_size")]
+    pub pool_size: u32,
+    #[serde(default = "default_web_pool_size")]
+    pub web_pool_size: u32,
+    #[serde(default)]
+    pub tls_ca: Option<String>,
+    #[serde(default)]
+    pub allow_insecure_local: bool,
 
     #[serde(default = "default_database_batch_size")]
     pub batch_size: usize,
@@ -171,8 +179,11 @@ fn default_max_peer_attempts_per_round() -> usize {
     8
 }
 
-fn default_db_path() -> String {
-    "~/.local/share/btfind/torrents.db".to_string()
+fn default_pool_size() -> u32 {
+    8
+}
+fn default_web_pool_size() -> u32 {
+    4
 }
 fn default_database_batch_size() -> usize {
     128
@@ -286,7 +297,11 @@ impl Default for MetadataConfig {
 impl Default for DatabaseConfig {
     fn default() -> Self {
         DatabaseConfig {
-            path: default_db_path(),
+            path: None,
+            pool_size: default_pool_size(),
+            web_pool_size: default_web_pool_size(),
+            tls_ca: None,
+            allow_insecure_local: false,
             batch_size: default_database_batch_size(),
             flush_interval_ms: default_database_flush_interval_ms(),
         }
@@ -377,19 +392,22 @@ impl Config {
         Ok(Config::default())
     }
 
-    pub fn database_path(&self) -> PathBuf {
-        let path = self.database.path.clone();
-        if path == "~" {
-            dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
-        } else if path.starts_with("~/") {
-            let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-            home.join(path.strip_prefix("~/").expect("path starts with ~/"))
-        } else {
-            PathBuf::from(path)
-        }
-    }
-
     pub fn validate(&self) -> Result<(), String> {
+        if self.database.path.is_some() {
+            return Err("database.path is no longer supported; set BTFIND_DATABASE_URL to a MySQL connection URL".into());
+        }
+        validate_range(
+            "database.pool_size",
+            self.database.pool_size as usize,
+            1,
+            64,
+        )?;
+        validate_range(
+            "database.web_pool_size",
+            self.database.web_pool_size as usize,
+            1,
+            64,
+        )?;
         validate_range(
             "metadata.max_concurrent",
             self.metadata.max_concurrent,
@@ -566,37 +584,20 @@ fn validate_range(name: &str, value: usize, min: usize, max: usize) -> Result<()
 mod tests {
     use super::*;
 
-    fn config_with_db_path(path: &str) -> Config {
-        Config {
-            database: DatabaseConfig {
-                path: path.to_string(),
-                ..DatabaseConfig::default()
-            },
-            ..Config::default()
-        }
-    }
-
     #[test]
-    fn test_database_path_expands_home_only() {
-        let expected = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-        assert_eq!(config_with_db_path("~").database_path(), expected);
-    }
-
-    #[test]
-    fn test_database_path_expands_home_prefix() {
-        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-        assert_eq!(
-            config_with_db_path("~/btfind.db").database_path(),
-            home.join("btfind.db")
-        );
-    }
-
-    #[test]
-    fn test_database_path_accepts_absolute_path() {
-        assert_eq!(
-            config_with_db_path("/tmp/btfind.db").database_path(),
-            PathBuf::from("/tmp/btfind.db")
-        );
+    fn mysql_config_rejects_legacy_paths_and_unbounded_pools() {
+        let mut config = Config::default();
+        config.database.path = Some("old.db".into());
+        assert!(config
+            .validate()
+            .unwrap_err()
+            .contains("BTFIND_DATABASE_URL"));
+        config.database.path = None;
+        config.database.pool_size = 0;
+        assert!(config.validate().is_err());
+        config.database.pool_size = 8;
+        config.database.web_pool_size = 65;
+        assert!(config.validate().is_err());
     }
 
     #[test]
