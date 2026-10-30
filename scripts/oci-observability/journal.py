@@ -225,7 +225,7 @@ def read_batches(
         if not terminated and (batch or last_raw_cursor != cursor):
             yield JournalBatch(batch, last_raw_cursor)
     finally:
-        if terminated and process.poll() is None:
+        if process.poll() is None:
             process.terminate()
         try:
             process.wait(timeout=10)
