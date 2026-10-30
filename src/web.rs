@@ -99,10 +99,9 @@ async fn record_request(
         .map(|path| path.as_str().to_string())
         .unwrap_or_default();
     let started = Instant::now();
-    metrics.begin_request();
+    let _active_request = metrics.begin_active_request();
     let response = next.run(request).await;
     metrics.record_request(&route, response.status().as_u16(), started.elapsed());
-    metrics.end_request();
     response
 }
 

@@ -256,6 +256,13 @@ for `ap-osaka-1`, `vm-sub01`, batching, lookback, and the freshness cutoff.
   analysis deduplicate retries, but OCI does not guarantee server-side dedupe.
 - **Independent streams.** Log and metric cursors, retries, and checkpoint updates
   are separate. A metrics failure does not block log shipping, and vice versa.
+  Each destination also has an independent execution budget
+  (`LOG_EXPORT_BUDGET_SECONDS`, `METRICS_EXPORT_BUDGET_SECONDS`). Log retries stop
+  at the log budget so the metric pass always starts with its own budget. The OCI
+  per-request timeout is clamped to one third of the smaller budget, and metric
+  posts are chunked so the budget is checked between requests. Default budgets
+  plus one in-flight request remain within the example 90-second systemd timeout;
+  raise them together only after reviewing that limit.
 - **Bounded retries.** Throttling, 5xx, timeout, network, and connection failures
   use bounded exponential backoff. Authentication, authorization, missing
   resource, and other permanent errors are reported distinctly and do not advance

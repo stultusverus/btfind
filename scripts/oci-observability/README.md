@@ -68,8 +68,10 @@ sudo -u root /opt/btfind-observability/venv/bin/python \
 | `METRICS_MAX_AGE_SECONDS` | `6900` | OCI Monitoring freshness cutoff (OCI accepts less than two hours old) |
 | `OCI_MONITORING_ENDPOINT` | derived | Override the `telemetry-ingestion.<region>` endpoint |
 | `METRICS_BATCH_MAX_POINTS` | `40` | Metric datapoints per `post_metric_data` call (OCI allows 50 unique streams) |
-| `OCI_MAX_ATTEMPTS` | `5` | Transient retry attempts |
-| `OCI_API_TIMEOUT_SECONDS` | `20` | Per-request connect/read timeout |
+| `OCI_MAX_ATTEMPTS` | `5` | Transient retry attempts per operation |
+| `OCI_API_TIMEOUT_SECONDS` | `8` | Per-request connect/read timeout; clamped to one third of each stream budget |
+| `LOG_EXPORT_BUDGET_SECONDS` | `25` | Independent log-stream execution budget |
+| `METRICS_EXPORT_BUDGET_SECONDS` | `25` | Independent metric-stream execution budget |
 | `STATE_DIR` | `/var/lib/btfind-observability` | Checkpoints, lock, and dead letters |
 | `DEAD_LETTER_PATH` | `$STATE_DIR/dead-letter.jsonl` | Oversized record diagnostics |
 | `DEAD_LETTER_MAX_BYTES` | `8388608` | Per-file cap; rotated to `.1` before appending |
@@ -168,6 +170,21 @@ overlapping exporter executions.
 The systemd oneshot/timer lifecycle is the primary serialization mechanism; the
 lock is a second guard. Exporter diagnostics go to stderr, which systemd records
 under its own identifier rather than the two source identifiers.
+
+## Execution budgets
+
+Logs and metrics run sequentially but each stream gets a fresh independent
+`Budget`. A logging outage that exhausts `LOG_EXPORT_BUDGET_SECONDS` cannot stop
+the metrics pass, which starts with its own `METRICS_EXPORT_BUDGET_SECONDS`.
+Retries check the remaining budget before every API attempt and before sleeping,
+so a failing destination cannot consume the other destination's time.
+
+The OCI per-request timeout is also clamped to one third of the smaller stream
+budget, and metric points are posted in bounded chunks so the budget is checked
+between API calls. With the defaults, the worst-case per-stream overrun is one
+8-second request beyond its 25-second budget; both streams plus SDK startup stay
+inside the example `TimeoutStartSec=90`. If you raise the budgets, keep their
+sum plus startup and one in-flight request below the systemd timeout.
 
 ## Failure semantics
 

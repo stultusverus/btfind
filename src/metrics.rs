@@ -201,6 +201,16 @@ pub struct WebMetrics {
     window: Mutex<WebWindow>,
 }
 
+pub struct ActiveRequestGuard {
+    metrics: Arc<WebMetrics>,
+}
+
+impl Drop for ActiveRequestGuard {
+    fn drop(&mut self) {
+        self.metrics.end_request();
+    }
+}
+
 impl Default for WebMetrics {
     fn default() -> Self {
         Self {
@@ -219,11 +229,14 @@ struct WebWindowSnapshot {
 }
 
 impl WebMetrics {
-    pub fn begin_request(&self) {
+    pub fn begin_active_request(self: &Arc<Self>) -> ActiveRequestGuard {
         self.active_requests.fetch_add(1, Ordering::Relaxed);
+        ActiveRequestGuard {
+            metrics: Arc::clone(self),
+        }
     }
 
-    pub fn end_request(&self) {
+    fn end_request(&self) {
         let _ = self
             .active_requests
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |active| {
@@ -419,6 +432,15 @@ mod tests {
         assert_eq!(route.latency_buckets[0], 1);
         assert_eq!(route.latency_buckets[2], 1);
         assert_eq!(snapshot.database_errors, 1);
+    }
+
+    #[test]
+    fn active_request_guard_decrements_on_drop() {
+        let metrics = Arc::new(WebMetrics::default());
+        let guard = metrics.begin_active_request();
+        assert_eq!(metrics.active_requests.load(Ordering::Relaxed), 1);
+        drop(guard);
+        assert_eq!(metrics.active_requests.load(Ordering::Relaxed), 0);
     }
 
     #[test]

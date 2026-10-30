@@ -23,6 +23,17 @@ class PublishError(Exception):
     pass
 
 
+class Budget:
+    def __init__(self, seconds):
+        self.deadline = time.monotonic() + max(0, seconds)
+
+    def remaining(self):
+        return max(0.0, self.deadline - time.monotonic())
+
+    def expired(self):
+        return self.remaining() <= 0
+
+
 @dataclass
 class Config:
     region: str
@@ -35,11 +46,13 @@ class Config:
     journal_max_batches: int = 10
     journal_max_records: int = 200
     journal_max_bytes: int = 262144
-    metrics_max_age_seconds: int = 7200
+    metrics_max_age_seconds: int = 6900
     max_attempts: int = 5
     retry_base_seconds: float = 1.0
     retry_max_seconds: float = 30.0
-    api_timeout_seconds: int = 20
+    api_timeout_seconds: int = 8
+    log_budget_seconds: int = 25
+    metrics_budget_seconds: int = 25
     log_ocids: dict = field(default_factory=dict)
 
 
@@ -82,7 +95,9 @@ def load_config():
         max_attempts=env_int("OCI_MAX_ATTEMPTS", 5),
         retry_base_seconds=env_float("OCI_RETRY_BASE_SECONDS", 1.0),
         retry_max_seconds=env_float("OCI_RETRY_MAX_SECONDS", 30.0),
-        api_timeout_seconds=env_int("OCI_API_TIMEOUT_SECONDS", 20),
+        api_timeout_seconds=env_int("OCI_API_TIMEOUT_SECONDS", 8),
+        log_budget_seconds=env_int("LOG_EXPORT_BUDGET_SECONDS", 25),
+        metrics_budget_seconds=env_int("METRICS_EXPORT_BUDGET_SECONDS", 25),
     )
     config.log_ocids = {
         "btfind-crawler": config.crawler_log_ocid,
@@ -91,12 +106,16 @@ def load_config():
     return config
 
 
-def with_retry(label, operation, config):
+def with_retry(label, operation, config, budget):
     import oci
 
     delay = config.retry_base_seconds
     last_error = None
     for attempt in range(1, config.max_attempts + 1):
+        if budget.expired():
+            raise PublishError(
+                f"{label}: time budget exhausted before attempt {attempt}: {last_error}"
+            )
         try:
             return operation()
         except oci.exceptions.ServiceError as error:
@@ -112,6 +131,11 @@ def with_retry(label, operation, config):
             last_error = error
         if attempt == config.max_attempts:
             break
+        sleep_for = delay + random.uniform(0, delay / 4)
+        if sleep_for >= budget.remaining():
+            raise PublishError(
+                f"{label}: time budget exhausted after attempt {attempt}: {last_error}"
+            )
         emit(
             "publish_retry",
             level="warning",
@@ -119,7 +143,7 @@ def with_retry(label, operation, config):
             attempt=attempt,
             error=str(last_error),
         )
-        time.sleep(delay + random.uniform(0, delay / 4))
+        time.sleep(sleep_for)
         delay = min(delay * 2, config.retry_max_seconds)
 
     raise PublishError(f"{label}: retries exhausted: {last_error}")
@@ -130,7 +154,15 @@ def make_clients(config):
 
     signer = oci.auth.signers.InstancePrincipalsSecurityTokenSigner()
     client_config = {"region": config.region}
-    timeout = (config.api_timeout_seconds, config.api_timeout_seconds)
+    api_timeout = max(
+        1,
+        min(
+            config.api_timeout_seconds,
+            config.log_budget_seconds // 3,
+            config.metrics_budget_seconds // 3,
+        ),
+    )
+    timeout = (api_timeout, api_timeout)
     monitoring_endpoint = os.environ.get(
         "OCI_MONITORING_ENDPOINT",
         f"https://telemetry-ingestion.{config.region}.oraclecloud.com",
@@ -149,26 +181,30 @@ def make_clients(config):
     return logging_client, monitoring_client
 
 
-def ship_log_batch(client, batch, config):
+def ship_log_batch(client, batch, config, budget):
     grouped = logging_export.entries_by_service(batch.records)
     for service, entries in grouped.items():
         log_ocid = config.log_ocids.get(service)
         if not log_ocid:
             raise PublishError(f"no OCI log configured for {service}")
-        with_retry(
-            f"logging:{service}",
-            lambda log_ocid=log_ocid, service=service, entries=entries: logging_export.put_logs(
-                client,
-                log_ocid,
-                service,
-                entries,
-                config.instance,
-            ),
-            config,
-        )
+        for chunk in logging_export.chunked(entries, logging_export.max_entries()):
+            if budget.expired():
+                raise PublishError("logging: time budget exhausted")
+            with_retry(
+                f"logging:{service}",
+                lambda log_ocid=log_ocid, service=service, chunk=chunk: logging_export.put_logs(
+                    client,
+                    log_ocid,
+                    service,
+                    chunk,
+                    config.instance,
+                ),
+                config,
+                budget,
+            )
 
 
-def ship_log_stream(store, client, config, cursor, lookback_seconds):
+def ship_log_stream(store, client, config, cursor, lookback_seconds, budget):
     for batch in journal.read_batches(
         cursor,
         lookback_seconds,
@@ -176,7 +212,9 @@ def ship_log_stream(store, client, config, cursor, lookback_seconds):
         config.journal_max_records,
         config.journal_max_bytes,
     ):
-        ship_log_batch(client, batch, config)
+        if budget.expired():
+            raise PublishError("logging: time budget exhausted")
+        ship_log_batch(client, batch, config, budget)
         store.advance("logs", batch.cursor)
         store.save()
         emit(
@@ -190,9 +228,10 @@ def run_logs(store, client, config):
     state = store.state["logs"]
     cursor = state.get("cursor")
     lookback = config.journal_lookback_seconds if not state.get("initialized") else None
+    budget = Budget(config.log_budget_seconds)
 
     try:
-        ship_log_stream(store, client, config, cursor, lookback)
+        ship_log_stream(store, client, config, cursor, lookback, budget)
         return True
     except journal.JournalCursorError as error:
         if store.state["logs"].get("cursor") != cursor:
@@ -208,7 +247,7 @@ def run_logs(store, client, config):
             reason="cursor_invalid",
         )
         try:
-            ship_log_stream(store, client, config, None, None)
+            ship_log_stream(store, client, config, None, None, budget)
         except logging_export.DeadLetterError as dead_letter:
             store.record_gap(
                 "logs",
@@ -231,7 +270,7 @@ def run_logs(store, client, config):
         raise PublishError(f"journal read failed: {error}") from error
 
 
-def ship_metrics_batch(store, client, batch, config):
+def ship_metrics_batch(store, client, batch, config, budget):
     points, baselines, skipped = metrics_export.map_batch(
         batch.records,
         config.instance,
@@ -242,29 +281,35 @@ def ship_metrics_batch(store, client, batch, config):
     for gap in skipped:
         store.record_gap("metrics", "freshness_skip", **gap)
     if points:
-        responses = with_retry(
-            "monitoring",
-            lambda: metrics_export.publish_metrics(
-                client,
-                points,
-                config.metrics_compartment_ocid,
-            ),
-            config,
-        )
-        failed = sum(
-            int(getattr(getattr(response, "data", None), "failed_metrics_count", 0) or 0)
-            for response in responses or []
-        )
-        if failed:
-            emit(
-                "metric_points_rejected",
-                level="error",
-                count=failed,
-                cursor=batch.cursor,
+        for chunk in logging_export.chunked(
+            points, metrics_export.max_points_per_request()
+        ):
+            if budget.expired():
+                raise PublishError("metrics: time budget exhausted")
+            responses = with_retry(
+                "monitoring",
+                lambda chunk=chunk: metrics_export.publish_metrics(
+                    client,
+                    chunk,
+                    config.metrics_compartment_ocid,
+                ),
+                config,
+                budget,
             )
-            raise PublishError(
-                f"monitoring rejected {failed} metric point(s); checkpoint not advanced"
+            failed = sum(
+                int(getattr(getattr(response, "data", None), "failed_metrics_count", 0) or 0)
+                for response in responses or []
             )
+            if failed:
+                emit(
+                    "metric_points_rejected",
+                    level="error",
+                    count=failed,
+                    cursor=batch.cursor,
+                )
+                raise PublishError(
+                    f"monitoring rejected {failed} metric point(s); checkpoint not advanced"
+                )
     store.advance("metrics", batch.cursor, baselines=baselines)
     store.save()
     emit(
@@ -275,7 +320,7 @@ def ship_metrics_batch(store, client, batch, config):
     )
 
 
-def ship_metric_stream(store, client, config, cursor, lookback_seconds):
+def ship_metric_stream(store, client, config, cursor, lookback_seconds, budget):
     for batch in journal.read_batches(
         cursor,
         lookback_seconds,
@@ -283,16 +328,19 @@ def ship_metric_stream(store, client, config, cursor, lookback_seconds):
         config.journal_max_records,
         config.journal_max_bytes,
     ):
-        ship_metrics_batch(store, client, batch, config)
+        if budget.expired():
+            raise PublishError("metrics: time budget exhausted")
+        ship_metrics_batch(store, client, batch, config, budget)
 
 
 def run_metrics(store, client, config):
     state = store.state["metrics"]
     cursor = state.get("cursor")
     lookback = config.journal_lookback_seconds if not state.get("initialized") else None
+    budget = Budget(config.metrics_budget_seconds)
 
     try:
-        ship_metric_stream(store, client, config, cursor, lookback)
+        ship_metric_stream(store, client, config, cursor, lookback, budget)
         return True
     except journal.JournalCursorError as error:
         if store.state["metrics"].get("cursor") != cursor:
@@ -307,7 +355,7 @@ def run_metrics(store, client, config):
             stream="metrics",
             reason="cursor_invalid",
         )
-        ship_metric_stream(store, client, config, None, None)
+        ship_metric_stream(store, client, config, None, None, budget)
         return True
     except PublishError:
         raise
