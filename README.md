@@ -173,6 +173,15 @@ Do not use the restricted crawler account to apply schema migrations.
 
 All queue, job, RPC, contact, peer, metadata, and sampling limits are validated before the runtime starts. Full discovery queues are coalesced into durable hash-job rows where admitted by the metadata scheduler; excess in-memory jobs remain in MySQL for the retry scan. `sampling_enabled` enables bounded random BEP 51 probing of validated live nodes. It is an opt-in discovery aid, not a keyspace traversal or coverage-complete sweep.
 
+## Observability
+
+Both service processes emit one-line JSON to journald. A checked-in one-shot
+exporter ships those records to OCI Logging and periodic `crawler_status` /
+`web_status` summaries to OCI Monitoring using instance principals. See
+[Observability](docs/observability.md) for the event schema, metric definitions,
+journald setup, deployment examples, and delivery semantics. The example
+systemd, journald, and environment files live under `deploy/`.
+
 ## How It Works
 
 See [Current architecture](docs/architecture.md) for module responsibilities and

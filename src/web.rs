@@ -1,17 +1,34 @@
 use crate::magnet;
+use crate::metrics::WebMetrics;
 use crate::store::{CrawlStats, Store, TorrentRecord, TorrentSearchFilters};
 use axum::body::Body;
-use axum::extract::{Path, Query, State};
+use axum::extract::{MatchedPath, Path, Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Json;
 use serde::Deserialize;
 use serde_json::json;
+use std::sync::Arc;
+use std::time::Instant;
 
 #[derive(Clone)]
 pub struct AppState {
     pub store: Store,
+    pub metrics: Arc<WebMetrics>,
+}
+
+impl AppState {
+    fn database_error(&self, error: crate::store::Error) -> ApiError {
+        self.metrics.record_database_error();
+        tracing::warn!(
+            event = "database_request_failed",
+            reason = "database",
+            error = %error,
+            "database request failed"
+        );
+        ApiError::Db("database temporarily unavailable".into())
+    }
 }
 
 #[derive(Debug)]
@@ -34,7 +51,12 @@ impl IntoResponse for ApiError {
 
 impl From<crate::store::Error> for ApiError {
     fn from(e: crate::store::Error) -> Self {
-        tracing::warn!("database request failed: {}", e);
+        tracing::warn!(
+            event = "database_request_failed",
+            reason = "database",
+            error = %e,
+            "database request failed"
+        );
         ApiError::Db("database temporarily unavailable".into())
     }
 }
@@ -45,8 +67,9 @@ impl From<String> for ApiError {
     }
 }
 
-pub fn router(store: Store) -> axum::Router {
-    let state = AppState { store };
+pub fn router(store: Store, metrics: Arc<WebMetrics>) -> axum::Router {
+    let state = AppState { store, metrics };
+    let request_metrics = state.metrics.clone();
 
     axum::Router::new()
         .route("/", get(dashboard))
@@ -59,6 +82,27 @@ pub fn router(store: Store) -> axum::Router {
         .route("/api/torrents/{info_hash}/magnet", get(api_magnet))
         .with_state(state)
         .layer(axum::middleware::from_fn(request_deadline))
+        .layer(axum::middleware::from_fn(move |request, next| {
+            let metrics = request_metrics.clone();
+            async move { record_request(metrics, request, next).await }
+        }))
+}
+
+async fn record_request(
+    metrics: Arc<WebMetrics>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let route = request
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|path| path.as_str().to_string())
+        .unwrap_or_default();
+    let started = Instant::now();
+    let _active_request = metrics.begin_active_request();
+    let response = next.run(request).await;
+    metrics.record_request(&route, response.status().as_u16(), started.elapsed());
+    response
 }
 
 fn static_response(content_type: &'static str, content: &'static str) -> Response {
@@ -205,7 +249,11 @@ fn validate_info_hash_hex(hex_str: &str) -> Result<(), ApiError> {
 
 #[axum::debug_handler]
 async fn api_stats(State(state): State<AppState>) -> Result<Json<CrawlStats>, ApiError> {
-    let stats = state.store.get_stats().await?;
+    let stats = state
+        .store
+        .get_stats()
+        .await
+        .map_err(|error| state.database_error(error))?;
     Ok(Json(stats))
 }
 
@@ -228,7 +276,8 @@ async fn api_search(
     let page = state
         .store
         .search_torrents_filtered_page(&query, limit, offset, sort, filters)
-        .await?;
+        .await
+        .map_err(|error| state.database_error(error))?;
 
     let results: Vec<SearchResult> = page.results.iter().map(torrent_to_search_result).collect();
     let has_next = page.has_next;
@@ -286,7 +335,11 @@ async fn api_torrent(
 ) -> Result<Json<TorrentDetail>, ApiError> {
     validate_info_hash_hex(&info_hash_hex)?;
 
-    let result = state.store.get_torrent_by_hex(&info_hash_hex).await?;
+    let result = state
+        .store
+        .get_torrent_by_hex(&info_hash_hex)
+        .await
+        .map_err(|error| state.database_error(error))?;
 
     match result {
         Some(t) => {
@@ -323,7 +376,8 @@ async fn api_torrent_files(
     if state
         .store
         .get_torrent_by_hex(&info_hash_hex)
-        .await?
+        .await
+        .map_err(|error| state.database_error(error))?
         .is_none()
     {
         return Err(ApiError::NotFound("torrent not found".into()));
@@ -331,7 +385,8 @@ async fn api_torrent_files(
     let page = state
         .store
         .search_files_page(&hash_bytes, &query, limit, offset)
-        .await?;
+        .await
+        .map_err(|error| state.database_error(error))?;
 
     let files: Vec<FileEntry> = page
         .results
@@ -358,7 +413,11 @@ async fn api_magnet(
         .try_into()
         .map_err(|_| ApiError::BadRequest("invalid hash length".into()))?;
 
-    let result = state.store.get_torrent_by_hex(&info_hash_hex).await?;
+    let result = state
+        .store
+        .get_torrent_by_hex(&info_hash_hex)
+        .await
+        .map_err(|error| state.database_error(error))?;
 
     let dn = result.as_ref().and_then(|t| t.name.as_deref());
     let uri = magnet::magnet_uri_from_hash(&hash_bytes, dn);
@@ -412,7 +471,10 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let state = AppState { store };
+        let state = AppState {
+            store,
+            metrics: Arc::new(WebMetrics::default()),
+        };
         let Json(response) = api_search(
             State(state.clone()),
             Query(SearchQuery {

@@ -1,3 +1,4 @@
+use crate::metrics::CrawlerMetrics;
 use crate::store::{PeerRetryEligibility, Store};
 use crate::types::{CrawlStatsEvent, HashDiscovery, InfoHash, MetadataFailureReason, PeerContact};
 use crate::wire::{self, ExtendedHandshake, Handshake, WireMessage, HANDSHAKE_LEN};
@@ -626,25 +627,24 @@ async fn filter_peers_for_retry(
                 next_eligible_at =
                     Some(next_eligible_at.map_or(retry_at, |current| current.min(retry_at)));
                 tracing::debug!(
-                    "delaying metadata fetch for {} from {} until {}",
-                    hex::encode(info_hash),
-                    peer_addr,
-                    retry_at
+                    event = "metadata_peer_delayed",
+                    retry_at = retry_at,
+                    "delaying metadata fetch until the peer retry time"
                 );
             }
             Ok(PeerRetryEligibility::Rejected) => {
                 tracing::debug!(
-                    "rejecting metadata peer {} for {} after hash mismatch",
-                    peer_addr,
-                    hex::encode(info_hash),
+                    event = "metadata_peer_rejected",
+                    reason = "hash_mismatch",
+                    "rejecting metadata peer after hash mismatch"
                 );
             }
             Err(error) => {
                 tracing::warn!(
-                    "peer retry eligibility database error for {} from {}: {}, delaying",
-                    hex::encode(info_hash),
-                    peer_addr,
-                    error
+                    event = "metadata_retry_state_failed",
+                    reason = "database",
+                    error = %error,
+                    "peer retry eligibility lookup failed; delaying"
                 );
                 let retry_at = chrono::Utc::now().timestamp().saturating_add(300);
                 next_eligible_at =
@@ -658,19 +658,43 @@ async fn filter_peers_for_retry(
     }
 }
 
-fn emit_metadata_failure(stats_tx: &mpsc::Sender<CrawlStatsEvent>, reason: MetadataFailureReason) {
-    if stats_tx
-        .try_send(CrawlStatsEvent::MetadataFetchFailed { reason })
-        .is_err()
-    {
-        tracing::warn!("stats_tx send failed after metadata fetch failure");
+fn emit_stat(
+    metrics: &CrawlerMetrics,
+    stats_tx: &mpsc::Sender<CrawlStatsEvent>,
+    event: CrawlStatsEvent,
+) -> bool {
+    metrics.apply(&event);
+    stats_tx.try_send(event).is_ok()
+}
+
+fn emit_metadata_failure(
+    metrics: &CrawlerMetrics,
+    stats_tx: &mpsc::Sender<CrawlStatsEvent>,
+    reason: MetadataFailureReason,
+) {
+    if !emit_stat(
+        metrics,
+        stats_tx,
+        CrawlStatsEvent::MetadataFetchFailed { reason },
+    ) {
+        tracing::debug!(
+            event = "stats_channel_full",
+            event_kind = "metadata_fetch_failed",
+            "metadata failure statistic was not accepted"
+        );
     }
 }
 
 fn log_storage_result(operation: &str, result: Result<(), crate::store::Error>) {
     match result {
         Ok(()) => {}
-        Err(error) => tracing::warn!("{} failed: {}", operation, error),
+        Err(error) => tracing::warn!(
+            event = "metadata_storage_failed",
+            operation = operation,
+            reason = "database",
+            error = %error,
+            "metadata storage operation failed"
+        ),
     }
 }
 
@@ -773,6 +797,7 @@ struct FetchRoundConfig {
     retry_after_hours: u32,
     max_metadata_size: u32,
     prior_attempt_count: u32,
+    metrics: Arc<CrawlerMetrics>,
 }
 
 fn apply_job_outcome(
@@ -850,13 +875,17 @@ where
             }
             Ok(false) => break,
             Err(error) => {
-                tracing::warn!("failed to check metadata job state: {error}; retrying");
+                tracing::warn!(
+                    event = "metadata_job_state_failed",
+                    reason = "database",
+                    error = %error,
+                    "failed to check metadata job state; retrying"
+                );
                 tokio::time::sleep(retry_delay).await;
                 retry_delay = retry_delay.saturating_mul(2).min(Duration::from_secs(5));
             }
         }
     }
-    let hash_hex = hex::encode(info_hash);
     let filter_store = store.clone();
     let filtered = (async move {
         filter_peers_for_retry(&filter_store, &info_hash, &peers, config.retry_after_hours).await
@@ -912,14 +941,19 @@ where
                 })
                 .await;
                 log_storage_result("record metadata hash mismatch", recorded);
-                emit_metadata_failure(&stats_tx, MetadataFailureReason::HashMismatch);
+                emit_metadata_failure(
+                    &config.metrics,
+                    &stats_tx,
+                    MetadataFailureReason::HashMismatch,
+                );
             }
             Ok(bytes) => match parse_torrent_info(&bytes) {
                 Ok(info) => {
-                    tracing::info!(
-                        "validated metadata for {} with {} files",
-                        hash_hex,
-                        info.file_count
+                    tracing::debug!(
+                        event = "metadata_validated",
+                        file_count = info.file_count,
+                        total_size = info.total_size,
+                        "validated torrent metadata"
                     );
                     let commit_store = store.clone();
                     let committed = (async move {
@@ -936,8 +970,16 @@ where
                     .await;
                     match committed {
                         Ok(()) => {
-                            if stats_tx.try_send(CrawlStatsEvent::MetadataFetched).is_err() {
-                                tracing::warn!("metadata completion statistic was not accepted");
+                            if !emit_stat(
+                                &config.metrics,
+                                &stats_tx,
+                                CrawlStatsEvent::MetadataFetched,
+                            ) {
+                                tracing::debug!(
+                                    event = "stats_channel_full",
+                                    event_kind = "metadata_fetched",
+                                    "metadata completion statistic was not accepted"
+                                );
                             }
                             return JobOutcome {
                                 info_hash,
@@ -963,7 +1005,12 @@ where
                                 {
                                     Ok(()) => break,
                                     Err(error) => {
-                                        tracing::warn!("failed to record unsupported search document: {error}; retrying state write");
+                                        tracing::warn!(
+                                            event = "metadata_job_state_failed",
+                                            reason = "database",
+                                            error = %error,
+                                            "failed to record unsupported search document; retrying"
+                                        );
                                         tokio::time::sleep(retry_delay).await;
                                         retry_delay = retry_delay
                                             .saturating_mul(2)
@@ -971,7 +1018,11 @@ where
                                     }
                                 }
                             }
-                            tracing::warn!("metadata job {} is unsupported: {}", hash_hex, message);
+                            tracing::warn!(
+                                event = "metadata_job_unsupported",
+                                reason = "search_document",
+                                "metadata job is unsupported"
+                            );
                             return JobOutcome {
                                 info_hash,
                                 attempts,
@@ -1008,7 +1059,7 @@ where
                     })
                     .await;
                     log_storage_result("record terminal metadata state", recorded);
-                    emit_metadata_failure(&stats_tx, MetadataFailureReason::Parse);
+                    emit_metadata_failure(&config.metrics, &stats_tx, MetadataFailureReason::Parse);
                     return JobOutcome {
                         info_hash,
                         attempts,
@@ -1034,7 +1085,7 @@ where
                 })
                 .await;
                 log_storage_result("record metadata peer failure", recorded);
-                emit_metadata_failure(&stats_tx, reason);
+                emit_metadata_failure(&config.metrics, &stats_tx, reason);
             }
         }
     }
@@ -1096,7 +1147,12 @@ where
     })
     .await;
     log_storage_result("schedule metadata retry", recorded);
-    tracing::debug!("metadata round failed for {}: {}", hash_hex, last_error);
+    tracing::debug!(
+        event = "metadata_round_failed",
+        reason = "peer_attempts",
+        error = %last_error,
+        "metadata fetch round failed"
+    );
     JobOutcome {
         info_hash,
         attempts,
@@ -1123,7 +1179,11 @@ async fn mark_metadata_complete_and_emit(
         )
         .await?;
     if stats_tx.try_send(CrawlStatsEvent::MetadataFetched).is_err() {
-        tracing::warn!("stats_tx send failed after metadata fetch");
+        tracing::debug!(
+            event = "stats_channel_full",
+            event_kind = "metadata_fetched",
+            "metadata completion statistic was not accepted"
+        );
     }
     Ok(())
 }
@@ -1140,12 +1200,15 @@ pub async fn run_metadata_fetcher(
     max_active_hash_jobs: usize,
     max_peers_per_hash: usize,
     stats_tx: mpsc::Sender<CrawlStatsEvent>,
+    metrics: Arc<CrawlerMetrics>,
 ) {
     let mut jobs: HashMap<InfoHash, HashJob> = HashMap::new();
     let mut ready = VecDeque::new();
     let mut ready_set = HashSet::new();
     let mut workers: JoinSet<JobOutcome> = JoinSet::new();
     let mut retry_tick = tokio::time::interval(Duration::from_secs(30));
+    let mut status_tick = tokio::time::interval(Duration::from_secs(60));
+    status_tick.tick().await;
 
     loop {
         while workers.len() < max_concurrent {
@@ -1171,6 +1234,7 @@ pub async fn run_metadata_fetcher(
                 retry_after_hours,
                 max_metadata_size,
                 prior_attempt_count: job.attempt_count,
+                metrics: metrics.clone(),
             };
             workers.spawn(process_hash_round(
                 info_hash,
@@ -1200,7 +1264,13 @@ pub async fn run_metadata_fetcher(
                     match persistence {
                         Ok(()) => break,
                         Err(error) => {
-                            tracing::warn!("failed to persist discovery for {}: {}; retrying", hex::encode(info_hash), error);
+                            tracing::warn!(
+                                event = "discovery_persist_failed",
+                                reason = "database",
+                                retryable = true,
+                                error = %error,
+                                "failed to persist discovery; retrying"
+                            );
                             tokio::time::sleep(retry_delay).await;
                             retry_delay = retry_delay.saturating_mul(2).min(Duration::from_secs(5));
                         }
@@ -1216,11 +1286,35 @@ pub async fn run_metadata_fetcher(
                     max_active_hash_jobs,
                     max_peers_per_hash,
                 ) == JobAdmission::AtCapacity
-                    && stats_tx
-                        .try_send(CrawlStatsEvent::DiscoveryBackpressure)
-                        .is_err()
+                    && !emit_stat(
+                        &metrics,
+                        &stats_tx,
+                        CrawlStatsEvent::DiscoveryBackpressure,
+                    )
                 {
-                    tracing::warn!("metadata backpressure statistic was not accepted");
+                    tracing::debug!(
+                        event = "stats_channel_full",
+                        event_kind = "discovery_backpressure",
+                        "metadata backpressure statistic was not accepted"
+                    );
+                }
+            }
+            _ = status_tick.tick() => {
+                let pending_peers = jobs.values().map(|job| job.peers.len()).sum();
+                if !emit_stat(
+                    &metrics,
+                    &stats_tx,
+                    CrawlStatsEvent::MetadataQueue {
+                        active_jobs: jobs.len(),
+                        queued_jobs: ready.len(),
+                        pending_peers,
+                    },
+                ) {
+                    tracing::debug!(
+                        event = "stats_channel_full",
+                        event_kind = "metadata_queue",
+                        "metadata queue statistic was not accepted"
+                    );
                 }
             }
             _ = retry_tick.tick() => {
@@ -1235,7 +1329,12 @@ pub async fn run_metadata_fetcher(
                     Ok::<_, crate::store::Error>(loaded)
                 }).await;
                 if let Err(error) = &due {
-                    tracing::warn!("failed to load due metadata jobs: {}", error);
+                    tracing::warn!(
+                        event = "metadata_job_load_failed",
+                        reason = "database",
+                        error = %error,
+                        "failed to load due metadata jobs"
+                    );
                 }
                 if let Ok(records) = due {
                     for (record, peers) in records {
@@ -1251,10 +1350,12 @@ pub async fn run_metadata_fetcher(
                         );
                         if admission == JobAdmission::Accepted {
                             tracing::debug!(
-                                "restoring {} metadata job {} after {:?}",
-                                record.status,
-                                hex::encode(record.info_hash),
-                                (record.next_attempt_at, record.last_failure)
+                                event = "metadata_job_restored",
+                                status = %record.status,
+                                attempt_count = record.attempt_count,
+                                next_attempt_at = record.next_attempt_at,
+                                has_last_failure = record.last_failure.is_some(),
+                                "restored metadata job"
                             );
                         }
                     }
@@ -1265,7 +1366,12 @@ pub async fn run_metadata_fetcher(
                     Some(Ok(outcome)) => {
                         apply_job_outcome(&mut jobs, &mut ready, &mut ready_set, outcome);
                     }
-                    Some(Err(error)) => tracing::warn!("metadata worker join error: {}", error),
+                    Some(Err(error)) => tracing::warn!(
+                        event = "metadata_worker_join_failed",
+                        reason = "join",
+                        error = %error,
+                        "metadata worker join error"
+                    ),
                     None => {}
                 }
             }
@@ -1274,7 +1380,12 @@ pub async fn run_metadata_fetcher(
 
     while let Some(result) = workers.join_next().await {
         if let Err(e) = result {
-            tracing::warn!("metadata worker join error: {}", e);
+            tracing::warn!(
+                event = "metadata_worker_join_failed",
+                reason = "join",
+                error = %e,
+                "metadata worker join error"
+            );
         }
     }
 }
@@ -1596,6 +1707,7 @@ mod tests {
                     retry_after_hours: 0,
                     max_metadata_size: 64 * 1024 * 1024,
                     prior_attempt_count: 0,
+                    metrics: Arc::new(CrawlerMetrics::default()),
                 },
                 |_, _, _, _| {
                     downloads.set(downloads.get() + 1);
@@ -1646,6 +1758,7 @@ mod tests {
                 retry_after_hours: 0,
                 max_metadata_size: 1024,
                 prior_attempt_count: 0,
+                metrics: Arc::new(CrawlerMetrics::default()),
             },
             |_, _, _, _| std::future::ready(Ok(bytes.clone())),
         )
@@ -1686,6 +1799,7 @@ mod tests {
                 retry_after_hours: 24,
                 max_metadata_size: 1024,
                 prior_attempt_count: 0,
+                metrics: Arc::new(CrawlerMetrics::default()),
             },
         )
         .await;
@@ -1731,6 +1845,7 @@ mod tests {
                 retry_after_hours: 24,
                 max_metadata_size: 1024,
                 prior_attempt_count: 1,
+                metrics: Arc::new(CrawlerMetrics::default()),
             },
         )
         .await;

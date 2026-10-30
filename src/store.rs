@@ -691,7 +691,11 @@ impl Store {
                 rebuilt += documents.len();
             }
             after = hashes.last().expect("nonempty search batch").clone();
-            tracing::info!(rebuilt, "rebuilt search documents");
+            tracing::info!(
+                event = "search_rebuild_progress",
+                rebuilt = rebuilt,
+                "rebuilt search documents"
+            );
         }
     }
     async fn replace_search_documents(
@@ -726,7 +730,12 @@ impl Store {
                 return Err(invalid(format!("ANALYZE TABLE failed: {message}")));
             }
             if kind == "warning" {
-                tracing::warn!("ANALYZE TABLE: {message}");
+                tracing::warn!(
+                    event = "database_analyze_warning",
+                    reason = "optimizer",
+                    message = %message,
+                    "ANALYZE TABLE warning"
+                );
             }
         }
         Ok(())

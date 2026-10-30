@@ -1,0 +1,21 @@
+[Unit]
+Description=btfind HTTP dashboard and API
+After=network-online.target mysql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/opc
+EnvironmentFile=/home/opc/.config/btfind/btfind-web.env
+Environment=RUST_LOG=btfind=info
+ExecStart=/home/opc/.local/bin/btfind serve
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=45
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=btfind-web
+
+[Install]
+WantedBy=default.target

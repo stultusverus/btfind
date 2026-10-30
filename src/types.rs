@@ -100,6 +100,11 @@ pub enum CrawlStatsEvent {
     SamplingResponse {
         samples: usize,
     },
+    MetadataQueue {
+        active_jobs: usize,
+        queued_jobs: usize,
+        pending_peers: usize,
+    },
     SampleObserved {
         info_hash: InfoHash,
         node_id: NodeId,

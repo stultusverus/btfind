@@ -1,4 +1,5 @@
 use crate::bencode::{KrpcError, KrpcMessage, KrpcValue};
+use crate::metrics::CrawlerMetrics;
 use crate::routing::RoutingTable;
 use crate::types::{
     random_node_id, CrawlStatsEvent, DiscoverySource, HashDiscovery, InfoHash, NodeContact, NodeId,
@@ -175,7 +176,13 @@ async fn resolve_v4(addr: &str) -> Option<SocketAddrV4> {
             std::net::SocketAddr::V6(_) => None,
         }),
         Err(error) => {
-            tracing::warn!("DNS resolution failed for '{}': {}", addr, error);
+            tracing::warn!(
+                event = "dht_dns_resolution_failed",
+                reason = "dns",
+                host = addr,
+                error = %error,
+                "DHT bootstrap host resolution failed"
+            );
             None
         }
     }
@@ -519,6 +526,7 @@ pub struct DhtCrawler {
     pub routing: RoutingTable,
     info_hash_tx: mpsc::Sender<HashDiscovery>,
     stats_tx: mpsc::Sender<CrawlStatsEvent>,
+    metrics: Arc<CrawlerMetrics>,
     token_secret: [u8; 16],
     bootstrap_nodes: Vec<String>,
     discovery_queue: VecDeque<InfoHash>,
@@ -541,6 +549,7 @@ impl DhtCrawler {
         info_hash_tx: mpsc::Sender<HashDiscovery>,
         stats_tx: mpsc::Sender<CrawlStatsEvent>,
         bootstrap_nodes: Vec<String>,
+        metrics: Arc<CrawlerMetrics>,
     ) -> Self {
         Self::with_config(
             random_node_id(),
@@ -549,6 +558,7 @@ impl DhtCrawler {
             stats_tx,
             bootstrap_nodes,
             DhtConfig::default(),
+            metrics,
         )
     }
 
@@ -559,6 +569,7 @@ impl DhtCrawler {
         stats_tx: mpsc::Sender<CrawlStatsEvent>,
         bootstrap_nodes: Vec<String>,
         config: DhtConfig,
+        metrics: Arc<CrawlerMetrics>,
     ) -> Self {
         let mut token_secret = [0; 16];
         rand::thread_rng().fill(&mut token_secret);
@@ -568,6 +579,7 @@ impl DhtCrawler {
             routing: RoutingTable::with_candidate_capacity(our_id, config.max_candidate_nodes),
             info_hash_tx,
             stats_tx,
+            metrics,
             token_secret,
             bootstrap_nodes,
             discovery_queue: VecDeque::new(),
@@ -585,11 +597,16 @@ impl DhtCrawler {
     }
 
     fn emit_stat(&self, event: CrawlStatsEvent) {
+        self.metrics.apply(&event);
         if matches!(
             self.stats_tx.try_send(event),
             Err(mpsc::error::TrySendError::Closed(_))
         ) {
-            tracing::warn!("statistics receiver closed");
+            tracing::warn!(
+                event = "stats_channel_closed",
+                component = "dht",
+                "statistics receiver closed"
+            );
         }
     }
 
@@ -646,7 +663,13 @@ impl DhtCrawler {
             }
             Err(error) => {
                 self.pending_rpcs.remove(&key);
-                tracing::debug!("failed to send {:?} to {}: {}", method, addr, error);
+                tracing::debug!(
+                    event = "dht_send_failed",
+                    method = ?method,
+                    reason = "udp",
+                    error = %error,
+                    "failed to send DHT query"
+                );
                 false
             }
         }
@@ -749,7 +772,12 @@ impl DhtCrawler {
                             self.handle_packet(&buffer[..length], source).await;
                         }
                         Ok(_) => {}
-                        Err(error) => tracing::warn!("DHT receive error: {}", error),
+                        Err(error) => tracing::warn!(
+                            event = "dht_receive_failed",
+                            reason = "udp",
+                            error = %error,
+                            "DHT receive error"
+                        ),
                     }
                 }
                 _ = discovery_tick.tick() => self.discover_peers().await,
@@ -800,7 +828,12 @@ impl DhtCrawler {
         let message = match KrpcMessage::from_bytes(data) {
             Ok(message) => message,
             Err(error) => {
-                tracing::debug!("malformed KRPC from {}: {}", source, error);
+                tracing::debug!(
+                    event = "dht_malformed_packet",
+                    reason = "decode",
+                    error = %error,
+                    "malformed KRPC packet"
+                );
                 self.emit_stat(CrawlStatsEvent::RpcMalformed);
                 return;
             }
@@ -862,7 +895,13 @@ impl DhtCrawler {
             _ => error_message(t, "unknown query"),
         };
         if let Err(error) = self.socket.send_to(&response.to_bytes(), source).await {
-            tracing::debug!("failed to answer {} from {}: {}", q, source, error);
+            tracing::debug!(
+                event = "dht_answer_failed",
+                method = %q,
+                reason = "udp",
+                error = %error,
+                "failed to send DHT response"
+            );
         }
     }
 
@@ -996,7 +1035,12 @@ impl DhtCrawler {
                 ) {
                     Ok(response) => response,
                     Err(error) => {
-                        tracing::debug!("invalid sample_infohashes response: {}", error);
+                        tracing::debug!(
+                            event = "dht_sample_response_invalid",
+                            reason = "malformed",
+                            error = %error,
+                            "invalid sample_infohashes response"
+                        );
                         self.emit_stat(CrawlStatsEvent::RpcMalformed);
                         return;
                     }
@@ -1007,9 +1051,9 @@ impl DhtCrawler {
                 self.sample_eligible_at
                     .insert(response.node_id, Instant::now() + interval);
                 tracing::debug!(
-                    "sampling node {} reports {} indexed hashes",
-                    source,
-                    response.total_num
+                    event = "dht_sampling_response",
+                    indexed_hashes = response.total_num,
+                    "sampling node response"
                 );
                 self.admit_candidates(&response.nodes);
                 for hash in &response.samples {

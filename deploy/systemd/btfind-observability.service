@@ -1,0 +1,26 @@
+[Unit]
+Description=Export btfind journal events and metrics to OCI
+Documentation=file:/opt/btfind-observability/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/btfind/observability.env
+ExecStart=/opt/btfind-observability/venv/bin/python /opt/btfind-observability/export.py
+StateDirectory=btfind-observability
+UMask=0077
+TimeoutStartSec=90
+SyslogIdentifier=btfind-observability
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/btfind-observability
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+LockPersonality=yes
+RestrictSUIDSGID=yes
+MemoryMax=192M
