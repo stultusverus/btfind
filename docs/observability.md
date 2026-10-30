@@ -268,6 +268,11 @@ for `ap-osaka-1`, `vm-sub01`, batching, lookback, and the freshness cutoff.
   between calls. Default hard deadlines sum to 70 seconds, leaving room under the
   example 90-second systemd timeout; raise them together only after reviewing
   that limit.
+  Each child validates only the resources for its destination and constructs only
+  the required OCI client. The logs child needs both custom log OCIDs; the metrics
+  child needs only the metric compartment OCID. A missing log OCID, Logging client
+  failure, missing metric compartment, or Monitoring client failure is isolated
+  to that destination.
 - **Bounded retries.** Throttling, 5xx, timeout, network, and connection failures
   use bounded exponential backoff. Authentication, authorization, missing
   resource, and other permanent errors are reported distinctly and do not advance

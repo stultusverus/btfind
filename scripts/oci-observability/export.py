@@ -77,12 +77,17 @@ def env_float(name, default):
     return float(value)
 
 
-def load_config():
-    required = {
-        "BTFIND_CRAWLER_LOG_OCID": "crawler log OCID",
-        "BTFIND_WEB_LOG_OCID": "web log OCID",
-        "OCI_METRICS_COMPARTMENT_OCID": "metric compartment OCID",
-    }
+def required_resources(stream):
+    if stream == "logs":
+        return {
+            "BTFIND_CRAWLER_LOG_OCID": "crawler log OCID",
+            "BTFIND_WEB_LOG_OCID": "web log OCID",
+        }
+    return {"OCI_METRICS_COMPARTMENT_OCID": "metric compartment OCID"}
+
+
+def load_config(stream):
+    required = required_resources(stream)
     missing = [description for name, description in required.items() if not os.environ.get(name)]
     if missing:
         raise ValueError("missing required configuration: " + ", ".join(missing))
@@ -90,9 +95,9 @@ def load_config():
     config = Config(
         region=os.environ.get("OCI_REGION", "ap-osaka-1"),
         instance=os.environ.get("INSTANCE_NAME", "vm-sub01"),
-        crawler_log_ocid=os.environ["BTFIND_CRAWLER_LOG_OCID"],
-        web_log_ocid=os.environ["BTFIND_WEB_LOG_OCID"],
-        metrics_compartment_ocid=os.environ["OCI_METRICS_COMPARTMENT_OCID"],
+        crawler_log_ocid=os.environ.get("BTFIND_CRAWLER_LOG_OCID", ""),
+        web_log_ocid=os.environ.get("BTFIND_WEB_LOG_OCID", ""),
+        metrics_compartment_ocid=os.environ.get("OCI_METRICS_COMPARTMENT_OCID", ""),
         state_dir=os.environ.get("STATE_DIR", "/var/lib/btfind-observability"),
         journal_lookback_seconds=env_int("JOURNAL_LOOKBACK_SECONDS", 300),
         journal_max_batches=env_int("JOURNAL_MAX_BATCHES", 10),
@@ -107,8 +112,12 @@ def load_config():
         metrics_budget_seconds=env_int("METRICS_EXPORT_BUDGET_SECONDS", 25),
     )
     config.log_ocids = {
-        "btfind-crawler": config.crawler_log_ocid,
-        "btfind-web": config.web_log_ocid,
+        service: ocid
+        for service, ocid in {
+            "btfind-crawler": config.crawler_log_ocid,
+            "btfind-web": config.web_log_ocid,
+        }.items()
+        if ocid
     }
     return config
 
@@ -156,7 +165,7 @@ def with_retry(label, operation, config, budget):
     raise PublishError(f"{label}: retries exhausted: {last_error}")
 
 
-def make_clients(config):
+def make_client(config, stream):
     import oci
 
     signer = oci.auth.signers.InstancePrincipalsSecurityTokenSigner()
@@ -170,22 +179,24 @@ def make_clients(config):
         ),
     )
     timeout = (api_timeout, api_timeout)
+
+    if stream == "logs":
+        return oci.loggingingestion.LoggingClient(
+            client_config,
+            signer=signer,
+            timeout=timeout,
+        )
+
     monitoring_endpoint = os.environ.get(
         "OCI_MONITORING_ENDPOINT",
         f"https://telemetry-ingestion.{config.region}.oraclecloud.com",
     )
-    logging_client = oci.loggingingestion.LoggingClient(
-        client_config,
-        signer=signer,
-        timeout=timeout,
-    )
-    monitoring_client = oci.monitoring.MonitoringClient(
+    return oci.monitoring.MonitoringClient(
         client_config,
         signer=signer,
         service_endpoint=monitoring_endpoint,
         timeout=timeout,
     )
-    return logging_client, monitoring_client
 
 
 def ship_log_batch(client, batch, config, budget):
@@ -372,7 +383,7 @@ def run_metrics(store, client, config):
 
 def run_stream(stream):
     try:
-        config = load_config()
+        config = load_config(stream)
     except (ValueError, TypeError) as error:
         emit(
             "configuration_invalid",
@@ -386,7 +397,7 @@ def run_stream(stream):
         store = checkpoint.CheckpointStore(config.state_dir)
         with store:
             try:
-                logging_client, monitoring_client = make_clients(config)
+                client = make_client(config, stream)
             except Exception as error:
                 emit(
                     "instance_principal_failed",
@@ -398,9 +409,9 @@ def run_stream(stream):
 
             try:
                 if stream == "logs":
-                    run_logs(store, logging_client, config)
+                    run_logs(store, client, config)
                 else:
-                    run_metrics(store, monitoring_client, config)
+                    run_metrics(store, client, config)
             except PublishError as error:
                 emit(
                     f"{stream}_export_failed",

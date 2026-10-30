@@ -54,9 +54,9 @@ sudo -u root /opt/btfind-observability/venv/bin/python \
 | --- | --- | --- |
 | `OCI_REGION` | `ap-osaka-1` | OCI Logging/Monitoring region |
 | `INSTANCE_NAME` | `vm-sub01` | Log `source` and Monitoring `instance` dimension |
-| `BTFIND_CRAWLER_LOG_OCID` | required | Custom log for `btfind-crawler` records |
-| `BTFIND_WEB_LOG_OCID` | required | Custom log for `btfind-web` records |
-| `OCI_METRICS_COMPARTMENT_OCID` | required | Compartment for the `btfind` metric namespace |
+| `BTFIND_CRAWLER_LOG_OCID` | required for logs | Custom log for `btfind-crawler` records |
+| `BTFIND_WEB_LOG_OCID` | required for logs | Custom log for `btfind-web` records |
+| `OCI_METRICS_COMPARTMENT_OCID` | required for metrics | Compartment for the `btfind` metric namespace |
 | `BTFIND_JOURNAL_UID` | `opc` UID, else `1000` | UID filter for journal records |
 | `BTFIND_INSTANCE_USER` | `opc` | User name used when `BTFIND_JOURNAL_UID` is unset |
 | `JOURNAL_LOOKBACK_SECONDS` | `300` | First-run lookback only, never a full backfill |
@@ -81,6 +81,14 @@ sudo -u root /opt/btfind-observability/venv/bin/python \
 The source journal identifiers are `btfind-crawler` and `btfind-web`. The
 exporter itself uses `btfind-observability`, which is intentionally excluded from
 the journal filters to avoid recursive ingestion.
+
+Each child stream validates only its own resources and constructs only its own
+OCI client. The logs child requires both custom log OCIDs; the metrics child
+requires only the metric compartment OCID. A missing log OCID or a Logging client
+initialisation failure therefore does not prevent the metrics child from running,
+and a missing metric compartment or Monitoring client failure does not prevent
+the logs child. Region, instance name, instance-principal authentication,
+state directory, and retry/budget settings remain shared.
 
 ## Journal selection and backlog
 
