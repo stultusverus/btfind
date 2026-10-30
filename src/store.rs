@@ -408,6 +408,11 @@ impl Store {
             })
             .collect()
     }
+    pub async fn hash_job_is_terminal(&self, hash: &InfoHash) -> Result<bool, Error> {
+        let terminal: Option<bool> = sqlx::query_scalar("SELECT status IN ('complete','invalid','unsupported') FROM hash_jobs WHERE info_hash=?")
+            .bind(hex::encode(hash)).fetch_optional(&self.pool).await?;
+        Ok(terminal.unwrap_or(false))
+    }
     pub async fn due_hash_jobs(&self, limit: usize) -> Result<Vec<HashJobRecord>, Error> {
         sqlx::query("SELECT * FROM hash_jobs WHERE status IN ('queued','retry_at') AND next_attempt_at<=? ORDER BY next_attempt_at,updated_at,info_hash LIMIT ?").bind(now()).bind(limit as u64).fetch_all(&self.pool).await?.iter().map(|r| Ok(HashJobRecord {
             info_hash:decode_hash(r.try_get("info_hash")?)?,status:r.try_get("status")?,attempt_count:u32::try_from(r.try_get::<i64,_>("attempt_count")?).map_err(|_| invalid("invalid attempt count"))?,next_attempt_at:r.try_get("next_attempt_at")?,last_failure:r.try_get("last_failure")?
@@ -784,10 +789,30 @@ impl SearchLimits {
         Self::for_packet(packet)
     }
 }
+#[derive(Debug)]
+struct SearchDocumentTooLarge {
+    hash: String,
+    budget: usize,
+}
+impl std::fmt::Display for SearchDocumentTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "search document {} exceeds document byte limit {}; document was not truncated",
+            self.hash, self.budget
+        )
+    }
+}
+impl std::error::Error for SearchDocumentTooLarge {}
+
+pub fn is_unsupported_search_document(error: &Error) -> bool {
+    matches!(error, Error::Encode(cause) if cause.is::<SearchDocumentTooLarge>())
+}
 fn document_too_large(hash: &str, budget: usize) -> Error {
-    invalid(format!(
-        "search document {hash} exceeds document byte limit {budget}; document was not truncated"
-    ))
+    Error::Encode(Box::new(SearchDocumentTooLarge {
+        hash: hash.to_owned(),
+        budget,
+    }))
 }
 fn append_search_text(output: &mut String, input: &str, budget: usize) -> bool {
     let mut separator = !output.is_empty();

@@ -95,7 +95,12 @@ are bounded too, and normalization checks its output incrementally. The separate
 rebuild batching target is 128 documents or approximately 1 MiB. A valid document
 larger than that target is written alone. Both paths preserve all searchable
 content or fail explicitly without truncation. An ingestion failure rolls back
-metadata changes. Completed rebuild batches remain committed; a rebuild can be
+metadata changes. A typed document-size failure marks the metadata job
+`unsupported`; the worker persists that terminal state without fetching from
+another peer and checks terminal states before subsequent downloads, including
+rediscoveries. Database write failures remain retryable. Unsupported jobs require
+explicit requeuing after a limit change. Completed rebuild batches remain
+committed; a rebuild can be
 rerun. See the README for exact limits and memory behavior. Rebuilds, schema migrations, and counter reconciliation
 require stopped services and never run within HTTP requests. After a logical
 restore, `db analyze` refreshes optimizer/full-text statistics.

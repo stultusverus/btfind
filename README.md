@@ -233,6 +233,12 @@ is incremental, so Unicode expansion cannot build an unlimited intermediate
 string. Exceeding a limit returns an explicit error with the hash and limit;
 content is never silently truncated. Ingestion rolls back the metadata transaction
 on failure; a failed rebuild retains the affected document's existing index entry.
+An oversized document marks the metadata job `unsupported`, recording the size
+error without scheduling another download. Rediscovery does not reactivate
+terminal jobs. If saving this state fails, the worker retries the state write,
+not the download. Other database failures retain normal retry behavior. After
+changing indexing limits, retrying an unsupported job requires explicitly
+requeuing it; the limit change alone does not reactivate it.
 
 The rebuild batching target is separate: at most 128 documents and approximately
 1 MiB per write, reduced for smaller packet limits. An accepted document larger

@@ -804,3 +804,14 @@ async fn mysql_discovery_retention_failure_rolls_back_and_concurrent_peers_merge
         .unwrap();
     assert_eq!(store.hash_job_peers(&hash, 16).await.unwrap().len(), 4);
 }
+
+#[test]
+fn search_size_error_is_typed() {
+    assert!(is_unsupported_search_document(&document_too_large(
+        "hash", 1024
+    )));
+    assert!(!is_unsupported_search_document(&invalid(
+        "search document hash exceeds document byte limit 1024; document was not truncated"
+    )));
+    assert!(!is_unsupported_search_document(&Error::PoolTimedOut));
+}

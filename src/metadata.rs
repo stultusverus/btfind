@@ -769,6 +769,51 @@ async fn process_hash_round(
     stats_tx: mpsc::Sender<CrawlStatsEvent>,
     config: FetchRoundConfig,
 ) -> JobOutcome {
+    process_hash_round_with_fetch(
+        info_hash,
+        peers,
+        store,
+        stats_tx,
+        config,
+        |hash, peer, timeout, limit| async move {
+            fetch_from_peer_with_limit(&hash, &peer, timeout, limit).await
+        },
+    )
+    .await
+}
+
+async fn process_hash_round_with_fetch<F, Fut>(
+    info_hash: InfoHash,
+    peers: Vec<PeerContact>,
+    store: Arc<Store>,
+    stats_tx: mpsc::Sender<CrawlStatsEvent>,
+    config: FetchRoundConfig,
+    mut fetch: F,
+) -> JobOutcome
+where
+    F: FnMut(InfoHash, PeerContact, Duration, u32) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<u8>, MetadataFetchError>>,
+{
+    let mut retry_delay = Duration::from_millis(100);
+    loop {
+        match store.hash_job_is_terminal(&info_hash).await {
+            Ok(true) => {
+                return JobOutcome {
+                    info_hash,
+                    attempts: 0,
+                    complete: false,
+                    terminal: true,
+                    parked: false,
+                }
+            }
+            Ok(false) => break,
+            Err(error) => {
+                tracing::warn!("failed to check metadata job state: {error}; retrying");
+                tokio::time::sleep(retry_delay).await;
+                retry_delay = retry_delay.saturating_mul(2).min(Duration::from_secs(5));
+            }
+        }
+    }
     let hash_hex = hex::encode(info_hash);
     let filter_store = store.clone();
     let filtered = (async move {
@@ -801,9 +846,9 @@ async fn process_hash_round(
             }
         }
 
-        match fetch_from_peer_with_limit(
-            &info_hash,
-            &peer,
+        match fetch(
+            info_hash,
+            peer,
             config.peer_timeout,
             config.max_metadata_size,
         )
@@ -857,6 +902,39 @@ async fn process_hash_round(
                                 attempts,
                                 complete: true,
                                 terminal: false,
+                                parked: false,
+                            };
+                        }
+                        Err(error) if crate::store::is_unsupported_search_document(&error) => {
+                            let message = error.to_string();
+                            let mut retry_delay = Duration::from_millis(100);
+                            loop {
+                                match store
+                                    .update_hash_job_failure(
+                                        &info_hash,
+                                        "unsupported",
+                                        config.prior_attempt_count.saturating_add(attempts),
+                                        0,
+                                        &message,
+                                    )
+                                    .await
+                                {
+                                    Ok(()) => break,
+                                    Err(error) => {
+                                        tracing::warn!("failed to record unsupported search document: {error}; retrying state write");
+                                        tokio::time::sleep(retry_delay).await;
+                                        retry_delay = retry_delay
+                                            .saturating_mul(2)
+                                            .min(Duration::from_secs(5));
+                                    }
+                                }
+                            }
+                            tracing::warn!("metadata job {} is unsupported: {}", hash_hex, message);
+                            return JobOutcome {
+                                info_hash,
+                                attempts,
+                                complete: false,
+                                terminal: true,
                                 parked: false,
                             };
                         }
@@ -1262,6 +1340,106 @@ mod tests {
         );
 
         assert!(result.unwrap_err().contains("torrent total size overflow"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires BTFIND_TEST_DATABASE_URL; run scripts/test-mysql.sh"]
+    async fn oversized_search_document_stops_downloads_after_one_attempt() {
+        let store = Arc::new(Store::open_test_database().await.unwrap());
+        let path = "㍿".repeat(300);
+        let file = format!("d6:lengthi1e4:pathl{}:{}ee", path.len(), path);
+        let bytes = format!(
+            "d5:filesl{}e4:name8:oversize12:piece lengthi16384ee",
+            file.repeat(5000)
+        )
+        .into_bytes();
+        assert!(bytes.len() < 64 * 1024 * 1024);
+        assert!(parse_torrent_info(&bytes).is_ok());
+        let info_hash: InfoHash = Sha1::digest(&bytes).into();
+        let peers = vec![
+            PeerContact {
+                addr: "8.8.8.8:6881".parse().unwrap(),
+            },
+            PeerContact {
+                addr: "8.8.4.4:6881".parse().unwrap(),
+            },
+        ];
+        store
+            .persist_hash_discovery(&info_hash, "test", &peers, 8)
+            .await
+            .unwrap();
+        let (stats_tx, mut stats_rx) = mpsc::channel(8);
+        let downloads = std::cell::Cell::new(0);
+        for round in 0..2 {
+            let outcome = process_hash_round_with_fetch(
+                info_hash,
+                peers.clone(),
+                store.clone(),
+                stats_tx.clone(),
+                FetchRoundConfig {
+                    peer_timeout: Duration::from_secs(1),
+                    retry_after_hours: 0,
+                    max_metadata_size: 64 * 1024 * 1024,
+                    prior_attempt_count: 0,
+                },
+                |_, _, _, _| {
+                    downloads.set(downloads.get() + 1);
+                    std::future::ready(Ok(bytes.clone()))
+                },
+            )
+            .await;
+            assert!(outcome.terminal);
+            assert!(!outcome.complete);
+            assert_eq!(outcome.attempts, u32::from(round == 0));
+            assert_eq!(
+                store.hash_job_schedule_for_test(&info_hash).await.unwrap(),
+                ("unsupported".into(), 1, 0)
+            );
+            assert!(store.due_hash_jobs(10).await.unwrap().is_empty());
+            store
+                .persist_hash_discovery(&info_hash, "rediscovered", &peers, 8)
+                .await
+                .unwrap();
+        }
+        assert_eq!(downloads.get(), 1);
+        assert!(stats_rx.try_recv().is_err());
+        assert_eq!(store.get_stats().await.unwrap().total_metadata_complete, 0);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires BTFIND_TEST_DATABASE_URL; run scripts/test-mysql.sh"]
+    async fn database_commit_failure_still_schedules_metadata_retry() {
+        let store = Arc::new(Store::open_test_database().await.unwrap());
+        let bytes = b"d6:lengthi42e4:name8:test.txt12:piece lengthi16384ee".to_vec();
+        let info_hash: InfoHash = Sha1::digest(&bytes).into();
+        let peers = vec![PeerContact {
+            addr: "8.8.8.8:6881".parse().unwrap(),
+        }];
+        store
+            .persist_hash_discovery(&info_hash, "test", &peers, 8)
+            .await
+            .unwrap();
+        store.execute_batch_for_test("CREATE TRIGGER fail_commit BEFORE INSERT ON files FOR EACH ROW SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='temporary storage failure'").await.unwrap();
+        let (stats_tx, _stats_rx) = mpsc::channel(8);
+        let outcome = process_hash_round_with_fetch(
+            info_hash,
+            peers,
+            store.clone(),
+            stats_tx,
+            FetchRoundConfig {
+                peer_timeout: Duration::from_secs(1),
+                retry_after_hours: 0,
+                max_metadata_size: 1024,
+                prior_attempt_count: 0,
+            },
+            |_, _, _, _| std::future::ready(Ok(bytes.clone())),
+        )
+        .await;
+        assert!(!outcome.terminal);
+        let (status, attempts, next) = store.hash_job_schedule_for_test(&info_hash).await.unwrap();
+        assert_eq!(status, "retry_at");
+        assert_eq!(attempts, 1);
+        assert!(next > chrono::Utc::now().timestamp());
     }
 
     #[tokio::test]
