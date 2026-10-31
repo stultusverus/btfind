@@ -46,7 +46,7 @@ these top-level keys:
 | `target` | Rust module target |
 | `service` | `crawler`, `web`, or `btfind` for CLI commands |
 | `version` | `CARGO_PKG_VERSION` |
-| `revision` | Optional build-time `BTFIND_GIT_REVISION` |
+| `revision` | Build-time `BTFIND_GIT_REVISION`; defaults to the Git commit, with an explicit environment override for archive builds |
 | `run_id` | Process-lifetime random UUID for counter reset detection |
 | `fields` | Event message and structured fields |
 
@@ -138,6 +138,25 @@ depend on the database writer draining its queue.
   database URLs, credentials, or high-cardinality peer identifiers.
 - journald is capped at 64 MiB with 1 GiB kept free, 8 MiB files, and a three-day
   age cap. Actual retention is the shorter of age and available space.
+
+### Metadata failure diagnosis
+
+`btfind stats` reports persisted failure counts. New attempts distinguish
+`connect_timeout`, `handshake_timeout`, `extension_timeout`, and
+`metadata_timeout`; transport errors use `connect`, `handshake_io`,
+`extension_io`, and `metadata_io`. Invalid handshakes use `handshake`, invalid
+extension negotiation uses `extension_protocol`, and invalid metadata frames use
+`protocol`. EOF and truncated reads retain their I/O stage and source error in
+the stored peer failure text.
+
+Unavailable metadata is split into `extensions_unsupported`,
+`metadata_unsupported`, `metadata_disabled`, and `metadata_size_missing`.
+`metadata_too_large` identifies the configured size limit; `rejected` identifies
+an explicit peer rejection. These availability/size/rejection failures use the
+existing long retry base (900 seconds); transport and malformed-protocol failures
+use the short base (30 seconds). Exponential backoff, jitter, and the configured
+peer retry interval still apply. Historical `timeout` and `extension` counts
+remain readable alongside the new categories; no migration rewrites old data.
 
 ## Expected OCI resources
 

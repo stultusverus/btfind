@@ -1304,7 +1304,7 @@ mod integration_tests {
             .unwrap();
         stats_tx
             .try_send(types::CrawlStatsEvent::MetadataFetchFailed {
-                reason: types::MetadataFailureReason::Timeout,
+                reason: types::MetadataFailureReason::MetadataTimeout,
             })
             .unwrap();
         stats_tx
@@ -1331,7 +1331,7 @@ mod integration_tests {
                     count: 2,
                 },
                 store::MetadataFailureCount {
-                    reason: "timeout".to_string(),
+                    reason: "metadata_timeout".to_string(),
                     count: 1,
                 },
             ]
