@@ -67,3 +67,15 @@ DhtCrawler ──(InfoHash, Vec<PeerContact>)──→ run_metadata_fetcher ─�
 - Integration tests in `src/main.rs` under `mod integration_tests`.
 - Don't write tests that hit the network (real DHT/peers).
 - Run offline tests with `cargo test` and database tests with `bash scripts/test-mysql.sh`; every test must pass. Database tests are explicitly ignored in the offline suite, not silently skipped when their server is unavailable.
+
+## Production Monitoring & Logging
+
+- Production runs on OCI instance `vm-sub01` in `ap-osaka-1`. Use the OCI CLI with `--region ap-osaka-1`. SSH access is `ssh vm-sub01`; if the connection stalls during banner exchange, use `ssh -o IPQoS=none vm-sub01`.
+- `btfind.service` (crawler) and `btfind-web.service` (HTTP server) are systemd **user** services. Both emit structured JSON to persistent systemd-journald, including status metrics every 60 seconds. Event names and metric fields are nested under `fields`.
+- The system-level `btfind-observability.timer` invokes a one-shot Python exporter using instance-principal authentication. It uploads logs to OCI Logging group `btfind-production`, custom logs `btfind-crawler` and `btfind-web`, and metrics to OCI Monitoring namespace `btfind` with `instance=vm-sub01`.
+- Metrics cover DHT activity, metadata fetching, queue utilisation, backpressure, HTTP traffic and latency. Crawler counters are exported as interval deltas; zero deltas are omitted, so an absent counter stream alone does not establish an exporter failure.
+- Production resource OCIDs and exporter settings are in `/etc/btfind/observability.env`; do not commit real OCIDs or credentials. Exporter code is in `/opt/btfind-observability/`, with checkpoints in `/var/lib/btfind-observability/`.
+- On the host, inspect application logs with `journalctl --user-unit=btfind.service` and `journalctl --user-unit=btfind-web.service`. Inspect exporter JSON diagnostics with `sudo journalctl -t btfind-observability`; inspect the JSON `level` field rather than relying only on journal priority filtering.
+- Check application state with `systemctl --user status btfind.service btfind-web.service`. Check exporter scheduling with `sudo systemctl status btfind-observability.timer btfind-observability.service`. The one-shot service is normally inactive between runs; the timer should be enabled and active. Its schedule is one minute after the preceding run finishes, with up to ten seconds of timer accuracy slack.
+- To enable or restore scheduled exports when requested: `sudo systemctl enable --now btfind-observability.timer`. Verify subsequent successful log and metric commits in the exporter journal and fresh events/datapoints in OCI; active applications alone do not establish healthy export.
+- See [docs/observability.md](docs/observability.md) for schemas, retention, delivery semantics and deployment details.
