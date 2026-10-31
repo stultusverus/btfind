@@ -11,6 +11,13 @@ cargo install --path .
 Requires current stable Rust and MySQL 8.4 or newer with the built-in ngram parser
 and `ngram_token_size=2`. Application connections disable full-text stopwords.
 
+Production builds from a Git checkout automatically embed the current commit in
+`BTFIND_GIT_REVISION`, which appears as `revision` in structured logs. Build with
+`cargo build --release` (or `cargo install --path .`). For source archives without
+Git metadata, supply `BTFIND_GIT_REVISION=<commit-sha>` to the build command. An
+explicit nonempty value takes precedence over Git detection. After deployment,
+check the `process_started` log event for the expected revision.
+
 ## Usage
 
 ```

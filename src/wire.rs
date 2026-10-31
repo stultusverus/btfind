@@ -317,12 +317,18 @@ impl ExtendedHandshake {
             for (k, v) in m_dict {
                 if let serde_bencode::value::Value::Int(i) = v {
                     if let Ok(key) = std::str::from_utf8(k) {
-                        if *i >= 1 && *i <= 255 {
+                        if (0..=255).contains(i) {
                             m.insert(key.to_string(), *i as u32);
+                        } else if key == "ut_metadata" {
+                            return None;
                         }
                     }
+                } else if k == b"ut_metadata" {
+                    return None;
                 }
             }
+        } else if dict.contains_key(b"m".as_slice()) {
+            return None;
         }
         let metadata_size = match dict.get(b"metadata_size".as_slice()) {
             Some(serde_bencode::value::Value::Int(i)) => {
@@ -332,7 +338,8 @@ impl ExtendedHandshake {
                 }
                 Some(val as u32)
             }
-            _ => None,
+            None => None,
+            Some(_) => return None,
         };
         let v = match dict.get(b"v".as_slice()) {
             Some(serde_bencode::value::Value::Bytes(b)) => {
@@ -795,19 +802,10 @@ mod tests {
             serde_bencode::to_bytes(&serde_bencode::value::Value::Dict(dict)).unwrap()
         };
 
-        // ut_metadata = -1 should be rejected
-        let parsed = ExtendedHandshake::from_bytes(&make_with_m_value(-1)).unwrap();
-        assert!(!parsed.m.contains_key("ut_metadata"));
-
-        // ut_metadata = 0 should be rejected
+        assert!(ExtendedHandshake::from_bytes(&make_with_m_value(-1)).is_none());
+        assert!(ExtendedHandshake::from_bytes(&make_with_m_value(300)).is_none());
         let parsed = ExtendedHandshake::from_bytes(&make_with_m_value(0)).unwrap();
-        assert!(!parsed.m.contains_key("ut_metadata"));
-
-        // ut_metadata = 300 should be rejected (>255)
-        let parsed = ExtendedHandshake::from_bytes(&make_with_m_value(300)).unwrap();
-        assert!(!parsed.m.contains_key("ut_metadata"));
-
-        // ut_metadata = 1 should be accepted
+        assert_eq!(parsed.m.get("ut_metadata"), Some(&0));
         let parsed = ExtendedHandshake::from_bytes(&make_with_m_value(1)).unwrap();
         assert_eq!(parsed.m.get("ut_metadata"), Some(&1));
     }

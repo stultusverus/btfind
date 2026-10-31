@@ -13,8 +13,10 @@ use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 
+const LOCAL_METADATA_ID: u8 = 1;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TimeoutStage {
+pub enum IoStage {
     Connect,
     HandshakeRead,
     HandshakeWrite,
@@ -24,78 +26,79 @@ pub enum TimeoutStage {
     MetadataWrite,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtensionUnavailable {
+    ExtensionsUnsupported,
+    MetadataUnsupported,
+    MetadataDisabled,
+    MetadataSizeMissing,
+}
+
 #[derive(Debug)]
 pub enum MetadataFetchError {
-    Connect(String),
-    Timeout { stage: TimeoutStage },
+    Io {
+        stage: IoStage,
+        source: std::io::Error,
+    },
+    Timeout {
+        stage: IoStage,
+    },
     InvalidHandshake,
-    ExtensionUnsupported,
+    ExtensionUnavailable(ExtensionUnavailable),
+    MetadataTooLarge {
+        size: u32,
+        limit: u32,
+    },
     MetadataRejected,
-    MalformedProtocol(String),
+    Protocol {
+        stage: IoStage,
+        message: String,
+    },
 }
 
 impl MetadataFetchError {
-    fn from_protocol_message(message: String) -> Self {
-        if message == "connect timeout" {
-            Self::Timeout {
-                stage: TimeoutStage::Connect,
-            }
-        } else if message.starts_with("connect error") {
-            Self::Connect(message)
-        } else if message.contains("handshake read timeout") {
-            Self::Timeout {
-                stage: TimeoutStage::HandshakeRead,
-            }
-        } else if message.contains("handshake write timeout") {
-            Self::Timeout {
-                stage: TimeoutStage::HandshakeWrite,
-            }
-        } else if message.contains("extended handshake") && message.contains("timeout") {
-            Self::Timeout {
-                stage: if message.contains("write") {
-                    TimeoutStage::ExtensionWrite
-                } else {
-                    TimeoutStage::ExtensionRead
-                },
-            }
-        } else if message.contains("metadata") && message.contains("write timeout") {
-            Self::Timeout {
-                stage: TimeoutStage::MetadataWrite,
-            }
-        } else if message.contains("timeout") {
-            Self::Timeout {
-                stage: TimeoutStage::MetadataRead,
-            }
-        } else if message.contains("invalid handshake") || message.contains("info_hash mismatch") {
-            Self::InvalidHandshake
-        } else if message.contains("extensions")
-            || message.contains("ut_metadata")
-            || message.contains("metadata_size")
-            || message.contains("extended handshake")
-        {
-            Self::ExtensionUnsupported
-        } else if message.contains("rejected metadata") {
-            Self::MetadataRejected
-        } else {
-            Self::MalformedProtocol(message)
-        }
-    }
-
     fn reason(&self) -> MetadataFailureReason {
+        use IoStage::*;
         match self {
-            MetadataFetchError::Connect(_) => MetadataFailureReason::Connect,
-            MetadataFetchError::Timeout { .. } => MetadataFailureReason::Timeout,
-            MetadataFetchError::InvalidHandshake => MetadataFailureReason::Handshake,
-            MetadataFetchError::ExtensionUnsupported => MetadataFailureReason::Extension,
-            MetadataFetchError::MetadataRejected => MetadataFailureReason::Rejected,
-            MetadataFetchError::MalformedProtocol(_) => MetadataFailureReason::Protocol,
+            Self::Io { stage, .. } => match stage {
+                Connect => MetadataFailureReason::Connect,
+                HandshakeRead | HandshakeWrite => MetadataFailureReason::HandshakeIo,
+                ExtensionRead | ExtensionWrite => MetadataFailureReason::ExtensionIo,
+                MetadataRead | MetadataWrite => MetadataFailureReason::MetadataIo,
+            },
+            Self::Timeout { stage } => match stage {
+                Connect => MetadataFailureReason::ConnectTimeout,
+                HandshakeRead | HandshakeWrite => MetadataFailureReason::HandshakeTimeout,
+                ExtensionRead | ExtensionWrite => MetadataFailureReason::ExtensionTimeout,
+                MetadataRead | MetadataWrite => MetadataFailureReason::MetadataTimeout,
+            },
+            Self::InvalidHandshake => MetadataFailureReason::Handshake,
+            Self::ExtensionUnavailable(reason) => match reason {
+                ExtensionUnavailable::ExtensionsUnsupported => {
+                    MetadataFailureReason::ExtensionsUnsupported
+                }
+                ExtensionUnavailable::MetadataUnsupported => {
+                    MetadataFailureReason::MetadataUnsupported
+                }
+                ExtensionUnavailable::MetadataDisabled => MetadataFailureReason::MetadataDisabled,
+                ExtensionUnavailable::MetadataSizeMissing => {
+                    MetadataFailureReason::MetadataSizeMissing
+                }
+            },
+            Self::MetadataTooLarge { .. } => MetadataFailureReason::MetadataTooLarge,
+            Self::MetadataRejected => MetadataFailureReason::Rejected,
+            Self::Protocol {
+                stage: ExtensionRead | ExtensionWrite,
+                ..
+            } => MetadataFailureReason::ExtensionProtocol,
+            Self::Protocol { .. } => MetadataFailureReason::Protocol,
         }
     }
 
     fn long_backoff(&self) -> bool {
         matches!(
             self,
-            MetadataFetchError::ExtensionUnsupported | MetadataFetchError::MetadataRejected
+            Self::ExtensionUnavailable(_) | Self::MetadataTooLarge { .. } | Self::MetadataRejected
         )
     }
 }
@@ -103,23 +106,26 @@ impl MetadataFetchError {
 impl std::fmt::Display for MetadataFetchError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            MetadataFetchError::Connect(message)
-            | MetadataFetchError::MalformedProtocol(message) => formatter.write_str(message),
-            MetadataFetchError::Timeout { stage } => {
-                write!(formatter, "timeout during {:?}", stage)
+            Self::Io { stage, source } => write!(formatter, "I/O during {stage:?}: {source}"),
+            Self::Timeout { stage } => write!(formatter, "timeout during {stage:?}"),
+            Self::InvalidHandshake => {
+                formatter.write_str("invalid handshake or info_hash mismatch")
             }
-            MetadataFetchError::InvalidHandshake => formatter.write_str("invalid handshake"),
-            MetadataFetchError::ExtensionUnsupported => {
-                formatter.write_str("metadata extension unsupported")
+            Self::ExtensionUnavailable(reason) => formatter.write_str(match reason {
+                ExtensionUnavailable::ExtensionsUnsupported => "peer does not support extensions",
+                ExtensionUnavailable::MetadataUnsupported => "peer does not advertise ut_metadata",
+                ExtensionUnavailable::MetadataDisabled => "peer disabled ut_metadata",
+                ExtensionUnavailable::MetadataSizeMissing => "peer did not advertise metadata_size",
+            }),
+            Self::MetadataTooLarge { size, limit } => {
+                write!(formatter, "metadata size {size} exceeds limit {limit}")
             }
-            MetadataFetchError::MetadataRejected => formatter.write_str("metadata rejected"),
+            Self::MetadataRejected => formatter.write_str("metadata rejected"),
+            Self::Protocol { stage, message } => {
+                write!(formatter, "protocol error during {stage:?}: {message}")
+            }
         }
     }
-}
-
-#[cfg(test)]
-fn classify_metadata_failure(message: &str) -> MetadataFailureReason {
-    MetadataFetchError::from_protocol_message(message.to_string()).reason()
 }
 
 pub fn metadata_piece_count(total_size: u32) -> u32 {
@@ -153,13 +159,14 @@ pub async fn fetch_from_peer_with_limit(
     let stream = timeout(peer_timeout, TcpStream::connect(addr))
         .await
         .map_err(|_| MetadataFetchError::Timeout {
-            stage: TimeoutStage::Connect,
+            stage: IoStage::Connect,
         })?
-        .map_err(|error| MetadataFetchError::Connect(format!("connect error: {}", error)))?;
+        .map_err(|source| MetadataFetchError::Io {
+            stage: IoStage::Connect,
+            source,
+        })?;
 
-    fetch_from_stream_with_limit(info_hash, stream, peer_timeout, max_metadata_size)
-        .await
-        .map_err(MetadataFetchError::from_protocol_message)
+    fetch_from_stream_with_limit(info_hash, stream, peer_timeout, max_metadata_size).await
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -167,7 +174,7 @@ async fn fetch_from_stream<S>(
     info_hash: &InfoHash,
     stream: S,
     peer_timeout: Duration,
-) -> Result<Vec<u8>, String>
+) -> Result<Vec<u8>, MetadataFetchError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -179,34 +186,45 @@ async fn fetch_from_stream_with_limit<S>(
     mut stream: S,
     peer_timeout: Duration,
     max_metadata_size: u32,
-) -> Result<Vec<u8>, String>
+) -> Result<Vec<u8>, MetadataFetchError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let our_peer_id = crate::types::random_node_id();
 
     let hs = Handshake::new(*info_hash, our_peer_id);
-    write_all_timeout(&mut stream, &hs.to_bytes(), peer_timeout, "handshake").await?;
+    write_all_timeout(
+        &mut stream,
+        &hs.to_bytes(),
+        peer_timeout,
+        IoStage::HandshakeWrite,
+    )
+    .await?;
 
     let mut handshake_buf = vec![0u8; HANDSHAKE_LEN];
-    timeout(peer_timeout, stream.read_exact(&mut handshake_buf))
-        .await
-        .map_err(|_| "handshake read timeout".to_string())?
-        .map_err(|e| format!("read handshake: {}", e))?;
+    read_exact_timeout(
+        &mut stream,
+        &mut handshake_buf,
+        peer_timeout,
+        IoStage::HandshakeRead,
+    )
+    .await?;
 
-    let hs_resp = Handshake::from_bytes(&handshake_buf)
-        .ok_or_else(|| "invalid handshake response".to_string())?;
+    let hs_resp =
+        Handshake::from_bytes(&handshake_buf).ok_or(MetadataFetchError::InvalidHandshake)?;
 
     if hs_resp.info_hash != *info_hash {
-        return Err("handshake info_hash mismatch".to_string());
+        return Err(MetadataFetchError::InvalidHandshake);
     }
 
     if !hs_resp.supports_extensions() {
-        return Err("peer doesn't support extensions".to_string());
+        return Err(MetadataFetchError::ExtensionUnavailable(
+            ExtensionUnavailable::ExtensionsUnsupported,
+        ));
     }
 
     let mut m = std::collections::BTreeMap::new();
-    m.insert("ut_metadata".to_string(), 1u32);
+    m.insert("ut_metadata".to_string(), u32::from(LOCAL_METADATA_ID));
 
     let ext_hs = ExtendedHandshake {
         m,
@@ -216,9 +234,13 @@ where
         reqq: None,
     };
 
-    let ext_hs_bytes =
-        serde_bencode::to_bytes(&serde_bencode::value::Value::Dict(ext_hs.to_dict()))
-            .map_err(|e| format!("encode ext hs: {}", e))?;
+    let ext_hs_bytes = serde_bencode::to_bytes(&serde_bencode::value::Value::Dict(
+        ext_hs.to_dict(),
+    ))
+    .map_err(|e| MetadataFetchError::Protocol {
+        stage: IoStage::ExtensionWrite,
+        message: format!("encode extended handshake: {e}"),
+    })?;
 
     let ext_msg = WireMessage::Extended {
         id: 0,
@@ -229,33 +251,42 @@ where
         &mut stream,
         &ext_msg.to_bytes(),
         peer_timeout,
-        "extended handshake",
+        IoStage::ExtensionWrite,
     )
     .await?;
 
     let peer_ext_hs = read_extended_handshake(&mut stream, peer_timeout).await?;
 
-    let ut_metadata_id = peer_ext_hs
-        .m
-        .get("ut_metadata")
-        .copied()
-        .ok_or_else(|| "peer doesn't support ut_metadata".to_string())?;
-
-    if ut_metadata_id == 0 || ut_metadata_id > 255 {
-        return Err(format!("invalid ut_metadata id: {}", ut_metadata_id));
+    let peer_metadata_id = peer_ext_hs.m.get("ut_metadata").copied().ok_or(
+        MetadataFetchError::ExtensionUnavailable(ExtensionUnavailable::MetadataUnsupported),
+    )?;
+    if peer_metadata_id == 0 {
+        return Err(MetadataFetchError::ExtensionUnavailable(
+            ExtensionUnavailable::MetadataDisabled,
+        ));
     }
-    let ut_metadata_id = ut_metadata_id as u8;
-
-    let metadata_size = peer_ext_hs
-        .metadata_size
-        .ok_or_else(|| "peer didn't advertise metadata_size".to_string())?;
-
+    let peer_metadata_id =
+        u8::try_from(peer_metadata_id).map_err(|_| MetadataFetchError::Protocol {
+            stage: IoStage::ExtensionRead,
+            message: format!("invalid ut_metadata id: {peer_metadata_id}"),
+        })?;
+    let metadata_size =
+        peer_ext_hs
+            .metadata_size
+            .ok_or(MetadataFetchError::ExtensionUnavailable(
+                ExtensionUnavailable::MetadataSizeMissing,
+            ))?;
     if metadata_size == 0 {
-        return Err("peer advertised metadata_size = 0".to_string());
+        return Err(MetadataFetchError::Protocol {
+            stage: IoStage::ExtensionRead,
+            message: "metadata_size is zero".to_string(),
+        });
     }
-
     if metadata_size > max_metadata_size {
-        return Err("metadata too large".to_string());
+        return Err(MetadataFetchError::MetadataTooLarge {
+            size: metadata_size,
+            limit: max_metadata_size,
+        });
     }
 
     let total_pieces = metadata_piece_count(metadata_size);
@@ -270,14 +301,14 @@ where
     while next_to_request < total_pieces && in_flight < max_outstanding as u32 {
         let req = wire::build_metadata_request(next_to_request);
         let req_msg = WireMessage::Extended {
-            id: ut_metadata_id,
+            id: peer_metadata_id,
             payload: req,
         };
         write_all_timeout(
             &mut stream,
             &req_msg.to_bytes(),
             peer_timeout,
-            "metadata request",
+            IoStage::MetadataWrite,
         )
         .await?;
         requested.insert(next_to_request);
@@ -292,30 +323,41 @@ where
     while received < total_pieces {
         let remaining = deadline.saturating_sub(start.elapsed());
         if remaining.is_zero() {
-            return Err("metadata receive timeout".to_string());
+            return Err(MetadataFetchError::Timeout {
+                stage: IoStage::MetadataRead,
+            });
         }
 
-        match read_next_frame(&mut stream, &mut buf, remaining).await? {
-            Some(WireMessage::Extended { id, payload }) if id == ut_metadata_id => {
+        match read_next_frame(&mut stream, &mut buf, remaining, IoStage::MetadataRead).await? {
+            Some(WireMessage::Extended { id, payload }) if id == LOCAL_METADATA_ID => {
                 match wire::parse_metadata_response(&payload) {
                     Some(Ok((piece_idx, total_size, data))) => {
                         if requested.remove(&piece_idx) {
                             in_flight -= 1;
                         }
                         if total_size != metadata_size {
-                            return Err("metadata total_size mismatch".to_string());
+                            return Err(MetadataFetchError::Protocol {
+                                stage: IoStage::MetadataRead,
+                                message: "metadata total_size mismatch".to_string(),
+                            });
                         }
                         if piece_idx >= total_pieces {
-                            return Err("metadata piece out of range".to_string());
+                            return Err(MetadataFetchError::Protocol {
+                                stage: IoStage::MetadataRead,
+                                message: "metadata piece out of range".to_string(),
+                            });
                         }
                         let expected_len =
                             metadata_piece_len(metadata_size, total_pieces, piece_idx);
                         if data.len() != expected_len {
-                            return Err(format!(
-                                "invalid metadata piece length: got {}, expected {}",
-                                data.len(),
-                                expected_len
-                            ));
+                            return Err(MetadataFetchError::Protocol {
+                                stage: IoStage::MetadataRead,
+                                message: format!(
+                                    "invalid metadata piece length: got {}, expected {}",
+                                    data.len(),
+                                    expected_len
+                                ),
+                            });
                         }
                         if pieces[piece_idx as usize].is_none() {
                             pieces[piece_idx as usize] = Some(data);
@@ -323,7 +365,7 @@ where
                         }
                     }
                     Some(Err(())) => {
-                        return Err("peer rejected metadata request".to_string());
+                        return Err(MetadataFetchError::MetadataRejected);
                     }
                     None => {}
                 }
@@ -335,14 +377,14 @@ where
         while next_to_request < total_pieces && in_flight < max_outstanding as u32 {
             let req = wire::build_metadata_request(next_to_request);
             let req_msg = WireMessage::Extended {
-                id: ut_metadata_id,
+                id: peer_metadata_id,
                 payload: req,
             };
             write_all_timeout(
                 &mut stream,
                 &req_msg.to_bytes(),
                 peer_timeout,
-                "metadata request",
+                IoStage::MetadataWrite,
             )
             .await?;
             requested.insert(next_to_request);
@@ -355,20 +397,31 @@ where
     for piece in &pieces {
         match piece {
             Some(data) => all_data.extend_from_slice(data),
-            None => return Err("missing metadata piece".to_string()),
+            None => {
+                return Err(MetadataFetchError::Protocol {
+                    stage: IoStage::MetadataRead,
+                    message: "missing metadata piece".to_string(),
+                })
+            }
         }
     }
 
     if all_data.is_empty() {
-        return Err("empty metadata".to_string());
+        return Err(MetadataFetchError::Protocol {
+            stage: IoStage::MetadataRead,
+            message: "empty metadata".to_string(),
+        });
     }
 
     if all_data.len() != metadata_size as usize {
-        return Err(format!(
-            "metadata size mismatch: got {}, expected {}",
-            all_data.len(),
-            metadata_size
-        ));
+        return Err(MetadataFetchError::Protocol {
+            stage: IoStage::MetadataRead,
+            message: format!(
+                "metadata size mismatch: got {}, expected {}",
+                all_data.len(),
+                metadata_size
+            ),
+        });
     }
 
     Ok(all_data)
@@ -378,86 +431,92 @@ async fn write_all_timeout<S>(
     stream: &mut S,
     bytes: &[u8],
     timeout_dur: Duration,
-    stage: &str,
-) -> Result<(), String>
+    stage: IoStage,
+) -> Result<(), MetadataFetchError>
 where
     S: AsyncWrite + Unpin,
 {
     timeout(timeout_dur, stream.write_all(bytes))
         .await
-        .map_err(|_| format!("{} write timeout", stage))?
-        .map_err(|error| format!("write {}: {}", stage, error))
+        .map_err(|_| MetadataFetchError::Timeout { stage })?
+        .map_err(|source| MetadataFetchError::Io { stage, source })
 }
 
 async fn read_extended_handshake<S>(
     stream: &mut S,
     peer_timeout: Duration,
-) -> Result<ExtendedHandshake, String>
+) -> Result<ExtendedHandshake, MetadataFetchError>
 where
     S: AsyncRead + Unpin,
 {
-    let deadline = peer_timeout;
     let start = std::time::Instant::now();
     let mut buf = Vec::new();
-
     loop {
-        let remaining = deadline.saturating_sub(start.elapsed());
+        let remaining = peer_timeout.saturating_sub(start.elapsed());
         if remaining.is_zero() {
-            return Err("extended handshake read timeout".to_string());
+            return Err(MetadataFetchError::Timeout {
+                stage: IoStage::ExtensionRead,
+            });
         }
-
-        match read_next_frame(stream, &mut buf, remaining).await? {
+        match read_next_frame(stream, &mut buf, remaining, IoStage::ExtensionRead).await? {
             Some(WireMessage::Extended { id: 0, payload }) => {
-                return ExtendedHandshake::from_bytes(&payload)
-                    .ok_or_else(|| "invalid extended handshake".to_string());
+                return ExtendedHandshake::from_bytes(&payload).ok_or_else(|| {
+                    MetadataFetchError::Protocol {
+                        stage: IoStage::ExtensionRead,
+                        message: "invalid extended handshake".to_string(),
+                    }
+                });
             }
             Some(_) => continue,
-            None => return Err("connection closed before extended handshake".to_string()),
+            None => {
+                return Err(MetadataFetchError::Protocol {
+                    stage: IoStage::ExtensionRead,
+                    message: "invalid frame during extended handshake".to_string(),
+                })
+            }
         }
     }
 }
 
-async fn read_frame_header<S>(stream: &mut S, timeout_dur: Duration) -> Result<u32, String>
+async fn read_exact_timeout<S>(
+    stream: &mut S,
+    buf: &mut [u8],
+    timeout_dur: Duration,
+    stage: IoStage,
+) -> Result<(), MetadataFetchError>
 where
     S: AsyncRead + Unpin,
 {
-    let mut header = [0u8; 4];
-    timeout(timeout_dur, stream.read_exact(&mut header))
+    timeout(timeout_dur, stream.read_exact(buf))
         .await
-        .map_err(|_| "frame header read timeout".to_string())?
-        .map_err(|e| format!("read frame header: {}", e))?;
-    Ok(u32::from_be_bytes(header))
+        .map_err(|_| MetadataFetchError::Timeout { stage })?
+        .map_err(|source| MetadataFetchError::Io { stage, source })?;
+    Ok(())
 }
 
 async fn read_next_frame<S>(
     stream: &mut S,
     buf: &mut Vec<u8>,
     timeout_dur: Duration,
-) -> Result<Option<WireMessage>, String>
+    stage: IoStage,
+) -> Result<Option<WireMessage>, MetadataFetchError>
 where
     S: AsyncRead + Unpin,
 {
-    let len = match read_frame_header(stream, timeout_dur).await {
-        Ok(l) => l,
-        Err(e) if e.contains("timeout") => return Err(e),
-        Err(_) => return Ok(None),
-    };
-
+    let mut header = [0u8; 4];
+    read_exact_timeout(stream, &mut header, timeout_dur, stage).await?;
+    let len = u32::from_be_bytes(header);
     if len == 0 {
         return Ok(Some(WireMessage::KeepAlive));
     }
-
     if len > 262_144 {
-        return Err(format!("frame too large: {} bytes", len));
+        return Err(MetadataFetchError::Protocol {
+            stage,
+            message: format!("frame too large: {len} bytes"),
+        });
     }
-
     buf.resize(len as usize, 0);
-    match timeout(timeout_dur, stream.read_exact(buf)).await {
-        Ok(Ok(_)) => {}
-        Ok(Err(e)) => return Err(format!("read frame body: {}", e)),
-        Err(_) => return Err("frame body read timeout".to_string()),
-    }
-
+    read_exact_timeout(stream, buf, timeout_dur, stage).await?;
     Ok(WireMessage::from_bytes_frame(len, buf))
 }
 
@@ -1772,6 +1831,100 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires BTFIND_TEST_DATABASE_URL; run scripts/test-mysql.sh"]
+    async fn typed_failures_persist_the_correct_retry_backoff() {
+        let store = Arc::new(Store::open_test_database().await.unwrap());
+        let peer = PeerContact {
+            addr: "192.0.2.1:6881".parse().unwrap(),
+        };
+        for (index, (error, base, expected_reason)) in [
+            (
+                MetadataFetchError::Timeout {
+                    stage: IoStage::ExtensionRead,
+                },
+                30,
+                MetadataFailureReason::ExtensionTimeout,
+            ),
+            (
+                MetadataFetchError::Io {
+                    stage: IoStage::ExtensionRead,
+                    source: std::io::ErrorKind::UnexpectedEof.into(),
+                },
+                30,
+                MetadataFailureReason::ExtensionIo,
+            ),
+            (
+                MetadataFetchError::Protocol {
+                    stage: IoStage::ExtensionRead,
+                    message: "invalid extended handshake".into(),
+                },
+                30,
+                MetadataFailureReason::ExtensionProtocol,
+            ),
+            (
+                MetadataFetchError::ExtensionUnavailable(ExtensionUnavailable::MetadataDisabled),
+                900,
+                MetadataFailureReason::MetadataDisabled,
+            ),
+            (
+                MetadataFetchError::MetadataRejected,
+                900,
+                MetadataFailureReason::Rejected,
+            ),
+            (
+                MetadataFetchError::MetadataTooLarge {
+                    size: 2048,
+                    limit: 1024,
+                },
+                900,
+                MetadataFailureReason::MetadataTooLarge,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let hash = [index as u8; 20];
+            store
+                .persist_hash_discovery(&hash, "test", std::slice::from_ref(&peer), 8)
+                .await
+                .unwrap();
+            let (stats_tx, mut stats_rx) = mpsc::channel(4);
+            let mut error = Some(error);
+            let before = chrono::Utc::now().timestamp();
+            let outcome = process_hash_round_with_fetch(
+                hash,
+                vec![peer.clone()],
+                store.clone(),
+                stats_tx,
+                FetchRoundConfig {
+                    peer_timeout: Duration::from_secs(1),
+                    retry_after_hours: 0,
+                    max_metadata_size: 1024,
+                    prior_attempt_count: 0,
+                    metrics: Arc::new(CrawlerMetrics::default()),
+                },
+                |_, _, _, _| std::future::ready(Err(error.take().unwrap())),
+            )
+            .await;
+            let after = chrono::Utc::now().timestamp();
+            assert_eq!(outcome.attempts, 1);
+            assert!(!outcome.complete && !outcome.terminal && !outcome.parked);
+            let (status, attempts, next) = store.hash_job_schedule_for_test(&hash).await.unwrap();
+            assert_eq!((status.as_str(), attempts), ("retry_at", 1));
+            assert!(
+                (before + base * 2..=after + base * 2 + base / 2).contains(&next),
+                "unexpected retry time {next}"
+            );
+            assert_eq!(
+                stats_rx.recv().await,
+                Some(CrawlStatsEvent::MetadataFetchFailed {
+                    reason: expected_reason
+                })
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires BTFIND_TEST_DATABASE_URL; run scripts/test-mysql.sh"]
     async fn durable_retry_waits_until_peer_is_eligible() {
         let store = Arc::new(Store::open_test_database().await.unwrap());
         let info_hash = [0xACu8; 20];
@@ -1873,8 +2026,7 @@ mod tests {
         assert_eq!(status, "queued");
     }
 
-    #[tokio::test]
-    async fn test_fetch_from_stream_success() {
+    async fn assert_fetch_with_peer_metadata_id(peer_metadata_id: u32) {
         let info_dict = b"d6:lengthi42e4:name8:test.txt12:piece lengthi16384ee";
         let info_hash: InfoHash = {
             let mut hasher = Sha1::new();
@@ -1885,7 +2037,7 @@ mod tests {
         let (client_stream, mut server_stream) = tokio::io::duplex(64 * 1024);
         let server_info_hash = info_hash;
 
-        let _server = tokio::spawn(async move {
+        let server = tokio::spawn(async move {
             // read handshake
             let mut buf = vec![0u8; HANDSHAKE_LEN];
             server_stream.read_exact(&mut buf).await.unwrap();
@@ -1903,10 +2055,17 @@ mod tests {
             let len = u32::from_be_bytes(len_buf) as usize;
             let mut body = vec![0u8; len];
             server_stream.read_exact(&mut body).await.unwrap();
+            let Some(WireMessage::Extended { id: 0, payload }) =
+                WireMessage::from_bytes_frame(len as u32, &body)
+            else {
+                panic!("expected local extended handshake");
+            };
+            let local = ExtendedHandshake::from_bytes(&payload).unwrap();
+            assert_eq!(local.m.get("ut_metadata"), Some(&1));
 
             // send extended handshake with ut_metadata
             let mut m = std::collections::BTreeMap::new();
-            m.insert("ut_metadata".to_string(), 1u32);
+            m.insert("ut_metadata".to_string(), peer_metadata_id);
             let ext_hs = ExtendedHandshake {
                 m,
                 metadata_size: Some(info_dict.len() as u32),
@@ -1929,6 +2088,9 @@ mod tests {
             let len = u32::from_be_bytes(len_buf) as usize;
             let mut body = vec![0u8; len];
             server_stream.read_exact(&mut body).await.unwrap();
+            assert!(
+                matches!(WireMessage::from_bytes_frame(len as u32, &body), Some(WireMessage::Extended { id, .. }) if u32::from(id) == peer_metadata_id)
+            );
 
             // send metadata piece with trailing data
             let mut dict = std::collections::HashMap::new();
@@ -1961,6 +2123,245 @@ mod tests {
         let info = parse_torrent_info(&data).unwrap();
         assert_eq!(info.name, "test.txt");
         assert_eq!(info.total_size, 42);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_fetch_from_stream_identical_extension_ids() {
+        assert_fetch_with_peer_metadata_id(1).await;
+    }
+
+    #[tokio::test]
+    async fn test_fetch_from_stream_different_extension_ids() {
+        assert_fetch_with_peer_metadata_id(3).await;
+        assert_fetch_with_peer_metadata_id(255).await;
+    }
+
+    fn negotiation_bytes(metadata_id: Option<u32>, size: Option<u32>) -> Vec<u8> {
+        let mut m = std::collections::BTreeMap::new();
+        if let Some(id) = metadata_id {
+            m.insert("ut_metadata".to_string(), id);
+        }
+        let handshake = ExtendedHandshake {
+            m,
+            metadata_size: size,
+            v: None,
+            your_ip: None,
+            reqq: None,
+        };
+        let payload =
+            serde_bencode::to_bytes(&serde_bencode::value::Value::Dict(handshake.to_dict()))
+                .unwrap();
+        WireMessage::Extended { id: 0, payload }.to_bytes()
+    }
+
+    async fn error_from_peer_bytes(bytes: &[u8], close: bool) -> MetadataFetchError {
+        let (client, mut peer) = tokio::io::duplex(4096);
+        peer.write_all(bytes).await.unwrap();
+        if close {
+            peer.shutdown().await.unwrap();
+        }
+        let error =
+            fetch_from_stream_with_limit(&[0xAA; 20], client, Duration::from_millis(10), 1024)
+                .await
+                .unwrap_err();
+        drop(peer);
+        error
+    }
+
+    #[tokio::test]
+    async fn invalid_negotiation_has_specific_reason_and_backoff() {
+        let handshake = Handshake::new([0xAA; 20], [0; 20]).to_bytes();
+        for (id, size, expected, long_backoff) in [
+            (
+                None,
+                Some(42),
+                MetadataFailureReason::MetadataUnsupported,
+                true,
+            ),
+            (
+                Some(0),
+                Some(42),
+                MetadataFailureReason::MetadataDisabled,
+                true,
+            ),
+            (
+                Some(256),
+                Some(42),
+                MetadataFailureReason::ExtensionProtocol,
+                false,
+            ),
+            (
+                Some(3),
+                None,
+                MetadataFailureReason::MetadataSizeMissing,
+                true,
+            ),
+            (
+                Some(3),
+                Some(0),
+                MetadataFailureReason::ExtensionProtocol,
+                false,
+            ),
+            (
+                Some(3),
+                Some(1025),
+                MetadataFailureReason::MetadataTooLarge,
+                true,
+            ),
+        ] {
+            let mut bytes = handshake.clone();
+            bytes.extend(negotiation_bytes(id, size));
+            let error = error_from_peer_bytes(&bytes, true).await;
+            assert_eq!(error.reason(), expected, "{error}");
+            assert_eq!(error.long_backoff(), long_backoff, "{error}");
+        }
+        let mut unsupported = Handshake::new([0xAA; 20], [0; 20]);
+        unsupported.reserved[5] = 0;
+        let error = error_from_peer_bytes(&unsupported.to_bytes(), true).await;
+        assert_eq!(error.reason(), MetadataFailureReason::ExtensionsUnsupported);
+        assert!(error.long_backoff());
+
+        for payload in [
+            b"not bencode".as_slice(),
+            b"d1:md11:ut_metadatai-1eee",
+            b"d1:md11:ut_metadata1:xee",
+            b"d1:mi1ee",
+            b"d1:md11:ut_metadatai3ee13:metadata_size1:xe",
+        ] {
+            let mut malformed = handshake.clone();
+            malformed.extend(
+                WireMessage::Extended {
+                    id: 0,
+                    payload: payload.to_vec(),
+                }
+                .to_bytes(),
+            );
+            let error = error_from_peer_bytes(&malformed, true).await;
+            assert_eq!(error.reason(), MetadataFailureReason::ExtensionProtocol);
+            assert!(!error.long_backoff());
+        }
+    }
+
+    #[tokio::test]
+    async fn peer_read_failures_keep_their_protocol_stage() {
+        let handshake = Handshake::new([0xAA; 20], [0; 20]).to_bytes();
+        let mut negotiated = handshake.clone();
+        negotiated.extend(negotiation_bytes(Some(3), Some(42)));
+        for (prefix, stage, timeout_reason, io_reason) in [
+            (
+                Vec::new(),
+                IoStage::HandshakeRead,
+                MetadataFailureReason::HandshakeTimeout,
+                MetadataFailureReason::HandshakeIo,
+            ),
+            (
+                handshake,
+                IoStage::ExtensionRead,
+                MetadataFailureReason::ExtensionTimeout,
+                MetadataFailureReason::ExtensionIo,
+            ),
+            (
+                negotiated,
+                IoStage::MetadataRead,
+                MetadataFailureReason::MetadataTimeout,
+                MetadataFailureReason::MetadataIo,
+            ),
+        ] {
+            for partial_body in [false, true] {
+                let mut bytes = prefix.clone();
+                if partial_body {
+                    bytes.extend([0, 0, 0, 8, 20, 0]);
+                }
+                let error = error_from_peer_bytes(&bytes, false).await;
+                assert!(
+                    matches!(error, MetadataFetchError::Timeout { stage: actual } if actual == stage)
+                );
+                assert_eq!(error.reason(), timeout_reason);
+                assert!(!error.long_backoff());
+                let error = error_from_peer_bytes(&bytes, true).await;
+                assert!(
+                    matches!(error, MetadataFetchError::Io { stage: actual, ref source } if actual == stage && source.kind() == std::io::ErrorKind::UnexpectedEof)
+                );
+                assert_eq!(error.reason(), io_reason);
+                assert!(!error.long_backoff());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn write_failures_keep_their_protocol_stage() {
+        for (stage, timeout_reason, io_reason) in [
+            (
+                IoStage::HandshakeWrite,
+                MetadataFailureReason::HandshakeTimeout,
+                MetadataFailureReason::HandshakeIo,
+            ),
+            (
+                IoStage::ExtensionWrite,
+                MetadataFailureReason::ExtensionTimeout,
+                MetadataFailureReason::ExtensionIo,
+            ),
+            (
+                IoStage::MetadataWrite,
+                MetadataFailureReason::MetadataTimeout,
+                MetadataFailureReason::MetadataIo,
+            ),
+        ] {
+            let (mut client, peer) = tokio::io::duplex(1);
+            let error = write_all_timeout(&mut client, &[0; 2], Duration::from_millis(10), stage)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, MetadataFetchError::Timeout { stage: actual } if actual == stage)
+            );
+            assert_eq!(error.reason(), timeout_reason);
+            assert!(!error.long_backoff());
+            drop(peer);
+            let error = write_all_timeout(&mut client, &[0; 2], Duration::from_millis(10), stage)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, MetadataFetchError::Io { stage: actual, .. } if actual == stage)
+            );
+            assert_eq!(error.reason(), io_reason);
+            assert!(!error.long_backoff());
+        }
+    }
+
+    #[tokio::test]
+    async fn metadata_rejection_uses_local_id_and_long_backoff() {
+        let mut bytes = Handshake::new([0xAA; 20], [0; 20]).to_bytes();
+        bytes.extend(negotiation_bytes(Some(3), Some(42)));
+        bytes.extend(
+            WireMessage::Extended {
+                id: 1,
+                payload: b"d8:msg_typei2e5:piecei0ee".to_vec(),
+            }
+            .to_bytes(),
+        );
+        let error = error_from_peer_bytes(&bytes, true).await;
+        assert!(matches!(error, MetadataFetchError::MetadataRejected));
+        assert_eq!(error.reason(), MetadataFailureReason::Rejected);
+        assert!(error.long_backoff());
+    }
+
+    #[test]
+    fn connection_errors_are_not_classified_by_message_text() {
+        let error = MetadataFetchError::Io {
+            stage: IoStage::Connect,
+            source: std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                "extended handshake timeout",
+            ),
+        };
+        assert_eq!(error.reason(), MetadataFailureReason::Connect);
+        assert!(!error.long_backoff());
+        let error = MetadataFetchError::Timeout {
+            stage: IoStage::Connect,
+        };
+        assert_eq!(error.reason(), MetadataFailureReason::ConnectTimeout);
+        assert!(!error.long_backoff());
     }
 
     #[tokio::test]
@@ -1986,7 +2387,10 @@ mod tests {
 
         let result = fetch_from_stream(&info_hash, client_stream, Duration::from_secs(5)).await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("info_hash mismatch"));
+        assert!(matches!(
+            result.unwrap_err(),
+            MetadataFetchError::InvalidHandshake
+        ));
     }
 
     async fn fetch_single_piece_from_fake_peer(
@@ -1994,7 +2398,7 @@ mod tests {
         advertised_size: u32,
         response_total_size: i64,
         piece_data: Vec<u8>,
-    ) -> Result<Vec<u8>, String> {
+    ) -> Result<Vec<u8>, MetadataFetchError> {
         let info_hash: InfoHash = {
             let mut hasher = Sha1::new();
             hasher.update(info_dict);
@@ -2295,34 +2699,6 @@ mod tests {
 
         assert_eq!(peers.eligible, vec![attempted_peer]);
         assert_eq!(peers.next_eligible_at, None);
-    }
-
-    #[test]
-    fn test_classify_metadata_failure_reasons() {
-        assert_eq!(
-            classify_metadata_failure("connect error: connection refused"),
-            crate::types::MetadataFailureReason::Connect
-        );
-        assert_eq!(
-            classify_metadata_failure("metadata receive timeout"),
-            crate::types::MetadataFailureReason::Timeout
-        );
-        assert_eq!(
-            classify_metadata_failure("handshake info_hash mismatch"),
-            crate::types::MetadataFailureReason::Handshake
-        );
-        assert_eq!(
-            classify_metadata_failure("peer doesn't support ut_metadata"),
-            crate::types::MetadataFailureReason::Extension
-        );
-        assert_eq!(
-            classify_metadata_failure("peer rejected metadata request"),
-            crate::types::MetadataFailureReason::Rejected
-        );
-        assert_eq!(
-            classify_metadata_failure("invalid metadata piece length"),
-            crate::types::MetadataFailureReason::Protocol
-        );
     }
 
     #[tokio::test]
