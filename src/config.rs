@@ -34,6 +34,9 @@ pub struct MetadataConfig {
     #[serde(default = "default_max_concurrent")]
     pub max_concurrent: usize,
 
+    #[serde(default = "default_connect_timeout_secs")]
+    pub connect_timeout_secs: u64,
+
     #[serde(default = "default_peer_timeout_secs")]
     pub peer_timeout_secs: u64,
 
@@ -155,6 +158,9 @@ fn default_bootstrap_nodes() -> Vec<String> {
 }
 
 fn default_max_concurrent() -> usize {
+    10
+}
+fn default_connect_timeout_secs() -> u64 {
     10
 }
 fn default_peer_timeout_secs() -> u64 {
@@ -283,6 +289,7 @@ impl Default for MetadataConfig {
     fn default() -> Self {
         MetadataConfig {
             max_concurrent: default_max_concurrent(),
+            connect_timeout_secs: default_connect_timeout_secs(),
             peer_timeout_secs: default_peer_timeout_secs(),
             retry_after_hours: default_retry_after_hours(),
             peer_attempt_retention_hours: default_peer_attempt_retention_hours(),
@@ -486,6 +493,12 @@ impl Config {
         validate_range("database.batch_size", self.database.batch_size, 1, 10_000)?;
 
         validate_u64_range(
+            "metadata.connect_timeout_secs",
+            self.metadata.connect_timeout_secs,
+            1,
+            600,
+        )?;
+        validate_u64_range(
             "metadata.peer_timeout_secs",
             self.metadata.peer_timeout_secs,
             1,
@@ -580,6 +593,25 @@ fn validate_range(name: &str, value: usize, min: usize, max: usize) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metadata_connection_timeout_is_independent_and_backward_compatible() {
+        let legacy: Config = toml::from_str("[metadata]\npeer_timeout_secs = 45").unwrap();
+        assert_eq!(legacy.metadata.connect_timeout_secs, 10);
+        assert_eq!(legacy.metadata.peer_timeout_secs, 45);
+        let mut custom: Config =
+            toml::from_str("[metadata]\nconnect_timeout_secs = 5\npeer_timeout_secs = 60").unwrap();
+        assert_eq!(custom.metadata.connect_timeout_secs, 5);
+        assert_eq!(custom.metadata.peer_timeout_secs, 60);
+        custom.validate().unwrap();
+        for invalid in [0, 601] {
+            custom.metadata.connect_timeout_secs = invalid;
+            assert!(custom
+                .validate()
+                .unwrap_err()
+                .contains("metadata.connect_timeout_secs"));
+        }
+    }
 
     #[test]
     fn mysql_config_rejects_legacy_paths_and_unbounded_pools() {

@@ -128,6 +128,7 @@ bootstrap_nodes = [
 
 [metadata]
 max_concurrent = 10
+connect_timeout_secs = 10
 peer_timeout_secs = 30
 retry_after_hours = 24
 peer_attempt_retention_hours = 72
@@ -169,6 +170,19 @@ shutdown_drain_secs = 10
 host = "127.0.0.1"
 port = 8080
 ```
+
+`metadata.connect_timeout_secs` bounds TCP establishment only and defaults to 10
+seconds, including when an older config omits it. `peer_timeout_secs` continues
+to control handshake and protocol I/O (30 seconds by default); the existing
+metadata receive deadline remains twice that value. Set `connect_timeout_secs`
+to the previous `peer_timeout_secs` value to retain the old connection budget.
+
+Fresh peer-bearing discoveries move ready jobs ahead of older queued work and
+put their peers first within each job. Restored due jobs prefer the most recent
+peer observation, while retaining the existing retry eligibility checks. Older
+jobs remain durable, but sustained fresh discoveries can defer them. The retry
+loader skips full queues, skips already tracked hashes, and loads peer lists
+only for available slots. Concurrency remains 10 by default.
 
 CLI flags override config values. Set BTFIND_DATABASE_URL in a protected service
 environment file. TLS certificate and hostname verification are enabled by
