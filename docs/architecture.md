@@ -42,9 +42,10 @@ The metadata scheduler deduplicates hashes and limits concurrent hash workers. T
 establishment has its own timeout (10 seconds by default), separate from the
 handshake and metadata I/O timeout (30 seconds). Discoveries that add pending peer
 addresses promote ready jobs; duplicate-only discoveries preserve the ready queue
-order. Newly observed peers go ahead of older pending peers, including when a
-job's peer list is full. The existing per-hash peer limit still
-applies. Persisted due jobs are ordered by latest peer observation first, subject
+order. New addresses are admitted only into free slots and go ahead of existing
+pending peers. A full in-memory list keeps its pending work, even if rediscovered
+peers are still in retry cooldown. The existing database retention policy and
+per-hash peer limit still apply. Persisted due jobs are ordered by latest peer observation first, subject
 to their retry time and terminal-state checks. The retry loader does no database
 work at capacity and only loads peer lists for untracked jobs that fit available
 slots. No age cutoff deletes older work; continuous fresh arrivals can defer it.

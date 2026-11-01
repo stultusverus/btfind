@@ -179,7 +179,10 @@ to the previous `peer_timeout_secs` value to retain the old connection budget.
 
 Discoveries that add pending peer addresses move ready jobs ahead of older queued
 work and put their peers first within each job. Duplicate-only discoveries leave
-the ready queue order unchanged. Restored due jobs prefer the most recent
+the ready queue order unchanged. New addresses use free slots only; a full pending
+peer list is not replaced, so rediscovered peers in retry cooldown cannot evict
+unattempted work. The existing database peer-retention policy is unchanged.
+Restored due jobs prefer the most recent
 peer observation, while retaining the existing retry eligibility checks. Older
 jobs remain durable, but sustained fresh discoveries can defer them. The retry
 loader skips full queues, skips already tracked hashes, and loads peer lists

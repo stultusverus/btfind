@@ -803,20 +803,19 @@ impl HashJob {
     }
 
     fn merge_peers(&mut self, peers: Vec<PeerContact>, limit: usize) -> usize {
-        let mut ordered = VecDeque::new();
-        let mut seen = HashSet::new();
-        let mut added = 0;
-        for peer in peers.into_iter().chain(self.peers.drain(..)) {
-            if ordered.len() >= limit {
+        let available = limit.saturating_sub(self.peers.len());
+        let mut admitted = VecDeque::new();
+        for peer in peers {
+            if admitted.len() >= available {
                 break;
             }
-            if seen.insert(peer.addr) {
-                added += usize::from(!self.peer_set.contains(&peer.addr));
-                ordered.push_back(peer);
+            if self.peer_set.insert(peer.addr) {
+                admitted.push_back(peer);
             }
         }
-        self.peers = ordered;
-        self.peer_set = seen;
+        let added = admitted.len();
+        admitted.append(&mut self.peers);
+        self.peers = admitted;
         added
     }
 
@@ -1563,7 +1562,7 @@ mod tests {
     }
 
     #[test]
-    fn fresh_peers_take_precedence_without_duplicate_pending_addresses() {
+    fn fresh_peers_use_free_slots_without_replacing_pending_peers() {
         let peers: Vec<PeerContact> = (1..=4)
             .map(|port| PeerContact {
                 addr: format!("192.0.2.1:{port}").parse().unwrap(),
@@ -1572,18 +1571,94 @@ mod tests {
         let mut job = HashJob::new(0);
         job.merge_peers(peers[..3].to_vec(), 3);
         assert_eq!(
+            job.merge_peers(vec![peers[3].clone(), peers[1].clone()], 3),
+            0
+        );
+        assert_eq!(job.peers, VecDeque::from(peers[..3].to_vec()));
+        assert_eq!(job.take_round(1), vec![peers[0].clone()]);
+        assert_eq!(
             job.merge_peers(
-                vec![peers[3].clone(), peers[1].clone(), peers[3].clone()],
+                vec![peers[1].clone(), peers[3].clone(), peers[3].clone()],
                 3
             ),
             1
         );
         assert_eq!(
             job.take_round(3),
-            vec![peers[3].clone(), peers[1].clone(), peers[0].clone()]
+            vec![peers[3].clone(), peers[1].clone(), peers[2].clone()]
         );
         assert!(job.peer_set.is_empty());
         assert!(job.peers.is_empty());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires BTFIND_TEST_DATABASE_URL; run scripts/test-mysql.sh"]
+    async fn saturated_pending_peers_survive_recently_attempted_rediscoveries() {
+        let store = Store::open_test_database().await.unwrap();
+        let hash = [0xB5; 20];
+        let peers: Vec<PeerContact> = (1..=4)
+            .map(|port| PeerContact {
+                addr: format!("192.0.2.1:{port}").parse().unwrap(),
+            })
+            .collect();
+        store
+            .persist_hash_discovery(&hash, "test", &peers, 4)
+            .await
+            .unwrap();
+        store
+            .set_peer_attempt(
+                &hash,
+                &peers[2].addr.to_string(),
+                Some("timeout during Connect"),
+            )
+            .await
+            .unwrap();
+        let incoming = vec![peers[2].clone(), peers[3].clone()];
+        let filtered = filter_peers_for_retry(&store, &hash, &incoming, 24).await;
+        assert_eq!(filtered.eligible, vec![peers[3].clone()]);
+        assert!(filtered.next_eligible_at.is_some());
+
+        let mut jobs = HashMap::new();
+        let mut ready = VecDeque::from([[0xA1; 20]]);
+        let mut ready_set = HashSet::from([[0xA1; 20]]);
+        assert_eq!(
+            admit_job_peers(
+                &mut jobs,
+                &mut ready,
+                &mut ready_set,
+                hash,
+                peers[..2].to_vec(),
+                0,
+                2,
+                2
+            ),
+            JobAdmission::Accepted
+        );
+        let original_order = ready.clone();
+        for _ in 0..2 {
+            store
+                .persist_hash_discovery(&hash, "announce_peer", &incoming, 2)
+                .await
+                .unwrap();
+            let admission = admit_job_peers(
+                &mut jobs,
+                &mut ready,
+                &mut ready_set,
+                hash,
+                incoming.clone(),
+                0,
+                2,
+                2,
+            );
+            assert_eq!(admission, JobAdmission::Unchanged);
+            prioritize_ready_job(&mut ready, &ready_set, hash, admission);
+            assert_eq!(ready, original_order);
+        }
+        let pending = jobs.get_mut(&hash).unwrap().take_round(2);
+        assert_eq!(pending, peers[..2]);
+        let filtered = filter_peers_for_retry(&store, &hash, &pending, 24).await;
+        assert_eq!(filtered.eligible, pending);
+        assert_eq!(filtered.next_eligible_at, None);
     }
 
     #[test]
