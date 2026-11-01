@@ -177,8 +177,9 @@ to control handshake and protocol I/O (30 seconds by default); the existing
 metadata receive deadline remains twice that value. Set `connect_timeout_secs`
 to the previous `peer_timeout_secs` value to retain the old connection budget.
 
-Fresh peer-bearing discoveries move ready jobs ahead of older queued work and
-put their peers first within each job. Restored due jobs prefer the most recent
+Discoveries that add pending peer addresses move ready jobs ahead of older queued
+work and put their peers first within each job. Duplicate-only discoveries leave
+the ready queue order unchanged. Restored due jobs prefer the most recent
 peer observation, while retaining the existing retry eligibility checks. Older
 jobs remain durable, but sustained fresh discoveries can defer them. The retry
 loader skips full queues, skips already tracked hashes, and loads peer lists

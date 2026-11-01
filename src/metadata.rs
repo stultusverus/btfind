@@ -844,6 +844,7 @@ struct JobOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum JobAdmission {
     Accepted,
+    Unchanged,
     NoPeers,
     AtCapacity,
 }
@@ -865,7 +866,11 @@ fn admit_job_peers(
         if added > 0 && !job.running && ready_set.insert(info_hash) {
             ready.push_back(info_hash);
         }
-        return JobAdmission::Accepted;
+        return if added > 0 {
+            JobAdmission::Accepted
+        } else {
+            JobAdmission::Unchanged
+        };
     }
     if peers.is_empty() {
         return JobAdmission::NoPeers;
@@ -1285,8 +1290,9 @@ fn prioritize_ready_job(
     ready: &mut VecDeque<InfoHash>,
     ready_set: &HashSet<InfoHash>,
     hash: InfoHash,
+    admission: JobAdmission,
 ) {
-    if ready_set.contains(&hash) {
+    if admission == JobAdmission::Accepted && ready_set.contains(&hash) {
         ready.retain(|queued| *queued != hash);
         ready.push_front(hash);
     }
@@ -1405,7 +1411,6 @@ pub async fn run_metadata_fetcher(
                         }
                     }
                 }
-                let has_fresh_peers = !peers.is_empty();
                 let admission = admit_job_peers(
                     &mut jobs,
                     &mut ready,
@@ -1416,9 +1421,8 @@ pub async fn run_metadata_fetcher(
                     max_active_hash_jobs,
                     max_peers_per_hash,
                 );
-                if admission == JobAdmission::Accepted && has_fresh_peers {
-                    prioritize_ready_job(&mut ready, &ready_set, info_hash);
-                } else if admission == JobAdmission::AtCapacity
+                prioritize_ready_job(&mut ready, &ready_set, info_hash, admission);
+                if admission == JobAdmission::AtCapacity
                     && !emit_stat(&metrics, &stats_tx, CrawlStatsEvent::DiscoveryBackpressure)
                 {
                     tracing::debug!(
@@ -1586,11 +1590,73 @@ mod tests {
     fn fresh_ready_jobs_are_promoted_without_duplicating_or_restarting_workers() {
         let mut ready = VecDeque::from([[1; 20], [2; 20], [3; 20]]);
         let ready_set = HashSet::from([[1; 20], [2; 20], [3; 20]]);
-        prioritize_ready_job(&mut ready, &ready_set, [3; 20]);
-        prioritize_ready_job(&mut ready, &ready_set, [3; 20]);
-        prioritize_ready_job(&mut ready, &ready_set, [4; 20]);
+        prioritize_ready_job(&mut ready, &ready_set, [3; 20], JobAdmission::Accepted);
+        prioritize_ready_job(&mut ready, &ready_set, [3; 20], JobAdmission::Accepted);
+        prioritize_ready_job(&mut ready, &ready_set, [4; 20], JobAdmission::Accepted);
         assert_eq!(ready, VecDeque::from([[3; 20], [1; 20], [2; 20]]));
         assert_eq!(ready.len(), ready_set.len());
+    }
+
+    #[test]
+    fn duplicate_only_discoveries_preserve_ready_order() {
+        let peer = PeerContact {
+            addr: "192.0.2.1:6881".parse().unwrap(),
+        };
+        let mut jobs = HashMap::new();
+        let mut ready = VecDeque::new();
+        let mut ready_set = HashSet::new();
+        for hash in [[1; 20], [2; 20], [3; 20]] {
+            assert_eq!(
+                admit_job_peers(
+                    &mut jobs,
+                    &mut ready,
+                    &mut ready_set,
+                    hash,
+                    vec![peer.clone()],
+                    0,
+                    3,
+                    2
+                ),
+                JobAdmission::Accepted
+            );
+        }
+        let original = ready.clone();
+        for peers in [
+            vec![peer.clone(), peer.clone()],
+            vec![peer.clone()],
+            Vec::new(),
+        ] {
+            let admission = admit_job_peers(
+                &mut jobs,
+                &mut ready,
+                &mut ready_set,
+                [3; 20],
+                peers,
+                0,
+                3,
+                2,
+            );
+            assert_eq!(admission, JobAdmission::Unchanged);
+            prioritize_ready_job(&mut ready, &ready_set, [3; 20], admission);
+            assert_eq!(ready, original);
+        }
+        let new_peer = PeerContact {
+            addr: "192.0.2.2:6881".parse().unwrap(),
+        };
+        let admission = admit_job_peers(
+            &mut jobs,
+            &mut ready,
+            &mut ready_set,
+            [3; 20],
+            vec![peer, new_peer],
+            0,
+            3,
+            2,
+        );
+        assert_eq!(admission, JobAdmission::Accepted);
+        prioritize_ready_job(&mut ready, &ready_set, [3; 20], admission);
+        assert_eq!(ready, VecDeque::from([[3; 20], [1; 20], [2; 20]]));
+        assert_eq!(ready_set.len(), 3);
     }
 
     #[tokio::test]
