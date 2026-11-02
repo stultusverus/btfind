@@ -1,5 +1,5 @@
 const SEARCH_LIMITS = new Set([25, 50, 100, 250]);
-const SEARCH_SORTS = new Set(['rank', 'last_seen', 'first_seen', 'total_size', 'name']);
+const SEARCH_SORTS = new Set(['rank', 'last_seen', 'total_size']);
 const FILE_LIMIT = 100;
 
 const state = {
@@ -381,7 +381,7 @@ function renderPager() {
 function resultStatus() {
     if (state.results.length === 0) return 'No complete torrents found.';
     const currentPage = Math.floor(state.offset / state.limit) + 1;
-    const labels = { rank: 'relevance', last_seen: 'recently seen', first_seen: 'recently added', total_size: 'largest', name: 'name' };
+    const labels = { rank: 'relevance', last_seen: 'recently seen', total_size: 'largest' };
     return `Page ${formatNumber(currentPage)}, sorted by ${labels[state.effectiveSort] || state.effectiveSort}.`;
 }
 

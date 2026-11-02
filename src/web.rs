@@ -189,7 +189,7 @@ fn torrent_to_search_result(t: &TorrentRecord) -> SearchResult {
 
 fn validate_sort(sort: &str) -> Result<(), ApiError> {
     match sort {
-        "rank" | "first_seen" | "last_seen" | "total_size" | "name" => Ok(()),
+        "rank" | "last_seen" | "total_size" => Ok(()),
         other => Err(ApiError::BadRequest(format!("invalid sort: {other}"))),
     }
 }
@@ -204,9 +204,7 @@ fn clamp_offset(offset: usize) -> usize {
 
 fn effective_sort(query: &str, requested_sort: Option<&str>) -> &'static str {
     match requested_sort {
-        Some("first_seen") => "first_seen",
         Some("total_size") => "total_size",
-        Some("name") => "name",
         Some("last_seen") => "last_seen",
         Some("rank") if query.trim().chars().count() >= 2 => "rank",
         Some("rank") => "last_seen",
@@ -452,6 +450,12 @@ mod tests {
         assert!(validate_info_hash_hex(&"a".repeat(40)).is_ok());
         assert!(validate_info_hash_hex("invalid").is_err());
         assert!(validate_sort("name; DROP TABLE torrents").is_err());
+        for sort in ["rank", "last_seen", "total_size"] {
+            assert!(validate_sort(sort).is_ok());
+        }
+        for sort in ["first_seen", "name"] {
+            assert!(validate_sort(sort).is_err());
+        }
         assert_eq!(clamp_limit(0), 1);
         assert_eq!(clamp_limit(999), 500);
     }

@@ -2,6 +2,28 @@ use super::*;
 
 #[tokio::test]
 #[ignore = "requires BTFIND_TEST_DATABASE_URL; run scripts/test-mysql.sh"]
+async fn mysql_torrent_indexes_after_migration() {
+    let store = Store::open_test_database().await.unwrap();
+    let indexes: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT INDEX_NAME FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'torrents' ORDER BY INDEX_NAME",
+    )
+    .fetch_all(&store.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        indexes,
+        [
+            "idx_complete_last",
+            "idx_complete_size",
+            "idx_last",
+            "idx_size",
+            "PRIMARY"
+        ]
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires BTFIND_TEST_DATABASE_URL; run scripts/test-mysql.sh"]
 async fn mysql_metadata_retries_lock_timeout() {
     let store = Store::open_test_database().await.unwrap();
     let mut lock = store.pool.begin().await.unwrap();

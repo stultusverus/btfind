@@ -56,3 +56,12 @@ test('two-character CJK queries enable relevance sorting', () => {
     d.run('updateSortAvailability(true)');
     assert.equal(d.elements.get('sort').value, 'rank');
 });
+
+test('dashboard exposes only retained sort options', () => {
+    const html = readFileSync('src/web_dashboard.html', 'utf8');
+    const sortOptions = html.match(/<select id="sort">([\s\S]*?)<\/select>/)[1];
+    assert.deepEqual([...sortOptions.matchAll(/value="([^"]+)"/g)].map(match => match[1]),
+        ['rank', 'last_seen', 'total_size']);
+    const d = dashboard();
+    assert.deepEqual(Array.from(d.run('SEARCH_SORTS')), ['rank', 'last_seen', 'total_size']);
+});
