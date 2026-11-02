@@ -1,5 +1,5 @@
 use crate::metrics::CrawlerMetrics;
-use crate::store::{PeerRetryEligibility, Store};
+use crate::store::{HashJobRecord, PeerRetryEligibility, Store};
 use crate::types::{CrawlStatsEvent, HashDiscovery, InfoHash, MetadataFailureReason, PeerContact};
 use crate::wire::{self, ExtendedHandshake, Handshake, WireMessage, HANDSHAKE_LEN};
 use rand::Rng;
@@ -144,19 +144,48 @@ fn metadata_piece_len(total_size: u32, total_pieces: u32, piece_idx: u32) -> usi
 pub async fn fetch_from_peer(
     info_hash: &InfoHash,
     peer: &PeerContact,
+    connect_timeout: Duration,
     peer_timeout: Duration,
 ) -> Result<Vec<u8>, MetadataFetchError> {
-    fetch_from_peer_with_limit(info_hash, peer, peer_timeout, 8 * 1024 * 1024).await
+    fetch_from_peer_with_limit(
+        info_hash,
+        peer,
+        connect_timeout,
+        peer_timeout,
+        8 * 1024 * 1024,
+    )
+    .await
 }
 
 pub async fn fetch_from_peer_with_limit(
     info_hash: &InfoHash,
     peer: &PeerContact,
+    connect_timeout: Duration,
     peer_timeout: Duration,
     max_metadata_size: u32,
 ) -> Result<Vec<u8>, MetadataFetchError> {
     let addr = std::net::SocketAddr::V4(peer.addr);
-    let stream = timeout(peer_timeout, TcpStream::connect(addr))
+    fetch_with_connection(
+        info_hash,
+        TcpStream::connect(addr),
+        connect_timeout,
+        peer_timeout,
+        max_metadata_size,
+    )
+    .await
+}
+
+async fn fetch_with_connection<S>(
+    info_hash: &InfoHash,
+    connection: impl std::future::Future<Output = std::io::Result<S>>,
+    connect_timeout: Duration,
+    peer_timeout: Duration,
+    max_metadata_size: u32,
+) -> Result<Vec<u8>, MetadataFetchError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let stream = timeout(connect_timeout, connection)
         .await
         .map_err(|_| MetadataFetchError::Timeout {
             stage: IoStage::Connect,
@@ -165,7 +194,6 @@ pub async fn fetch_from_peer_with_limit(
             stage: IoStage::Connect,
             source,
         })?;
-
     fetch_from_stream_with_limit(info_hash, stream, peer_timeout, max_metadata_size).await
 }
 
@@ -775,16 +803,19 @@ impl HashJob {
     }
 
     fn merge_peers(&mut self, peers: Vec<PeerContact>, limit: usize) -> usize {
-        let mut added = 0;
+        let available = limit.saturating_sub(self.peers.len());
+        let mut admitted = VecDeque::new();
         for peer in peers {
-            if self.peers.len() >= limit {
+            if admitted.len() >= available {
                 break;
             }
             if self.peer_set.insert(peer.addr) {
-                self.peers.push_back(peer);
-                added += 1;
+                admitted.push_back(peer);
             }
         }
+        let added = admitted.len();
+        admitted.append(&mut self.peers);
+        self.peers = admitted;
         added
     }
 
@@ -812,6 +843,7 @@ struct JobOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum JobAdmission {
     Accepted,
+    Unchanged,
     NoPeers,
     AtCapacity,
 }
@@ -833,7 +865,11 @@ fn admit_job_peers(
         if added > 0 && !job.running && ready_set.insert(info_hash) {
             ready.push_back(info_hash);
         }
-        return JobAdmission::Accepted;
+        return if added > 0 {
+            JobAdmission::Accepted
+        } else {
+            JobAdmission::Unchanged
+        };
     }
     if peers.is_empty() {
         return JobAdmission::NoPeers;
@@ -852,6 +888,7 @@ fn admit_job_peers(
 }
 
 struct FetchRoundConfig {
+    connect_timeout: Duration,
     peer_timeout: Duration,
     retry_after_hours: u32,
     max_metadata_size: u32,
@@ -901,8 +938,8 @@ async fn process_hash_round(
         store,
         stats_tx,
         config,
-        |hash, peer, timeout, limit| async move {
-            fetch_from_peer_with_limit(&hash, &peer, timeout, limit).await
+        |hash, peer, connect_timeout, peer_timeout, limit| async move {
+            fetch_from_peer_with_limit(&hash, &peer, connect_timeout, peer_timeout, limit).await
         },
     )
     .await
@@ -917,7 +954,7 @@ async fn process_hash_round_with_fetch<F, Fut>(
     mut fetch: F,
 ) -> JobOutcome
 where
-    F: FnMut(InfoHash, PeerContact, Duration, u32) -> Fut,
+    F: FnMut(InfoHash, PeerContact, Duration, Duration, u32) -> Fut,
     Fut: std::future::Future<Output = Result<Vec<u8>, MetadataFetchError>>,
 {
     let mut retry_delay = Duration::from_millis(100);
@@ -979,6 +1016,7 @@ where
         match fetch(
             info_hash,
             peer,
+            config.connect_timeout,
             config.peer_timeout,
             config.max_metadata_size,
         )
@@ -1247,11 +1285,47 @@ async fn mark_metadata_complete_and_emit(
     Ok(())
 }
 
+fn prioritize_ready_job(
+    ready: &mut VecDeque<InfoHash>,
+    ready_set: &HashSet<InfoHash>,
+    hash: InfoHash,
+    admission: JobAdmission,
+) {
+    if admission == JobAdmission::Accepted && ready_set.contains(&hash) {
+        ready.retain(|queued| *queued != hash);
+        ready.push_front(hash);
+    }
+}
+
+async fn load_due_jobs(
+    store: &Store,
+    jobs: &HashMap<InfoHash, HashJob>,
+    max_active: usize,
+    max_peers: usize,
+) -> Result<Vec<(HashJobRecord, Vec<PeerContact>)>, crate::store::Error> {
+    let available = max_active.saturating_sub(jobs.len());
+    if available == 0 {
+        return Ok(Vec::new());
+    }
+    let records = store.due_hash_jobs(max_active).await?;
+    let mut loaded = Vec::new();
+    for record in records
+        .into_iter()
+        .filter(|record| !jobs.contains_key(&record.info_hash))
+        .take(available)
+    {
+        let peers = store.hash_job_peers(&record.info_hash, max_peers).await?;
+        loaded.push((record, peers));
+    }
+    Ok(loaded)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run_metadata_fetcher(
     mut info_hash_rx: mpsc::Receiver<HashDiscovery>,
     store: Arc<Store>,
     max_concurrent: usize,
+    connect_timeout_secs: u64,
     peer_timeout_secs: u64,
     retry_after_hours: u32,
     max_metadata_size: u32,
@@ -1289,6 +1363,7 @@ pub async fn run_metadata_fetcher(
             let round_store = store.clone();
             let round_stats = stats_tx.clone();
             let round_config = FetchRoundConfig {
+                connect_timeout: Duration::from_secs(connect_timeout_secs),
                 peer_timeout: Duration::from_secs(peer_timeout_secs),
                 retry_after_hours,
                 max_metadata_size,
@@ -1335,7 +1410,7 @@ pub async fn run_metadata_fetcher(
                         }
                     }
                 }
-                if admit_job_peers(
+                let admission = admit_job_peers(
                     &mut jobs,
                     &mut ready,
                     &mut ready_set,
@@ -1344,12 +1419,10 @@ pub async fn run_metadata_fetcher(
                     0,
                     max_active_hash_jobs,
                     max_peers_per_hash,
-                ) == JobAdmission::AtCapacity
-                    && !emit_stat(
-                        &metrics,
-                        &stats_tx,
-                        CrawlStatsEvent::DiscoveryBackpressure,
-                    )
+                );
+                prioritize_ready_job(&mut ready, &ready_set, info_hash, admission);
+                if admission == JobAdmission::AtCapacity
+                    && !emit_stat(&metrics, &stats_tx, CrawlStatsEvent::DiscoveryBackpressure)
                 {
                     tracing::debug!(
                         event = "stats_channel_full",
@@ -1377,16 +1450,7 @@ pub async fn run_metadata_fetcher(
                 }
             }
             _ = retry_tick.tick() => {
-                let due_store = store.clone();
-                let due = (async move {
-                    let records = due_store.due_hash_jobs(max_active_hash_jobs).await?;
-                    let mut loaded = Vec::with_capacity(records.len());
-                    for record in records {
-                        let peers = due_store.hash_job_peers(&record.info_hash, max_peers_per_hash).await?;
-                        loaded.push((record, peers));
-                    }
-                    Ok::<_, crate::store::Error>(loaded)
-                }).await;
+                let due = load_due_jobs(&store, &jobs, max_active_hash_jobs, max_peers_per_hash).await;
                 if let Err(error) = &due {
                     tracing::warn!(
                         event = "metadata_job_load_failed",
@@ -1452,6 +1516,250 @@ pub async fn run_metadata_fetcher(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn connection_timeout_does_not_consume_handshake_budget() {
+        let hash = [0xAA; 20];
+        let error = fetch_with_connection(
+            &hash,
+            std::future::pending::<std::io::Result<tokio::io::DuplexStream>>(),
+            Duration::from_millis(5),
+            Duration::from_secs(1),
+            1024,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            MetadataFetchError::Timeout {
+                stage: IoStage::Connect
+            }
+        ));
+
+        let (client, mut peer) = tokio::io::duplex(4096);
+        let server = tokio::spawn(async move {
+            let mut request = [0; HANDSHAKE_LEN];
+            peer.read_exact(&mut request).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let mut handshake = Handshake::new(hash, [0; 20]);
+            handshake.reserved[5] = 0;
+            peer.write_all(&handshake.to_bytes()).await.unwrap();
+        });
+        let error = fetch_with_connection(
+            &hash,
+            std::future::ready(Ok(client)),
+            Duration::from_millis(5),
+            Duration::from_secs(1),
+            1024,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            MetadataFetchError::ExtensionUnavailable(ExtensionUnavailable::ExtensionsUnsupported)
+        ));
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn fresh_peers_use_free_slots_without_replacing_pending_peers() {
+        let peers: Vec<PeerContact> = (1..=4)
+            .map(|port| PeerContact {
+                addr: format!("192.0.2.1:{port}").parse().unwrap(),
+            })
+            .collect();
+        let mut job = HashJob::new(0);
+        job.merge_peers(peers[..3].to_vec(), 3);
+        assert_eq!(
+            job.merge_peers(vec![peers[3].clone(), peers[1].clone()], 3),
+            0
+        );
+        assert_eq!(job.peers, VecDeque::from(peers[..3].to_vec()));
+        assert_eq!(job.take_round(1), vec![peers[0].clone()]);
+        assert_eq!(
+            job.merge_peers(
+                vec![peers[1].clone(), peers[3].clone(), peers[3].clone()],
+                3
+            ),
+            1
+        );
+        assert_eq!(
+            job.take_round(3),
+            vec![peers[3].clone(), peers[1].clone(), peers[2].clone()]
+        );
+        assert!(job.peer_set.is_empty());
+        assert!(job.peers.is_empty());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires BTFIND_TEST_DATABASE_URL; run scripts/test-mysql.sh"]
+    async fn saturated_pending_peers_survive_recently_attempted_rediscoveries() {
+        let store = Store::open_test_database().await.unwrap();
+        let hash = [0xB5; 20];
+        let peers: Vec<PeerContact> = (1..=4)
+            .map(|port| PeerContact {
+                addr: format!("192.0.2.1:{port}").parse().unwrap(),
+            })
+            .collect();
+        store
+            .persist_hash_discovery(&hash, "test", &peers, 4)
+            .await
+            .unwrap();
+        store
+            .set_peer_attempt(
+                &hash,
+                &peers[2].addr.to_string(),
+                Some("timeout during Connect"),
+            )
+            .await
+            .unwrap();
+        let incoming = vec![peers[2].clone(), peers[3].clone()];
+        let filtered = filter_peers_for_retry(&store, &hash, &incoming, 24).await;
+        assert_eq!(filtered.eligible, vec![peers[3].clone()]);
+        assert!(filtered.next_eligible_at.is_some());
+
+        let mut jobs = HashMap::new();
+        let mut ready = VecDeque::from([[0xA1; 20]]);
+        let mut ready_set = HashSet::from([[0xA1; 20]]);
+        assert_eq!(
+            admit_job_peers(
+                &mut jobs,
+                &mut ready,
+                &mut ready_set,
+                hash,
+                peers[..2].to_vec(),
+                0,
+                2,
+                2
+            ),
+            JobAdmission::Accepted
+        );
+        let original_order = ready.clone();
+        for _ in 0..2 {
+            store
+                .persist_hash_discovery(&hash, "announce_peer", &incoming, 2)
+                .await
+                .unwrap();
+            let admission = admit_job_peers(
+                &mut jobs,
+                &mut ready,
+                &mut ready_set,
+                hash,
+                incoming.clone(),
+                0,
+                2,
+                2,
+            );
+            assert_eq!(admission, JobAdmission::Unchanged);
+            prioritize_ready_job(&mut ready, &ready_set, hash, admission);
+            assert_eq!(ready, original_order);
+        }
+        let pending = jobs.get_mut(&hash).unwrap().take_round(2);
+        assert_eq!(pending, peers[..2]);
+        let filtered = filter_peers_for_retry(&store, &hash, &pending, 24).await;
+        assert_eq!(filtered.eligible, pending);
+        assert_eq!(filtered.next_eligible_at, None);
+    }
+
+    #[test]
+    fn fresh_ready_jobs_are_promoted_without_duplicating_or_restarting_workers() {
+        let mut ready = VecDeque::from([[1; 20], [2; 20], [3; 20]]);
+        let ready_set = HashSet::from([[1; 20], [2; 20], [3; 20]]);
+        prioritize_ready_job(&mut ready, &ready_set, [3; 20], JobAdmission::Accepted);
+        prioritize_ready_job(&mut ready, &ready_set, [3; 20], JobAdmission::Accepted);
+        prioritize_ready_job(&mut ready, &ready_set, [4; 20], JobAdmission::Accepted);
+        assert_eq!(ready, VecDeque::from([[3; 20], [1; 20], [2; 20]]));
+        assert_eq!(ready.len(), ready_set.len());
+    }
+
+    #[test]
+    fn duplicate_only_discoveries_preserve_ready_order() {
+        let peer = PeerContact {
+            addr: "192.0.2.1:6881".parse().unwrap(),
+        };
+        let mut jobs = HashMap::new();
+        let mut ready = VecDeque::new();
+        let mut ready_set = HashSet::new();
+        for hash in [[1; 20], [2; 20], [3; 20]] {
+            assert_eq!(
+                admit_job_peers(
+                    &mut jobs,
+                    &mut ready,
+                    &mut ready_set,
+                    hash,
+                    vec![peer.clone()],
+                    0,
+                    3,
+                    2
+                ),
+                JobAdmission::Accepted
+            );
+        }
+        let original = ready.clone();
+        for peers in [
+            vec![peer.clone(), peer.clone()],
+            vec![peer.clone()],
+            Vec::new(),
+        ] {
+            let admission = admit_job_peers(
+                &mut jobs,
+                &mut ready,
+                &mut ready_set,
+                [3; 20],
+                peers,
+                0,
+                3,
+                2,
+            );
+            assert_eq!(admission, JobAdmission::Unchanged);
+            prioritize_ready_job(&mut ready, &ready_set, [3; 20], admission);
+            assert_eq!(ready, original);
+        }
+        let new_peer = PeerContact {
+            addr: "192.0.2.2:6881".parse().unwrap(),
+        };
+        let admission = admit_job_peers(
+            &mut jobs,
+            &mut ready,
+            &mut ready_set,
+            [3; 20],
+            vec![peer, new_peer],
+            0,
+            3,
+            2,
+        );
+        assert_eq!(admission, JobAdmission::Accepted);
+        prioritize_ready_job(&mut ready, &ready_set, [3; 20], admission);
+        assert_eq!(ready, VecDeque::from([[3; 20], [1; 20], [2; 20]]));
+        assert_eq!(ready_set.len(), 3);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires BTFIND_TEST_DATABASE_URL; run scripts/test-mysql.sh"]
+    async fn retry_loading_skips_tracked_jobs_and_only_fills_available_slots() {
+        let store = Store::open_test_database().await.unwrap();
+        let peer = PeerContact {
+            addr: "192.0.2.1:6881".parse().unwrap(),
+        };
+        for hash in [[1; 20], [2; 20], [3; 20]] {
+            store
+                .persist_hash_discovery(&hash, "test", std::slice::from_ref(&peer), 8)
+                .await
+                .unwrap();
+        }
+        let tracked = hex::encode([1; 20]);
+        store.execute_batch_for_test(&format!("UPDATE hash_jobs SET updated_at=100; UPDATE hash_jobs SET updated_at=1 WHERE info_hash='{tracked}'; UPDATE hash_job_peers SET peer_addr='invalid' WHERE info_hash='{tracked}'")).await.unwrap();
+        let jobs = HashMap::from([([1; 20], HashJob::new(0))]);
+        let loaded = load_due_jobs(&store, &jobs, 2, 8).await.unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].0.info_hash, [2; 20]);
+        assert_eq!(loaded[0].1, vec![peer]);
+        store
+            .execute_batch_for_test("DROP TABLE hash_job_peers")
+            .await
+            .unwrap();
+        assert!(load_due_jobs(&store, &jobs, 1, 8).await.unwrap().is_empty());
+    }
 
     fn retry_outcome(info_hash: InfoHash) -> JobOutcome {
         JobOutcome {
@@ -1762,13 +2070,14 @@ mod tests {
                 store.clone(),
                 stats_tx.clone(),
                 FetchRoundConfig {
+                    connect_timeout: Duration::from_secs(1),
                     peer_timeout: Duration::from_secs(1),
                     retry_after_hours: 0,
                     max_metadata_size: 64 * 1024 * 1024,
                     prior_attempt_count: 0,
                     metrics: Arc::new(CrawlerMetrics::default()),
                 },
-                |_, _, _, _| {
+                |_, _, _, _, _| {
                     downloads.set(downloads.get() + 1);
                     std::future::ready(Ok(bytes.clone()))
                 },
@@ -1813,13 +2122,14 @@ mod tests {
             store.clone(),
             stats_tx,
             FetchRoundConfig {
+                connect_timeout: Duration::from_secs(1),
                 peer_timeout: Duration::from_secs(1),
                 retry_after_hours: 0,
                 max_metadata_size: 1024,
                 prior_attempt_count: 0,
                 metrics: Arc::new(CrawlerMetrics::default()),
             },
-            |_, _, _, _| std::future::ready(Ok(bytes.clone())),
+            |_, _, _, _, _| std::future::ready(Ok(bytes.clone())),
         )
         .await;
         assert!(!outcome.terminal);
@@ -1896,13 +2206,14 @@ mod tests {
                 store.clone(),
                 stats_tx,
                 FetchRoundConfig {
+                    connect_timeout: Duration::from_secs(1),
                     peer_timeout: Duration::from_secs(1),
                     retry_after_hours: 0,
                     max_metadata_size: 1024,
                     prior_attempt_count: 0,
                     metrics: Arc::new(CrawlerMetrics::default()),
                 },
-                |_, _, _, _| std::future::ready(Err(error.take().unwrap())),
+                |_, _, _, _, _| std::future::ready(Err(error.take().unwrap())),
             )
             .await;
             let after = chrono::Utc::now().timestamp();
@@ -1948,6 +2259,7 @@ mod tests {
             store.clone(),
             stats_tx,
             FetchRoundConfig {
+                connect_timeout: Duration::from_secs(1),
                 peer_timeout: Duration::from_millis(1),
                 retry_after_hours: 24,
                 max_metadata_size: 1024,
@@ -1994,6 +2306,7 @@ mod tests {
             store.clone(),
             stats_tx,
             FetchRoundConfig {
+                connect_timeout: Duration::from_secs(1),
                 peer_timeout: Duration::from_millis(1),
                 retry_after_hours: 24,
                 max_metadata_size: 1024,

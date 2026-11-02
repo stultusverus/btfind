@@ -326,6 +326,7 @@ async fn cmd_run(
     });
 
     let store_clone = store.clone();
+    let connect_timeout = config.metadata.connect_timeout_secs;
     let peer_timeout = config.metadata.peer_timeout_secs;
     let retry_after_hours = config.metadata.retry_after_hours;
     let max_metadata_size = config.metadata.max_metadata_size_bytes;
@@ -338,6 +339,7 @@ async fn cmd_run(
             info_hash_rx,
             store_clone,
             max_concurrent,
+            connect_timeout,
             peer_timeout,
             retry_after_hours,
             max_metadata_size,

@@ -38,7 +38,20 @@ IDs and expected responders; validated nodes enter the live routing table.
 Incoming queries, peer lookups, announces, and optional sampling produce work.
 Sampling is bounded and disabled by default.
 
-The metadata scheduler deduplicates hashes and limits concurrent hash workers.
+The metadata scheduler deduplicates hashes and limits concurrent hash workers. TCP
+establishment has its own timeout (10 seconds by default), separate from the
+handshake and metadata I/O timeout (30 seconds). Discoveries that add pending peer
+addresses promote ready jobs; duplicate-only discoveries preserve the ready queue
+order. New addresses are admitted only into free slots and go ahead of existing
+pending peers. A full in-memory list keeps its pending work, even if rediscovered
+peers are still in retry cooldown. The existing database retention policy and
+per-hash peer limit still apply. Persisted due jobs retain the existing order by
+`next_attempt_at`, `updated_at`, and `info_hash`, subject to retry time and
+terminal-state checks. Database-wide freshness ordering is deferred until a
+query/index design is evaluated at realistic scale. The retry loader does no
+database work at capacity and only loads peer lists for untracked jobs that fit
+available slots. No age cutoff deletes older work; continuous fresh arrivals can defer it.
+
 Discovery persistence writes the torrent, job, supplied peer addresses, and peer
 retention changes in one transaction, locking catalogue totals before the torrent.
 Peer upserts and retention deletes use bounded batches. Replays preserve unique
