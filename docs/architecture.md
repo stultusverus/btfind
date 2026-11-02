@@ -45,10 +45,12 @@ addresses promote ready jobs; duplicate-only discoveries preserve the ready queu
 order. New addresses are admitted only into free slots and go ahead of existing
 pending peers. A full in-memory list keeps its pending work, even if rediscovered
 peers are still in retry cooldown. The existing database retention policy and
-per-hash peer limit still apply. Persisted due jobs are ordered by latest peer observation first, subject
-to their retry time and terminal-state checks. The retry loader does no database
-work at capacity and only loads peer lists for untracked jobs that fit available
-slots. No age cutoff deletes older work; continuous fresh arrivals can defer it.
+per-hash peer limit still apply. Persisted due jobs retain the existing order by
+`next_attempt_at`, `updated_at`, and `info_hash`, subject to retry time and
+terminal-state checks. Database-wide freshness ordering is deferred until a
+query/index design is evaluated at realistic scale. The retry loader does no
+database work at capacity and only loads peer lists for untracked jobs that fit
+available slots. No age cutoff deletes older work; continuous fresh arrivals can defer it.
 
 Discovery persistence writes the torrent, job, supplied peer addresses, and peer
 retention changes in one transaction, locking catalogue totals before the torrent.

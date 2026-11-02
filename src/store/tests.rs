@@ -851,22 +851,24 @@ fn search_size_error_is_typed() {
 
 #[tokio::test]
 #[ignore = "requires BTFIND_TEST_DATABASE_URL; run scripts/test-mysql.sh"]
-async fn mysql_due_jobs_prefer_fresh_peer_observations_but_keep_retry_eligibility() {
+async fn mysql_due_jobs_keep_schedule_order_and_retry_eligibility() {
     let store = Store::open_test_database().await.unwrap();
     let older = [81; 20];
     let fresh = [82; 20];
     let future = [83; 20];
     let terminal = [84; 20];
+    let tied = [85; 20];
+    let later = [86; 20];
     let peer = PeerContact {
         addr: "192.0.2.1:6881".parse().unwrap(),
     };
-    for hash in [older, fresh, future, terminal] {
+    for hash in [older, fresh, future, terminal, tied, later] {
         store
             .persist_hash_discovery(&hash, "test", std::slice::from_ref(&peer), 8)
             .await
             .unwrap();
     }
-    sqlx::query("UPDATE hash_jobs SET last_new_peer_at=100,updated_at=1")
+    sqlx::query("UPDATE hash_jobs SET next_attempt_at=10,last_new_peer_at=100,updated_at=1")
         .execute(&store.pool)
         .await
         .unwrap();
@@ -875,6 +877,13 @@ async fn mysql_due_jobs_prefer_fresh_peer_observations_but_keep_retry_eligibilit
         .execute(&store.pool)
         .await
         .unwrap();
+    sqlx::query("UPDATE hash_jobs SET updated_at=2 WHERE info_hash=?")
+        .bind(hex::encode(tied))
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE hash_jobs SET next_attempt_at=20,updated_at=0,last_new_peer_at=300 WHERE info_hash=?")
+        .bind(hex::encode(later)).execute(&store.pool).await.unwrap();
     store
         .update_hash_job_failure(&future, "retry_at", 1, now() + 3600, "timeout")
         .await
@@ -883,12 +892,12 @@ async fn mysql_due_jobs_prefer_fresh_peer_observations_but_keep_retry_eligibilit
         .update_hash_job_failure(&terminal, "unsupported", 1, 0, "unsupported")
         .await
         .unwrap();
-    let due = store.due_hash_jobs(4).await.unwrap();
+    let due = store.due_hash_jobs(10).await.unwrap();
     assert_eq!(
         due.iter().map(|j| j.info_hash).collect::<Vec<_>>(),
-        vec![fresh, older]
+        vec![older, fresh, tied, later]
     );
-    assert_eq!(store.due_hash_jobs(1).await.unwrap()[0].info_hash, fresh);
+    assert_eq!(store.due_hash_jobs(1).await.unwrap()[0].info_hash, older);
     store
         .persist_hash_discovery(&older, "get_peers", std::slice::from_ref(&peer), 8)
         .await

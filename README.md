@@ -182,11 +182,13 @@ work and put their peers first within each job. Duplicate-only discoveries leave
 the ready queue order unchanged. New addresses use free slots only; a full pending
 peer list is not replaced, so rediscovered peers in retry cooldown cannot evict
 unattempted work. The existing database peer-retention policy is unchanged.
-Restored due jobs prefer the most recent
-peer observation, while retaining the existing retry eligibility checks. Older
+Restored due jobs retain their existing order: `next_attempt_at`, then
+`updated_at`, then `info_hash`, with retry eligibility checks unchanged. Older
 jobs remain durable, but sustained fresh discoveries can defer them. The retry
 loader skips full queues, skips already tracked hashes, and loads peer lists
-only for available slots. Concurrency remains 10 by default.
+only for available slots. Concurrency remains 10 by default. Database-wide
+freshness ordering is deferred pending query/index performance evaluation;
+these changes do not establish that the existing query scales without sorting.
 
 CLI flags override config values. Set BTFIND_DATABASE_URL in a protected service
 environment file. TLS certificate and hostname verification are enabled by

@@ -1748,7 +1748,7 @@ mod tests {
                 .unwrap();
         }
         let tracked = hex::encode([1; 20]);
-        store.execute_batch_for_test(&format!("UPDATE hash_jobs SET last_new_peer_at=100; UPDATE hash_jobs SET last_new_peer_at=300 WHERE info_hash='{tracked}'; UPDATE hash_job_peers SET peer_addr='invalid' WHERE info_hash='{tracked}'")).await.unwrap();
+        store.execute_batch_for_test(&format!("UPDATE hash_jobs SET updated_at=100; UPDATE hash_jobs SET updated_at=1 WHERE info_hash='{tracked}'; UPDATE hash_job_peers SET peer_addr='invalid' WHERE info_hash='{tracked}'")).await.unwrap();
         let jobs = HashMap::from([([1; 20], HashJob::new(0))]);
         let loaded = load_due_jobs(&store, &jobs, 2, 8).await.unwrap();
         assert_eq!(loaded.len(), 1);
