@@ -1273,3 +1273,48 @@ async fn mysql_discovery_receipt_replay_returns_committed_counts() {
             .unwrap();
     assert_eq!(receipt_rows, 0, "processed receipts are cleaned up");
 }
+
+#[tokio::test]
+#[ignore = "requires BTFIND_TEST_DATABASE_URL; run scripts/test-mysql.sh"]
+async fn mysql_repeated_identical_discovery_does_not_report_job_creation() {
+    let store = Store::open_test_database().await.unwrap();
+    let peer = PeerContact {
+        addr: "8.8.8.8:6881".parse().unwrap(),
+    };
+    let mut verified_same_second = false;
+    for attempt in 0..10u8 {
+        let mut hash = [100u8; 20];
+        hash[19] = attempt;
+        let before = now();
+        let first = store
+            .persist_hash_discovery(&hash, "announce_peer", std::slice::from_ref(&peer), 8)
+            .await
+            .unwrap();
+        let second = store
+            .persist_hash_discovery(&hash, "announce_peer", std::slice::from_ref(&peer), 8)
+            .await
+            .unwrap();
+        let after = now();
+        assert!(first.torrent_inserted);
+        assert!(first.hash_job_created);
+        assert!(!second.torrent_inserted);
+        assert!(
+            !second.hash_job_created,
+            "an unchanged existing job must not be counted as newly created"
+        );
+        let jobs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM hash_jobs WHERE info_hash=?")
+            .bind(hex::encode(hash))
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(jobs, 1);
+        if before == after {
+            verified_same_second = true;
+            break;
+        }
+    }
+    assert!(
+        verified_same_second,
+        "could not exercise the same-second unchanged-row path"
+    );
+}

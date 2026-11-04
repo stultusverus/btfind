@@ -225,7 +225,10 @@ rather than runtime labels, and no info hashes or peer addresses are logged.
   by the discovery channel) durably inserts or updates the torrent row but
   deliberately does not create a new `hash_jobs` row, counted in
   `peerless_jobs_skipped_total`; the job row is created when a later peer-bearing
-  discovery arrives. Failed, rolled-back, or retried
+  discovery arrives. Newly created job rows are determined by an explicit
+  existence check rather than upsert affected rows, because the MySQL driver
+  enables `CLIENT_FOUND_ROWS` and an unchanged existing row can report the same
+  affected-row count as a fresh insert. Failed, rolled-back, or retried
   operations are never counted as successful. `persistence_errors_total` counts
   failed database operations on persistence/retry-state paths. Committed work is
   counted exactly once: statistics batches and hash-discovery persistence record

@@ -909,24 +909,22 @@ async fn discover(
             .execute(&mut *conn)
             .await?;
     }
+    let job_exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM hash_jobs WHERE info_hash=?)")
+            .bind(&h)
+            .fetch_one(&mut *conn)
+            .await?;
     if peers {
-        let result = if metadata_complete == Some(true) {
-            sqlx::query("INSERT INTO hash_jobs(info_hash,status,last_new_peer_at,discovery_sources,updated_at,last_failure) VALUES (?,'complete',?,?,?,NULL) ON DUPLICATE KEY UPDATE status='complete',last_failure=NULL,next_attempt_at=0,last_new_peer_at=COALESCE(VALUES(last_new_peer_at),last_new_peer_at),discovery_sources=IF(FIND_IN_SET(VALUES(discovery_sources),discovery_sources)>0,discovery_sources,CONCAT_WS(',',NULLIF(discovery_sources,''),VALUES(discovery_sources))),updated_at=VALUES(updated_at)").bind(&h).bind(now()).bind(source).bind(now()).execute(&mut *conn).await?
+        if metadata_complete == Some(true) {
+            sqlx::query("INSERT INTO hash_jobs(info_hash,status,last_new_peer_at,discovery_sources,updated_at,last_failure) VALUES (?,'complete',?,?,?,NULL) ON DUPLICATE KEY UPDATE status='complete',last_failure=NULL,next_attempt_at=0,last_new_peer_at=COALESCE(VALUES(last_new_peer_at),last_new_peer_at),discovery_sources=IF(FIND_IN_SET(VALUES(discovery_sources),discovery_sources)>0,discovery_sources,CONCAT_WS(',',NULLIF(discovery_sources,''),VALUES(discovery_sources))),updated_at=VALUES(updated_at)").bind(&h).bind(now()).bind(source).bind(now()).execute(&mut *conn).await?;
         } else {
-            sqlx::query("INSERT INTO hash_jobs(info_hash,status,last_new_peer_at,discovery_sources,updated_at) VALUES (?,'queued',?,?,?) ON DUPLICATE KEY UPDATE status=CASE WHEN status IN ('complete','invalid','unsupported') THEN status WHEN status='waiting_peers' AND VALUES(last_new_peer_at) IS NULL THEN status ELSE 'queued' END,next_attempt_at=IF(VALUES(last_new_peer_at) IS NULL,next_attempt_at,0),last_new_peer_at=COALESCE(VALUES(last_new_peer_at),last_new_peer_at),discovery_sources=IF(FIND_IN_SET(VALUES(discovery_sources),discovery_sources)>0,discovery_sources,CONCAT_WS(',',NULLIF(discovery_sources,''),VALUES(discovery_sources))),updated_at=VALUES(updated_at)").bind(&h).bind(now()).bind(source).bind(now()).execute(&mut *conn).await?
-        };
-        outcome.hash_job_created = result.rows_affected() == 1;
-    } else {
-        let job_exists: Option<String> =
-            sqlx::query_scalar("SELECT info_hash FROM hash_jobs WHERE info_hash=?")
-                .bind(&h)
-                .fetch_optional(&mut *conn)
-                .await?;
-        if job_exists.is_some() {
-            sqlx::query("UPDATE hash_jobs SET status=CASE WHEN status IN ('complete','invalid','unsupported') THEN status WHEN status='waiting_peers' THEN status ELSE 'queued' END,discovery_sources=IF(FIND_IN_SET(?,discovery_sources)>0,discovery_sources,CONCAT_WS(',',NULLIF(discovery_sources,''),?)),updated_at=? WHERE info_hash=?").bind(source).bind(source).bind(now()).bind(&h).execute(&mut *conn).await?;
-        } else {
-            outcome.peerless_job_skipped = true;
+            sqlx::query("INSERT INTO hash_jobs(info_hash,status,last_new_peer_at,discovery_sources,updated_at) VALUES (?,'queued',?,?,?) ON DUPLICATE KEY UPDATE status=CASE WHEN status IN ('complete','invalid','unsupported') THEN status WHEN status='waiting_peers' AND VALUES(last_new_peer_at) IS NULL THEN status ELSE 'queued' END,next_attempt_at=IF(VALUES(last_new_peer_at) IS NULL,next_attempt_at,0),last_new_peer_at=COALESCE(VALUES(last_new_peer_at),last_new_peer_at),discovery_sources=IF(FIND_IN_SET(VALUES(discovery_sources),discovery_sources)>0,discovery_sources,CONCAT_WS(',',NULLIF(discovery_sources,''),VALUES(discovery_sources))),updated_at=VALUES(updated_at)").bind(&h).bind(now()).bind(source).bind(now()).execute(&mut *conn).await?;
         }
+        outcome.hash_job_created = !job_exists;
+    } else if job_exists {
+        sqlx::query("UPDATE hash_jobs SET status=CASE WHEN status IN ('complete','invalid','unsupported') THEN status WHEN status='waiting_peers' THEN status ELSE 'queued' END,discovery_sources=IF(FIND_IN_SET(?,discovery_sources)>0,discovery_sources,CONCAT_WS(',',NULLIF(discovery_sources,''),?)),updated_at=? WHERE info_hash=?").bind(source).bind(source).bind(now()).bind(&h).execute(&mut *conn).await?;
+    } else {
+        outcome.peerless_job_skipped = true;
     }
     Ok(outcome)
 }
