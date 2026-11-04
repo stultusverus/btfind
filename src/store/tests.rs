@@ -701,6 +701,8 @@ async fn mysql_discovery_peers_are_atomic_and_replayable() {
                 info_hash: hash,
                 source: crate::types::DiscoverySource::AnnouncePeer,
                 has_peers: true,
+                accepted: true,
+                peers: peers.len(),
             }],
             None,
             "observation-before-discovery",
@@ -940,5 +942,379 @@ async fn mysql_due_jobs_keep_schedule_order_and_retry_eligibility() {
     assert_eq!(
         store.hash_job_peers(&older, 8).await.unwrap(),
         vec![newer_peer, peer]
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires BTFIND_TEST_DATABASE_URL; run scripts/test-mysql.sh"]
+async fn mysql_peerless_discovery_skips_job_until_peer_bearing_arrival() {
+    let store = Store::open_test_database().await.unwrap();
+    let hash = [91; 20];
+    let peerless = store
+        .persist_hash_discovery(&hash, "sample_infohashes", &[], 8)
+        .await
+        .unwrap();
+    assert!(peerless.torrent_inserted);
+    assert!(peerless.peerless_job_skipped);
+    assert!(!peerless.hash_job_created);
+    assert!(store.get_torrent(&hash).await.unwrap().is_some());
+    assert_eq!(store.get_stats().await.unwrap().total_torrents, 1);
+    let jobs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM hash_jobs WHERE info_hash=?")
+        .bind(hex::encode(hash))
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+    assert_eq!(jobs, 0);
+    let peer = PeerContact {
+        addr: "8.8.8.8:6881".parse().unwrap(),
+    };
+    let with_peers = store
+        .persist_hash_discovery(&hash, "announce_peer", std::slice::from_ref(&peer), 8)
+        .await
+        .unwrap();
+    assert!(!with_peers.torrent_inserted);
+    assert!(with_peers.hash_job_created);
+    assert!(!with_peers.peerless_job_skipped);
+    assert_eq!(with_peers.peers_inserted, 1);
+    let jobs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM hash_jobs WHERE info_hash=?")
+        .bind(hex::encode(hash))
+        .fetch_one(&store.pool)
+        .await
+        .unwrap();
+    assert_eq!(jobs, 1);
+    let peerless_again = store
+        .persist_hash_discovery(&hash, "sample_infohashes", &[], 8)
+        .await
+        .unwrap();
+    assert!(!peerless_again.torrent_inserted);
+    assert!(!peerless_again.hash_job_created);
+    assert!(!peerless_again.peerless_job_skipped);
+    let sources: String =
+        sqlx::query_scalar("SELECT discovery_sources FROM hash_jobs WHERE info_hash=?")
+            .bind(hex::encode(hash))
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+    assert_eq!(sources, "announce_peer,sample_infohashes");
+}
+
+#[tokio::test]
+#[ignore = "requires BTFIND_TEST_DATABASE_URL; run scripts/test-mysql.sh"]
+async fn mysql_peer_discovery_accounting_tracks_inserts_updates_and_retention() {
+    let store = Store::open_test_database().await.unwrap();
+    let hash = [92; 20];
+    let first = PeerContact {
+        addr: "1.1.1.1:6881".parse().unwrap(),
+    };
+    let second = PeerContact {
+        addr: "8.8.8.8:6881".parse().unwrap(),
+    };
+    let third = PeerContact {
+        addr: "9.9.9.9:6881".parse().unwrap(),
+    };
+    let outcome = store
+        .persist_hash_discovery(&hash, "announce_peer", &[first.clone(), second], 2)
+        .await
+        .unwrap();
+    assert_eq!(
+        (
+            outcome.peers_inserted,
+            outcome.peers_updated,
+            outcome.peers_deleted
+        ),
+        (2, 0, 0)
+    );
+    assert_eq!(store.hash_job_peers(&hash, 8).await.unwrap().len(), 2);
+    let outcome = store
+        .persist_hash_discovery(&hash, "announce_peer", std::slice::from_ref(&first), 1)
+        .await
+        .unwrap();
+    assert_eq!(
+        (
+            outcome.peers_inserted,
+            outcome.peers_updated,
+            outcome.peers_deleted
+        ),
+        (0, 1, 1)
+    );
+    assert_eq!(
+        store.hash_job_peers(&hash, 8).await.unwrap(),
+        vec![first.clone()]
+    );
+    let outcome = store
+        .persist_hash_discovery(&hash, "announce_peer", &[first, third], 2)
+        .await
+        .unwrap();
+    assert_eq!(
+        (
+            outcome.peers_inserted,
+            outcome.peers_updated,
+            outcome.peers_deleted
+        ),
+        (1, 1, 0)
+    );
+    assert_eq!(store.hash_job_peers(&hash, 8).await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+#[ignore = "requires BTFIND_TEST_DATABASE_URL; run scripts/test-mysql.sh"]
+async fn mysql_runtime_batch_persists_only_rejected_hash_fallbacks() {
+    let store = Store::open_test_database().await.unwrap();
+    let rejected = [93; 20];
+    let accepted = [94; 20];
+    let outcome = store
+        .persist_runtime_batch(
+            &[
+                CrawlStatsEvent::HashObserved {
+                    info_hash: rejected,
+                    source: crate::types::DiscoverySource::AnnouncePeer,
+                    has_peers: true,
+                    accepted: false,
+                    peers: 3,
+                },
+                CrawlStatsEvent::HashObserved {
+                    info_hash: accepted,
+                    source: crate::types::DiscoverySource::AnnouncePeer,
+                    has_peers: true,
+                    accepted: true,
+                    peers: 1,
+                },
+            ],
+            None,
+            "rejected-fallback",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        RuntimeBatchPersistence {
+            torrents_inserted: 1,
+            hash_jobs_created: 0,
+            peerless_jobs_skipped: 1,
+        }
+    );
+    assert!(store.get_torrent(&rejected).await.unwrap().is_some());
+    assert!(store.get_torrent(&accepted).await.unwrap().is_none());
+    assert_eq!(store.get_stats().await.unwrap().total_torrents, 1);
+    let duplicate = store
+        .persist_runtime_batch(&[], None, "rejected-fallback")
+        .await
+        .unwrap();
+    assert_eq!(
+        duplicate,
+        RuntimeBatchPersistence {
+            torrents_inserted: 1,
+            hash_jobs_created: 0,
+            peerless_jobs_skipped: 1,
+        },
+        "a committed receipt must replay the originally committed counts"
+    );
+    assert_eq!(
+        store.get_stats().await.unwrap().total_torrents,
+        1,
+        "replaying a committed batch must not write the rows again"
+    );
+    let sampled = [95; 20];
+    let outcome = store
+        .persist_runtime_batch(
+            &[CrawlStatsEvent::SampleObserved {
+                info_hash: sampled,
+                node_id: [7; 20],
+                addr: "8.8.4.4:6881".parse().unwrap(),
+                round_id: 3,
+            }],
+            None,
+            "sample-observation",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        RuntimeBatchPersistence {
+            torrents_inserted: 1,
+            hash_jobs_created: 0,
+            peerless_jobs_skipped: 1,
+        }
+    );
+    assert!(store.get_torrent(&sampled).await.unwrap().is_some());
+    assert_eq!(store.get_stats().await.unwrap().total_torrents, 2);
+}
+
+#[tokio::test]
+#[ignore = "requires BTFIND_TEST_DATABASE_URL; run scripts/test-mysql.sh"]
+async fn mysql_update_hash_job_failure_reports_rows_affected() {
+    let store = Store::open_test_database().await.unwrap();
+    let hash = [96; 20];
+    let peer = PeerContact {
+        addr: "8.8.8.8:6881".parse().unwrap(),
+    };
+    store
+        .persist_hash_discovery(&hash, "announce_peer", std::slice::from_ref(&peer), 8)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .update_hash_job_failure(&hash, "retry_at", 1, now() + 60, "timeout")
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        store
+            .update_hash_job_failure(&[97; 20], "retry_at", 1, now() + 60, "missing")
+            .await
+            .unwrap(),
+        0
+    );
+    store
+        .commit_metadata(&hash, "complete", 1, 1, &[("file".into(), 1)])
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .update_hash_job_failure(&hash, "unsupported", 2, 0, "complete")
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires BTFIND_TEST_DATABASE_URL; run scripts/test-mysql.sh"]
+async fn mysql_metadata_completion_establishes_terminal_job() {
+    let store = Store::open_test_database().await.unwrap();
+    let hash = [98; 20];
+    store
+        .commit_metadata(&hash, "complete", 16, 10, &[("file".into(), 10)])
+        .await
+        .unwrap();
+    assert_eq!(
+        store.hash_job_schedule_for_test(&hash).await.unwrap().0,
+        "complete"
+    );
+    assert!(store.hash_job_is_terminal(&hash).await.unwrap());
+    assert!(store.due_hash_jobs(10).await.unwrap().is_empty());
+
+    let peer = PeerContact {
+        addr: "8.8.8.8:6881".parse().unwrap(),
+    };
+    let outcome = store
+        .persist_hash_discovery(&hash, "announce_peer", std::slice::from_ref(&peer), 8)
+        .await
+        .unwrap();
+    assert!(!outcome.torrent_inserted);
+    assert!(!outcome.hash_job_created);
+    assert_eq!(
+        store.hash_job_schedule_for_test(&hash).await.unwrap().0,
+        "complete",
+        "a peer-bearing discovery must not reopen a completed metadata job"
+    );
+    assert!(store.hash_job_is_terminal(&hash).await.unwrap());
+    assert!(store.due_hash_jobs(10).await.unwrap().is_empty());
+    assert_eq!(store.get_stats().await.unwrap().total_torrents, 1);
+    assert_eq!(store.hash_job_peers(&hash, 8).await.unwrap(), vec![peer]);
+}
+
+#[tokio::test]
+#[ignore = "requires BTFIND_TEST_DATABASE_URL; run scripts/test-mysql.sh"]
+async fn mysql_discovery_receipt_replay_returns_committed_counts() {
+    let store = Store::open_test_database().await.unwrap();
+    let hash = [99; 20];
+    let peers = vec![
+        PeerContact {
+            addr: "1.1.1.1:6881".parse().unwrap(),
+        },
+        PeerContact {
+            addr: "8.8.8.8:6881".parse().unwrap(),
+        },
+    ];
+    let receipt = "recovered-discovery-receipt";
+    let committed = DiscoveryPersistence {
+        torrent_inserted: true,
+        hash_job_created: true,
+        peerless_job_skipped: false,
+        peers_inserted: 2,
+        peers_updated: 0,
+        peers_deleted: 0,
+    };
+    sqlx::query(
+        "INSERT INTO persistence_receipts(id,created_at,acknowledged_at,result) VALUES (?,?,?,?)",
+    )
+    .bind(receipt)
+    .bind(now())
+    .bind(now())
+    .bind(serde_json::to_string(&committed).unwrap())
+    .execute(&store.pool)
+    .await
+    .unwrap();
+    let replayed = store
+        .persist_hash_discovery_with_receipt(&hash, "announce_peer", &peers, 8, receipt)
+        .await
+        .unwrap();
+    assert_eq!(replayed, committed);
+    assert!(
+        store.get_torrent(&hash).await.unwrap().is_none(),
+        "replaying a committed receipt must not repeat the transaction"
+    );
+
+    let fresh_receipt = "fresh-discovery-receipt";
+    let first = store
+        .persist_hash_discovery_with_receipt(&hash, "announce_peer", &peers, 8, fresh_receipt)
+        .await
+        .unwrap();
+    assert!(first.torrent_inserted);
+    assert!(first.hash_job_created);
+    assert_eq!(first.peers_inserted, 2);
+    let receipt_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM persistence_receipts WHERE id=?")
+            .bind(fresh_receipt)
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+    assert_eq!(receipt_rows, 0, "processed receipts are cleaned up");
+}
+
+#[tokio::test]
+#[ignore = "requires BTFIND_TEST_DATABASE_URL; run scripts/test-mysql.sh"]
+async fn mysql_repeated_identical_discovery_does_not_report_job_creation() {
+    let store = Store::open_test_database().await.unwrap();
+    let peer = PeerContact {
+        addr: "8.8.8.8:6881".parse().unwrap(),
+    };
+    let mut verified_same_second = false;
+    for attempt in 0..10u8 {
+        let mut hash = [100u8; 20];
+        hash[19] = attempt;
+        let before = now();
+        let first = store
+            .persist_hash_discovery(&hash, "announce_peer", std::slice::from_ref(&peer), 8)
+            .await
+            .unwrap();
+        let second = store
+            .persist_hash_discovery(&hash, "announce_peer", std::slice::from_ref(&peer), 8)
+            .await
+            .unwrap();
+        let after = now();
+        assert!(first.torrent_inserted);
+        assert!(first.hash_job_created);
+        assert!(!second.torrent_inserted);
+        assert!(
+            !second.hash_job_created,
+            "an unchanged existing job must not be counted as newly created"
+        );
+        let jobs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM hash_jobs WHERE info_hash=?")
+            .bind(hex::encode(hash))
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(jobs, 1);
+        if before == after {
+            verified_same_second = true;
+            break;
+        }
+    }
+    assert!(
+        verified_same_second,
+        "could not exercise the same-second unchanged-row path"
     );
 }

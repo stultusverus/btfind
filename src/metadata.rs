@@ -1,6 +1,9 @@
 use crate::metrics::CrawlerMetrics;
 use crate::store::{HashJobRecord, PeerRetryEligibility, Store};
-use crate::types::{CrawlStatsEvent, HashDiscovery, InfoHash, MetadataFailureReason, PeerContact};
+use crate::types::{
+    CrawlStatsEvent, HashDiscovery, InfoHash, MetadataFailureReason,
+    MetadataJobAdmission as JobAdmission, MetadataRetrievalOutcome, PeerContact,
+};
 use crate::wire::{self, ExtendedHandshake, Handshake, WireMessage, HANDSHAKE_LEN};
 use rand::Rng;
 use sha1::{Digest, Sha1};
@@ -697,6 +700,7 @@ struct PeerRetryFilter {
 
 async fn filter_peers_for_retry(
     store: &Store,
+    metrics: &CrawlerMetrics,
     info_hash: &InfoHash,
     peers: &[PeerContact],
     retry_after_hours: u32,
@@ -727,6 +731,7 @@ async fn filter_peers_for_retry(
                 );
             }
             Err(error) => {
+                metrics.record_persistence_error();
                 tracing::warn!(
                     event = "metadata_retry_state_failed",
                     reason = "database",
@@ -772,16 +777,58 @@ fn emit_metadata_failure(
     }
 }
 
-fn log_storage_result(operation: &str, result: Result<(), crate::store::Error>) {
-    match result {
-        Ok(()) => {}
-        Err(error) => tracing::warn!(
-            event = "metadata_storage_failed",
-            operation = operation,
-            reason = "database",
-            error = %error,
-            "metadata storage operation failed"
-        ),
+fn log_storage_error(operation: &str, error: &crate::store::Error) {
+    tracing::warn!(
+        event = "metadata_storage_failed",
+        operation = operation,
+        reason = "database",
+        error = %error,
+        "metadata storage operation failed"
+    );
+}
+
+fn log_storage_result(
+    metrics: &CrawlerMetrics,
+    operation: &str,
+    result: Result<(), crate::store::Error>,
+) {
+    if let Err(error) = result {
+        metrics.record_persistence_error();
+        log_storage_error(operation, &error);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn mark_hash_job_failure(
+    store: &Store,
+    metrics: &CrawlerMetrics,
+    operation: &str,
+    info_hash: InfoHash,
+    status: &str,
+    attempts: u32,
+    next_attempt_at: i64,
+    failure: &str,
+) -> u64 {
+    match store
+        .update_hash_job_failure(&info_hash, status, attempts, next_attempt_at, failure)
+        .await
+    {
+        Ok(rows_affected) => rows_affected,
+        Err(error) => {
+            metrics.record_persistence_error();
+            log_storage_error(operation, &error);
+            0
+        }
+    }
+}
+
+fn record_retrieval_outcome(
+    metrics: &CrawlerMetrics,
+    rows_affected: u64,
+    outcome: MetadataRetrievalOutcome,
+) {
+    if rows_affected > 0 {
+        metrics.record_metadata_retrieval_outcome(outcome);
     }
 }
 
@@ -838,14 +885,6 @@ struct JobOutcome {
     complete: bool,
     terminal: bool,
     parked: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum JobAdmission {
-    Accepted,
-    Unchanged,
-    NoPeers,
-    AtCapacity,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -971,6 +1010,7 @@ where
             }
             Ok(false) => break,
             Err(error) => {
+                config.metrics.record_persistence_error();
                 tracing::warn!(
                     event = "metadata_job_state_failed",
                     reason = "database",
@@ -983,8 +1023,17 @@ where
         }
     }
     let filter_store = store.clone();
+    let filter_metrics = config.metrics.clone();
+    let retry_after_hours = config.retry_after_hours;
     let filtered = (async move {
-        filter_peers_for_retry(&filter_store, &info_hash, &peers, config.retry_after_hours).await
+        filter_peers_for_retry(
+            &filter_store,
+            &filter_metrics,
+            &info_hash,
+            &peers,
+            retry_after_hours,
+        )
+        .await
     })
     .await;
     let mut attempts = 0u32;
@@ -1007,6 +1056,7 @@ where
         {
             Ok(()) => {}
             Err(error) => {
+                config.metrics.record_persistence_error();
                 last_error = format!("storage: failed to record peer attempt: {}", error);
                 retryable_attempts = retryable_attempts.saturating_add(1);
                 continue;
@@ -1037,7 +1087,7 @@ where
                         .await
                 })
                 .await;
-                log_storage_result("record metadata hash mismatch", recorded);
+                log_storage_result(&config.metrics, "record metadata hash mismatch", recorded);
                 emit_metadata_failure(
                     &config.metrics,
                     &stats_tx,
@@ -1067,6 +1117,9 @@ where
                     .await;
                     match committed {
                         Ok(()) => {
+                            config.metrics.record_metadata_retrieval_outcome(
+                                MetadataRetrievalOutcome::Complete,
+                            );
                             if !emit_stat(
                                 &config.metrics,
                                 &stats_tx,
@@ -1089,7 +1142,7 @@ where
                         Err(error) if crate::store::is_unsupported_search_document(&error) => {
                             let message = error.to_string();
                             let mut retry_delay = Duration::from_millis(100);
-                            loop {
+                            let rows_affected = loop {
                                 match store
                                     .update_hash_job_failure(
                                         &info_hash,
@@ -1100,8 +1153,9 @@ where
                                     )
                                     .await
                                 {
-                                    Ok(()) => break,
+                                    Ok(rows_affected) => break rows_affected,
                                     Err(error) => {
+                                        config.metrics.record_persistence_error();
                                         tracing::warn!(
                                             event = "metadata_job_state_failed",
                                             reason = "database",
@@ -1114,7 +1168,12 @@ where
                                             .min(Duration::from_secs(5));
                                     }
                                 }
-                            }
+                            };
+                            record_retrieval_outcome(
+                                &config.metrics,
+                                rows_affected,
+                                MetadataRetrievalOutcome::Unsupported,
+                            );
                             tracing::warn!(
                                 event = "metadata_job_unsupported",
                                 reason = "search_document",
@@ -1129,6 +1188,7 @@ where
                             };
                         }
                         Err(error) => {
+                            config.metrics.record_persistence_error();
                             last_error = format!("storage: {}", error);
                             retryable_attempts = retryable_attempts.saturating_add(1);
                         }
@@ -1141,21 +1201,23 @@ where
                     } else {
                         "invalid"
                     };
-                    let terminal_store = store.clone();
-                    let terminal_error = error.clone();
-                    let recorded = (async move {
-                        terminal_store
-                            .update_hash_job_failure(
-                                &info_hash,
-                                status,
-                                config.prior_attempt_count.saturating_add(attempts),
-                                0,
-                                &terminal_error,
-                            )
-                            .await
-                    })
+                    let rows_affected = mark_hash_job_failure(
+                        &store,
+                        &config.metrics,
+                        "record terminal metadata state",
+                        info_hash,
+                        status,
+                        config.prior_attempt_count.saturating_add(attempts),
+                        0,
+                        &error,
+                    )
                     .await;
-                    log_storage_result("record terminal metadata state", recorded);
+                    let outcome = if unsupported {
+                        MetadataRetrievalOutcome::Unsupported
+                    } else {
+                        MetadataRetrievalOutcome::Invalid
+                    };
+                    record_retrieval_outcome(&config.metrics, rows_affected, outcome);
                     emit_metadata_failure(&config.metrics, &stats_tx, MetadataFailureReason::Parse);
                     return JobOutcome {
                         info_hash,
@@ -1181,7 +1243,7 @@ where
                         .await
                 })
                 .await;
-                log_storage_result("record metadata peer failure", recorded);
+                log_storage_result(&config.metrics, "record metadata peer failure", recorded);
                 emit_metadata_failure(&config.metrics, &stats_tx, reason);
             }
         }
@@ -1198,21 +1260,22 @@ where
     let has_retryable_peer = next_peer_eligibility.is_some()
         || (retryable_attempts > 0 && config.retry_after_hours == 0);
     if !has_retryable_peer {
-        let retry_store = store.clone();
-        let retry_error = last_error.clone();
-        let recorded = (async move {
-            retry_store
-                .update_hash_job_failure(
-                    &info_hash,
-                    "waiting_peers",
-                    attempt_count,
-                    0,
-                    &retry_error,
-                )
-                .await
-        })
+        let rows_affected = mark_hash_job_failure(
+            &store,
+            &config.metrics,
+            "park metadata job",
+            info_hash,
+            "waiting_peers",
+            attempt_count,
+            0,
+            &last_error,
+        )
         .await;
-        log_storage_result("park metadata job", recorded);
+        record_retrieval_outcome(
+            &config.metrics,
+            rows_affected,
+            MetadataRetrievalOutcome::WaitingPeers,
+        );
         return JobOutcome {
             info_hash,
             attempts,
@@ -1229,21 +1292,22 @@ where
         now.saturating_add(i64::try_from(delay.saturating_add(jitter)).unwrap_or(i64::MAX));
     let next_attempt_at =
         next_peer_eligibility.map_or(backoff_at, |peer_retry_at| backoff_at.max(peer_retry_at));
-    let retry_store = store.clone();
-    let retry_error = last_error.clone();
-    let recorded = (async move {
-        retry_store
-            .update_hash_job_failure(
-                &info_hash,
-                "retry_at",
-                attempt_count,
-                next_attempt_at,
-                &retry_error,
-            )
-            .await
-    })
+    let rows_affected = mark_hash_job_failure(
+        &store,
+        &config.metrics,
+        "schedule metadata retry",
+        info_hash,
+        "retry_at",
+        attempt_count,
+        next_attempt_at,
+        &last_error,
+    )
     .await;
-    log_storage_result("schedule metadata retry", recorded);
+    record_retrieval_outcome(
+        &config.metrics,
+        rows_affected,
+        MetadataRetrievalOutcome::RetryAt,
+    );
     tracing::debug!(
         event = "metadata_round_failed",
         reason = "peer_attempts",
@@ -1387,17 +1451,20 @@ pub async fn run_metadata_fetcher(
                 let info_hash = discovery.info_hash;
                 let peers = discovery.peers;
                 let source = discovery.source;
+                let discovery_has_peers = !peers.is_empty();
                 let mut retry_delay = Duration::from_millis(100);
-                loop {
-                    let persistence = store.persist_hash_discovery(
+                let receipt = uuid::Uuid::new_v4().to_string();
+                let persisted = loop {
+                    match store.persist_hash_discovery_with_receipt(
                         &info_hash,
                         source.as_str(),
                         &peers,
                         max_peers_per_hash,
-                    ).await;
-                    match persistence {
-                        Ok(()) => break,
+                        &receipt,
+                    ).await {
+                        Ok(persisted) => break persisted,
                         Err(error) => {
+                            metrics.record_persistence_error();
                             tracing::warn!(
                                 event = "discovery_persist_failed",
                                 reason = "database",
@@ -1409,6 +1476,17 @@ pub async fn run_metadata_fetcher(
                             retry_delay = retry_delay.saturating_mul(2).min(Duration::from_secs(5));
                         }
                     }
+                };
+                metrics.record_torrents_inserted(u64::from(persisted.torrent_inserted));
+                metrics.record_hash_jobs_created(u64::from(persisted.hash_job_created));
+                metrics.record_peerless_jobs_skipped(u64::from(persisted.peerless_job_skipped));
+                metrics.record_peer_records(
+                    persisted.peers_inserted,
+                    persisted.peers_updated,
+                    persisted.peers_deleted,
+                );
+                if discovery_has_peers {
+                    metrics.record_peer_bearing_discoveries_persisted(1);
                 }
                 let admission = admit_job_peers(
                     &mut jobs,
@@ -1420,6 +1498,7 @@ pub async fn run_metadata_fetcher(
                     max_active_hash_jobs,
                     max_peers_per_hash,
                 );
+                metrics.record_metadata_job_admission(admission);
                 prioritize_ready_job(&mut ready, &ready_set, info_hash, admission);
                 if admission == JobAdmission::AtCapacity
                     && !emit_stat(&metrics, &stats_tx, CrawlStatsEvent::DiscoveryBackpressure)
@@ -1452,6 +1531,7 @@ pub async fn run_metadata_fetcher(
             _ = retry_tick.tick() => {
                 let due = load_due_jobs(&store, &jobs, max_active_hash_jobs, max_peers_per_hash).await;
                 if let Err(error) = &due {
+                    metrics.record_persistence_error();
                     tracing::warn!(
                         event = "metadata_job_load_failed",
                         reason = "database",
@@ -1471,6 +1551,7 @@ pub async fn run_metadata_fetcher(
                             max_active_hash_jobs,
                             max_peers_per_hash,
                         );
+                        metrics.record_metadata_job_admission(admission);
                         if admission == JobAdmission::Accepted {
                             tracing::debug!(
                                 event = "metadata_job_restored",
@@ -1614,7 +1695,8 @@ mod tests {
             .await
             .unwrap();
         let incoming = vec![peers[2].clone(), peers[3].clone()];
-        let filtered = filter_peers_for_retry(&store, &hash, &incoming, 24).await;
+        let inbox_metrics = CrawlerMetrics::default();
+        let filtered = filter_peers_for_retry(&store, &inbox_metrics, &hash, &incoming, 24).await;
         assert_eq!(filtered.eligible, vec![peers[3].clone()]);
         assert!(filtered.next_eligible_at.is_some());
 
@@ -1656,7 +1738,8 @@ mod tests {
         }
         let pending = jobs.get_mut(&hash).unwrap().take_round(2);
         assert_eq!(pending, peers[..2]);
-        let filtered = filter_peers_for_retry(&store, &hash, &pending, 24).await;
+        let pending_metrics = CrawlerMetrics::default();
+        let filtered = filter_peers_for_retry(&store, &pending_metrics, &hash, &pending, 24).await;
         assert_eq!(filtered.eligible, pending);
         assert_eq!(filtered.next_eligible_at, None);
     }
@@ -1983,6 +2066,42 @@ mod tests {
             JobAdmission::AtCapacity
         );
         assert_eq!(jobs.len(), 1);
+    }
+
+    #[test]
+    fn metadata_job_admissions_are_counted_by_variant() {
+        let metrics = Arc::new(CrawlerMetrics::default());
+        for admission in [
+            JobAdmission::Accepted,
+            JobAdmission::Unchanged,
+            JobAdmission::NoPeers,
+            JobAdmission::AtCapacity,
+        ] {
+            metrics.record_metadata_job_admission(admission);
+        }
+        let counts: Vec<u64> = metrics
+            .metadata_job_admissions
+            .iter()
+            .map(|count| count.load(std::sync::atomic::Ordering::Relaxed))
+            .collect();
+        assert_eq!(counts, [1, 1, 1, 1]);
+    }
+
+    #[test]
+    fn retrieval_outcomes_are_recorded_only_for_durable_transitions() {
+        let metrics = Arc::new(CrawlerMetrics::default());
+        record_retrieval_outcome(&metrics, 1, MetadataRetrievalOutcome::RetryAt);
+        record_retrieval_outcome(&metrics, 1, MetadataRetrievalOutcome::WaitingPeers);
+        record_retrieval_outcome(&metrics, 1, MetadataRetrievalOutcome::Invalid);
+        record_retrieval_outcome(&metrics, 1, MetadataRetrievalOutcome::Unsupported);
+        record_retrieval_outcome(&metrics, 0, MetadataRetrievalOutcome::RetryAt);
+        metrics.record_metadata_retrieval_outcome(MetadataRetrievalOutcome::Complete);
+        let counts: Vec<u64> = metrics
+            .metadata_retrieval_outcomes
+            .iter()
+            .map(|count| count.load(std::sync::atomic::Ordering::Relaxed))
+            .collect();
+        assert_eq!(counts, [1, 1, 1, 1, 1]);
     }
 
     #[test]
@@ -2973,8 +3092,10 @@ mod tests {
             .await
             .unwrap();
 
+        let retry_metrics = CrawlerMetrics::default();
         let peers = filter_peers_for_retry(
             &store,
+            &retry_metrics,
             &info_hash,
             &[attempted_peer.clone(), new_peer.clone()],
             24,
@@ -3006,9 +3127,15 @@ mod tests {
             .await
             .unwrap();
 
-        let peers =
-            filter_peers_for_retry(&store, &info_hash, std::slice::from_ref(&attempted_peer), 0)
-                .await;
+        let retry_metrics = CrawlerMetrics::default();
+        let peers = filter_peers_for_retry(
+            &store,
+            &retry_metrics,
+            &info_hash,
+            std::slice::from_ref(&attempted_peer),
+            0,
+        )
+        .await;
 
         assert_eq!(peers.eligible, vec![attempted_peer]);
         assert_eq!(peers.next_eligible_at, None);

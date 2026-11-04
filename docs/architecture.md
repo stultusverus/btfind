@@ -57,14 +57,24 @@ retention changes in one transaction, locking catalogue totals before the torren
 Peer upserts and retention deletes use bounded batches. Replays preserve unique
 torrent/peer keys and do not increment catalogue totals twice; completed jobs stay
 complete. Concurrent discoveries serialize through the existing catalogue lock.
-Accepted peer-bearing discoveries belong to the metadata worker, which has the
-actual addresses. If its channel is full or closed, the crawler marks the
-statistics observation as peerless so the statistics worker can retain the hash
-and source for future lookup. This fallback retains no peer addresses and requires
-the bounded statistics channel to accept the event and its worker to commit it.
+Accepted discoveries belong to the metadata worker, which owns the bounded
+discovery channel and any supplied peer addresses; the statistics path only
+persists the peerless fallback for discoveries rejected by that channel. If the
+channel is full or closed, the crawler hands the observation to the statistics
+worker as peerless so the hash and source are retained for future lookup. This
+fallback retains no peer addresses and requires the bounded statistics channel to
+accept the event and its worker to commit it. A peerless observation durably
+inserts or updates the torrent row but deliberately does not create a new
+`hash_jobs` row; the job row is created when a peer-bearing discovery arrives, and
+these skipped job creations are counted in `peerless_jobs_skipped_total`.
 Committed retained peer candidates and retry state survive restarts. Workers
 negotiate `ut_metadata`, retrieve and validate the info dictionary, and commit
 metadata, files, search documents, job completion, and counters atomically.
+Metadata completion also upserts the job's terminal `complete` state in the same
+transaction, so a completed torrent always has a durable terminal job row even
+when no peer-bearing discovery had created one; a later peer-bearing discovery
+never reopens a completed job. A peer-bearing discovery for a torrent whose
+metadata is already complete creates a terminal job row instead of a queued one.
 `MetadataFetched` is emitted after persistence succeeds. Timeout, retry, queue,
 and size limits are configured in `src/config.rs`; tests use simulated peers.
 

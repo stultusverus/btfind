@@ -4,7 +4,7 @@ use sqlx::{
     MySql, MySqlConnection, MySqlPool, QueryBuilder, Row,
 };
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     net::SocketAddrV4,
     str::FromStr,
     time::{Duration, Instant},
@@ -25,6 +25,14 @@ pub fn decode_hash(s: &str) -> Result<InfoHash, Error> {
         .map_err(|_| invalid("invalid stored hash"))?
         .try_into()
         .map_err(|_| invalid("invalid stored hash length"))
+}
+fn encode_persistence<T: serde::Serialize>(value: &T) -> Result<String, Error> {
+    serde_json::to_string(value)
+        .map_err(|error| invalid(format!("failed to encode persistence result: {error}")))
+}
+fn decode_persistence<T: serde::de::DeserializeOwned>(value: &str) -> Result<T, Error> {
+    serde_json::from_str(value)
+        .map_err(|error| invalid(format!("failed to decode persistence result: {error}")))
 }
 #[derive(Debug)]
 pub struct TorrentRecord {
@@ -78,6 +86,21 @@ pub struct RuntimeSnapshot {
     pub queries_sent: i64,
     pub info_hashes_found: i64,
     pub metadata_fetched: i64,
+}
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DiscoveryPersistence {
+    pub torrent_inserted: bool,
+    pub hash_job_created: bool,
+    pub peerless_job_skipped: bool,
+    pub peers_inserted: u64,
+    pub peers_updated: u64,
+    pub peers_deleted: u64,
+}
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RuntimeBatchPersistence {
+    pub torrents_inserted: u64,
+    pub hash_jobs_created: u64,
+    pub peerless_jobs_skipped: u64,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerRetryEligibility {
@@ -261,7 +284,7 @@ impl Store {
                     q.build().execute(&mut *tx).await?;
                 }
                 refresh_search(&mut tx, &h).await?;
-                sqlx::query("UPDATE hash_jobs SET status='complete',last_failure=NULL,last_success_at=?,updated_at=? WHERE info_hash=?").bind(now()).bind(now()).bind(&h).execute(&mut *tx).await?;
+                sqlx::query("INSERT INTO hash_jobs(info_hash,status,last_new_peer_at,discovery_sources,updated_at,last_failure,last_success_at) VALUES (?,'complete',NULL,'dht',?,NULL,?) ON DUPLICATE KEY UPDATE status='complete',last_failure=NULL,last_success_at=VALUES(last_success_at),updated_at=VALUES(updated_at)").bind(&h).bind(now()).bind(now()).execute(&mut *tx).await?;
                 sqlx::query("UPDATE catalog_totals SET total_metadata_complete=total_metadata_complete+?,total_files=total_files+?,total_size=total_size+? WHERE id=1")
                     .bind(i64::from(!old.try_get::<bool,_>("metadata_complete")?)).bind(count-deleted).bind(total_size-old.try_get::<i64,_>("total_size")?).execute(&mut *tx).await?;
                 tx.commit().await
@@ -273,23 +296,100 @@ impl Store {
         }
         unreachable!("bounded retry loop returns")
     }
+    #[cfg(test)]
     pub async fn persist_hash_discovery(
         &self,
         hash: &InfoHash,
         source: &str,
         peers: &[PeerContact],
         limit: usize,
-    ) -> Result<(), Error> {
-        let addresses: Vec<String> = peers
+    ) -> Result<DiscoveryPersistence, Error> {
+        let receipt = uuid::Uuid::new_v4().to_string();
+        self.persist_hash_discovery_with_receipt(hash, source, peers, limit, &receipt)
+            .await
+    }
+    pub async fn persist_hash_discovery_with_receipt(
+        &self,
+        hash: &InfoHash,
+        source: &str,
+        peers: &[PeerContact],
+        limit: usize,
+        receipt: &str,
+    ) -> Result<DiscoveryPersistence, Error> {
+        if let Some(persisted) = self.replayed_discovery(receipt).await? {
+            return Ok(persisted);
+        }
+        let outcome = self
+            .persist_hash_discovery_once(hash, source, peers, limit, receipt)
+            .await?;
+        self.remove_receipt(receipt).await;
+        Ok(outcome)
+    }
+    async fn replayed_discovery(
+        &self,
+        receipt: &str,
+    ) -> Result<Option<DiscoveryPersistence>, Error> {
+        let stored: Option<String> =
+            sqlx::query_scalar("SELECT COALESCE(result,'') FROM persistence_receipts WHERE id=?")
+                .bind(receipt)
+                .fetch_optional(&self.pool)
+                .await?;
+        let Some(stored) = stored else {
+            return Ok(None);
+        };
+        if stored.is_empty() {
+            return Ok(None);
+        }
+        decode_persistence(&stored).map(Some)
+    }
+    async fn remove_receipt(&self, receipt: &str) {
+        if let Err(error) = sqlx::query("DELETE FROM persistence_receipts WHERE id=?")
+            .bind(receipt)
+            .execute(&self.pool)
+            .await
+        {
+            tracing::debug!(
+                event = "persistence_receipt_cleanup_failed",
+                reason = "database",
+                error = %error,
+                "failed to remove persistence receipt"
+            );
+        }
+    }
+    async fn persist_hash_discovery_once(
+        &self,
+        hash: &InfoHash,
+        source: &str,
+        peers: &[PeerContact],
+        limit: usize,
+        receipt: &str,
+    ) -> Result<DiscoveryPersistence, Error> {
+        let mut addresses: Vec<String> = peers
             .iter()
             .take(limit)
             .map(|p| p.addr.to_string())
             .collect();
+        let mut seen = HashSet::with_capacity(addresses.len());
+        addresses.retain(|addr| seen.insert(addr.clone()));
         let h = hex::encode(hash);
         let mut tx = self.pool.begin().await?;
         lock_totals(&mut tx).await?;
-        discover(&mut tx, hash, source, !addresses.is_empty()).await?;
+        let mut outcome = discover(&mut tx, hash, source, !addresses.is_empty()).await?;
         for chunk in addresses.chunks(128) {
+            let mut count =
+                QueryBuilder::<MySql>::new("SELECT COUNT(*) FROM hash_job_peers WHERE info_hash=");
+            count.push_bind(&h).push(" AND peer_addr IN (");
+            {
+                let mut values = count.separated(",");
+                for addr in chunk {
+                    values.push_bind(addr);
+                }
+            }
+            count.push(")");
+            let existing: i64 = count.build_query_scalar().fetch_one(&mut *tx).await?;
+            let existing = u64::try_from(existing).map_err(|_| invalid("invalid peer count"))?;
+            outcome.peers_updated += existing;
+            outcome.peers_inserted += chunk.len() as u64 - existing;
             let mut insert = QueryBuilder::<MySql>::new(
                 "INSERT INTO hash_job_peers(info_hash,peer_addr,last_seen) ",
             );
@@ -310,32 +410,44 @@ impl Store {
                 values.push_bind(addr);
             }
             delete.push(")");
-            delete.build().execute(&mut *tx).await?;
+            outcome.peers_deleted += delete.build().execute(&mut *tx).await?.rows_affected();
         }
-        tx.commit().await
+        sqlx::query("INSERT INTO persistence_receipts(id,created_at,acknowledged_at,result) VALUES (?,?,?,?)")
+            .bind(receipt)
+            .bind(now())
+            .bind(now())
+            .bind(encode_persistence(&outcome)?)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(outcome)
     }
     pub async fn persist_runtime_batch(
         &self,
         events: &[CrawlStatsEvent],
         snapshot: Option<RuntimeSnapshot>,
         receipt: &str,
-    ) -> Result<(), Error> {
+    ) -> Result<RuntimeBatchPersistence, Error> {
         let mut tx = self.pool.begin().await?;
         lock_totals(&mut tx).await?;
-        let exists: Option<String> =
-            sqlx::query_scalar("SELECT id FROM persistence_receipts WHERE id=?")
+        let existing: Option<String> =
+            sqlx::query_scalar("SELECT COALESCE(result,'') FROM persistence_receipts WHERE id=?")
                 .bind(receipt)
                 .fetch_optional(&mut *tx)
                 .await?;
-        if exists.is_some() {
+        if let Some(stored) = existing {
             tx.rollback().await?;
-            return Ok(());
+            if stored.is_empty() {
+                return Ok(RuntimeBatchPersistence::default());
+            }
+            return decode_persistence(&stored);
         }
         sqlx::query("INSERT INTO persistence_receipts(id,created_at) VALUES (?,?)")
             .bind(receipt)
             .bind(now())
             .execute(&mut *tx)
             .await?;
+        let mut outcome = RuntimeBatchPersistence::default();
         let mut nodes = BTreeMap::new();
         for event in events {
             match event {
@@ -346,17 +458,39 @@ impl Store {
                     nodes.insert(*id, *addr);
                 }
                 CrawlStatsEvent::HashObserved {
+                    accepted: false,
                     info_hash,
                     source,
-                    has_peers: false,
-                } => discover(&mut tx, info_hash, source.as_str(), false).await?,
+                    ..
+                } => {
+                    let discovery = discover(&mut tx, info_hash, source.as_str(), false).await?;
+                    if discovery.torrent_inserted {
+                        outcome.torrents_inserted += 1;
+                    }
+                    if discovery.hash_job_created {
+                        outcome.hash_jobs_created += 1;
+                    }
+                    if discovery.peerless_job_skipped {
+                        outcome.peerless_jobs_skipped += 1;
+                    }
+                }
                 CrawlStatsEvent::SampleObserved {
                     info_hash,
                     node_id,
                     addr,
                     round_id,
                 } => {
-                    discover(&mut tx, info_hash, "sample_infohashes", false).await?;
+                    let discovery =
+                        discover(&mut tx, info_hash, "sample_infohashes", false).await?;
+                    if discovery.torrent_inserted {
+                        outcome.torrents_inserted += 1;
+                    }
+                    if discovery.hash_job_created {
+                        outcome.hash_jobs_created += 1;
+                    }
+                    if discovery.peerless_job_skipped {
+                        outcome.peerless_jobs_skipped += 1;
+                    }
                     sqlx::query("INSERT INTO sample_observations(info_hash,first_seen,last_seen,sampling_node_id,sampling_addr,sweep_id) VALUES (?,?,?,?,?,?) ON DUPLICATE KEY UPDATE last_seen=VALUES(last_seen),sample_count=sample_count+1,sampling_node_id=VALUES(sampling_node_id),sampling_addr=VALUES(sampling_addr),sweep_id=VALUES(sweep_id)")
                         .bind(hex::encode(info_hash)).bind(now()).bind(now()).bind(hex::encode(node_id)).bind(addr.to_string()).bind(i64::try_from(*round_id).unwrap_or(i64::MAX)).execute(&mut *tx).await?;
                 }
@@ -369,7 +503,13 @@ impl Store {
         if let Some(s) = snapshot {
             sqlx::query("INSERT INTO crawl_stats(timestamp,nodes_known,queries_sent,info_hashes_found,metadata_fetched) VALUES (?,?,?,?,?)").bind(now()).bind(s.nodes_known).bind(s.queries_sent).bind(s.info_hashes_found).bind(s.metadata_fetched).execute(&mut *tx).await?;
         }
-        tx.commit().await
+        sqlx::query("UPDATE persistence_receipts SET result=? WHERE id=?")
+            .bind(encode_persistence(&outcome)?)
+            .bind(receipt)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(outcome)
     }
     pub async fn acknowledge_receipt(&self, receipt: &str) -> Result<(), Error> {
         sqlx::query("UPDATE persistence_receipts SET acknowledged_at=? WHERE id=? AND acknowledged_at IS NULL")
@@ -387,9 +527,9 @@ impl Store {
         attempts: u32,
         next: i64,
         failure: &str,
-    ) -> Result<(), Error> {
-        sqlx::query("UPDATE hash_jobs SET status=?,attempt_count=?,next_attempt_at=?,last_failure=?,updated_at=? WHERE info_hash=? AND status<>'complete'").bind(status).bind(i64::from(attempts)).bind(next).bind(failure).bind(now()).bind(hex::encode(hash)).execute(&self.pool).await?;
-        Ok(())
+    ) -> Result<u64, Error> {
+        let result = sqlx::query("UPDATE hash_jobs SET status=?,attempt_count=?,next_attempt_at=?,last_failure=?,updated_at=? WHERE info_hash=? AND status<>'complete'").bind(status).bind(i64::from(attempts)).bind(next).bind(failure).bind(now()).bind(hex::encode(hash)).execute(&self.pool).await?;
+        Ok(result.rows_affected())
     }
     pub async fn hash_job_peers(
         &self,
@@ -752,21 +892,41 @@ async fn discover(
     hash: &InfoHash,
     source: &str,
     peers: bool,
-) -> Result<(), Error> {
+) -> Result<DiscoveryPersistence, Error> {
     let h = hex::encode(hash);
-    let exists: Option<String> =
-        sqlx::query_scalar("SELECT info_hash FROM torrents WHERE info_hash=?")
+    let metadata_complete: Option<bool> =
+        sqlx::query_scalar("SELECT metadata_complete FROM torrents WHERE info_hash=?")
             .bind(&h)
             .fetch_optional(&mut *conn)
             .await?;
     sqlx::query("INSERT INTO torrents(info_hash,source,first_seen,last_seen) VALUES (?,?,?,?) ON DUPLICATE KEY UPDATE source=VALUES(source),last_seen=VALUES(last_seen)").bind(&h).bind(source).bind(now()).bind(now()).execute(&mut *conn).await?;
-    if exists.is_none() {
+    let mut outcome = DiscoveryPersistence {
+        torrent_inserted: metadata_complete.is_none(),
+        ..DiscoveryPersistence::default()
+    };
+    if outcome.torrent_inserted {
         sqlx::query("UPDATE catalog_totals SET total_torrents=total_torrents+1 WHERE id=1")
             .execute(&mut *conn)
             .await?;
     }
-    sqlx::query("INSERT INTO hash_jobs(info_hash,status,last_new_peer_at,discovery_sources,updated_at) VALUES (?,'queued',?,?,?) ON DUPLICATE KEY UPDATE status=CASE WHEN status IN ('complete','invalid','unsupported') THEN status WHEN status='waiting_peers' AND VALUES(last_new_peer_at) IS NULL THEN status ELSE 'queued' END,next_attempt_at=IF(VALUES(last_new_peer_at) IS NULL,next_attempt_at,0),last_new_peer_at=COALESCE(VALUES(last_new_peer_at),last_new_peer_at),discovery_sources=IF(FIND_IN_SET(VALUES(discovery_sources),discovery_sources)>0,discovery_sources,CONCAT_WS(',',NULLIF(discovery_sources,''),VALUES(discovery_sources))),updated_at=VALUES(updated_at)").bind(&h).bind(peers.then_some(now())).bind(source).bind(now()).execute(&mut *conn).await?;
-    Ok(())
+    let job_exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM hash_jobs WHERE info_hash=?)")
+            .bind(&h)
+            .fetch_one(&mut *conn)
+            .await?;
+    if peers {
+        if metadata_complete == Some(true) {
+            sqlx::query("INSERT INTO hash_jobs(info_hash,status,last_new_peer_at,discovery_sources,updated_at,last_failure) VALUES (?,'complete',?,?,?,NULL) ON DUPLICATE KEY UPDATE status='complete',last_failure=NULL,next_attempt_at=0,last_new_peer_at=COALESCE(VALUES(last_new_peer_at),last_new_peer_at),discovery_sources=IF(FIND_IN_SET(VALUES(discovery_sources),discovery_sources)>0,discovery_sources,CONCAT_WS(',',NULLIF(discovery_sources,''),VALUES(discovery_sources))),updated_at=VALUES(updated_at)").bind(&h).bind(now()).bind(source).bind(now()).execute(&mut *conn).await?;
+        } else {
+            sqlx::query("INSERT INTO hash_jobs(info_hash,status,last_new_peer_at,discovery_sources,updated_at) VALUES (?,'queued',?,?,?) ON DUPLICATE KEY UPDATE status=CASE WHEN status IN ('complete','invalid','unsupported') THEN status WHEN status='waiting_peers' AND VALUES(last_new_peer_at) IS NULL THEN status ELSE 'queued' END,next_attempt_at=IF(VALUES(last_new_peer_at) IS NULL,next_attempt_at,0),last_new_peer_at=COALESCE(VALUES(last_new_peer_at),last_new_peer_at),discovery_sources=IF(FIND_IN_SET(VALUES(discovery_sources),discovery_sources)>0,discovery_sources,CONCAT_WS(',',NULLIF(discovery_sources,''),VALUES(discovery_sources))),updated_at=VALUES(updated_at)").bind(&h).bind(now()).bind(source).bind(now()).execute(&mut *conn).await?;
+        }
+        outcome.hash_job_created = !job_exists;
+    } else if job_exists {
+        sqlx::query("UPDATE hash_jobs SET status=CASE WHEN status IN ('complete','invalid','unsupported') THEN status WHEN status='waiting_peers' THEN status ELSE 'queued' END,discovery_sources=IF(FIND_IN_SET(?,discovery_sources)>0,discovery_sources,CONCAT_WS(',',NULLIF(discovery_sources,''),?)),updated_at=? WHERE info_hash=?").bind(source).bind(source).bind(now()).bind(&h).execute(&mut *conn).await?;
+    } else {
+        outcome.peerless_job_skipped = true;
+    }
+    Ok(outcome)
 }
 const SEARCH_DOCUMENT_BYTES: usize = 16 * 1024 * 1024;
 const SEARCH_BATCH_BYTES: usize = 1024 * 1024;

@@ -222,14 +222,19 @@ Data flows through bounded `tokio::sync::mpsc` channels. Metadata work is dedupl
 
 A discovery's torrent row, durable metadata job, supplied peers, and peer-retention
 changes commit in one transaction. Retrying upserts the same torrent and peer
-keys without duplicating catalogue counts. Peer-bearing observations are persisted
-by the metadata worker; statistics events without addresses cannot create a
-partially persisted peer-bearing discovery. If the metadata channel is full or
-closed, the crawler instead emits a peerless observation to the statistics path,
-retaining the hash and source for future lookup and restart recovery. This fallback
-does not retain the supplied peer addresses. Both channels are bounded; recovery
-through this fallback depends on the statistics event being accepted and committed.
-Peerless observations also use the statistics path. Work not yet committed can
+keys without duplicating catalogue counts. Accepted discoveries are persisted by
+the metadata worker, which owns the bounded discovery channel and any supplied
+peer addresses; statistics events without addresses cannot create a partially
+persisted peer-bearing discovery. If the metadata channel is full or closed, the
+crawler instead hands a peerless observation to the statistics path, retaining
+the hash and source for future lookup and restart recovery. The statistics path
+only persists this peerless fallback for discoveries rejected by the bounded
+discovery channel. The fallback does not retain the supplied peer addresses.
+Both channels are bounded; recovery through this fallback depends on the
+statistics event being accepted and committed. A peerless observation durably
+inserts or updates the torrent row but does not create a new `hash_jobs` row; the
+job row is created when a peer-bearing discovery arrives, and these skipped job
+creations are counted in `peerless_jobs_skipped_total`. Work not yet committed can
 still be lost on process exit; accepted metadata discoveries commit their retained
 peers atomically.
 

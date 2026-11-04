@@ -148,15 +148,28 @@ permanent OCI errors are reported distinctly and do not advance the cursor.
 ## OCI Monitoring
 
 `crawler_status` records become interval deltas for cumulative counters and
-gauges for current values. Deltas are computed from a stored per-service
-`run_id` baseline, so a restarted crawler starts a new baseline instead of
-publishing its reset counters as continuity. Web status records already contain
-fixed-window counts, sums, and latency buckets.
+gauges for current values. The crawler metric set was extended with discovery,
+lookup, metadata admission/retrieval, and database-persistence measurements in
+addition to the original RPC, metadata, and queue counters. Every
+`crawler_status` field maps to a bounded CamelCase OCI metric name, for example
+`discovery_observations_total` -> `CrawlerDiscoveryObservations`,
+`lookup_queue_capacity_rejected_total` -> `CrawlerLookupQueueCapacityRejected`,
+and `peer_records_inserted_total` -> `CrawlerPeerRecordsInserted`; the full mapping
+is `CRAWLER_COUNTERS`, `CRAWLER_GAUGES`, and `CRAWLER_INTERVAL_COUNTERS` in
+`metrics_export.py`.
+`metadata_fetched_interval` is emitted directly as
+`CrawlerMetadataFetchedInterval` with `window_count` semantics (unit `count`),
+while `metadata_fetched_total` remains the cumulative counter. Deltas are computed
+from a stored per-service `run_id` baseline, so a restarted crawler starts a new
+baseline instead of publishing its reset counters as continuity. Web status
+records already contain fixed-window counts, sums, and latency buckets.
 
-Metric namespace: `btfind`. Dimensions are bounded to `instance`, `service`,
-`route` (server route templates only), `status_class`, and `le`. Metric metadata
-records `unit` (`count` or `milliseconds`) and `semantics` (`gauge`,
-`interval_delta`, `window_count`, or `window_sum`).
+Metric namespace: `btfind`. Crawler metrics use only the `instance` and `service`
+dimensions; no runtime labels, info hashes, or peer addresses become dimensions.
+Web metrics additionally use bounded `route` (server route templates only),
+`status_class`, and `le`. Metric metadata records `unit` (`count` or
+`milliseconds`) and `semantics` (`gauge`, `interval_delta`, `window_count`, or
+`window_sum`).
 
 Metric batches use OCI's `ATOMIC` validation, and the exporter also inspects
 `failed_metrics_count` in every response. A rejected point prevents metric

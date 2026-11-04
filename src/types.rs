@@ -99,6 +99,23 @@ impl MetadataFailureReason {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetadataJobAdmission {
+    Accepted,
+    Unchanged,
+    NoPeers,
+    AtCapacity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetadataRetrievalOutcome {
+    Complete,
+    RetryAt,
+    WaitingPeers,
+    Invalid,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CrawlStatsEvent {
     DhtSnapshot {
         nodes_known: usize,
@@ -137,6 +154,8 @@ pub enum CrawlStatsEvent {
         info_hash: InfoHash,
         source: DiscoverySource,
         has_peers: bool,
+        accepted: bool,
+        peers: usize,
     },
 }
 
