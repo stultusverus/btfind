@@ -77,6 +77,7 @@ struct PendingRpc {
     is_real_lookup: bool,
     deadline: Instant,
     continuation_budget: u8,
+    lookup_id: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -254,7 +255,9 @@ pub fn decode_compact_nodes(data: &[u8]) -> Vec<NodeContact> {
     if !data.len().is_multiple_of(NODE_ID_LEN + 6) {
         return Vec::new();
     }
-    data.chunks_exact(NODE_ID_LEN + 6)
+    data.as_chunks::<{ NODE_ID_LEN + 6 }>()
+        .0
+        .iter()
         .filter_map(|chunk| {
             let mut id = [0; NODE_ID_LEN];
             id.copy_from_slice(&chunk[..NODE_ID_LEN]);
@@ -286,7 +289,9 @@ fn decode_compact_peers(data: &[u8]) -> Vec<PeerContact> {
     if !data.len().is_multiple_of(6) {
         return Vec::new();
     }
-    data.chunks_exact(6)
+    data.as_chunks::<6>()
+        .0
+        .iter()
         .filter_map(|chunk| {
             let addr = SocketAddrV4::new(
                 Ipv4Addr::new(chunk[0], chunk[1], chunk[2], chunk[3]),
@@ -351,14 +356,7 @@ pub fn parse_sample_infohashes_response(
     if !bytes.len().is_multiple_of(20) || bytes.len() / 20 > max_samples {
         return Err("invalid samples payload length".to_string());
     }
-    let samples = bytes
-        .chunks_exact(20)
-        .map(|chunk| {
-            let mut hash = [0; 20];
-            hash.copy_from_slice(chunk);
-            hash
-        })
-        .collect();
+    let samples = bytes.as_chunks::<20>().0.to_vec();
     let nodes = match r.get("nodes") {
         Some(KrpcValue::Bytes(bytes)) => decode_compact_nodes(bytes),
         _ => Vec::new(),
@@ -509,15 +507,113 @@ fn enqueue_discovery(
     let info_hash = discovery.info_hash;
     let source = discovery.source;
     let has_peers = !discovery.peers.is_empty();
+    let peers = discovery.peers.len();
     let accepted = sender.try_send(discovery).is_ok();
     (
         CrawlStatsEvent::HashObserved {
             info_hash,
             source,
-            has_peers: has_peers && accepted,
+            has_peers,
+            accepted,
+            peers,
         },
         !accepted,
     )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueueAdmission {
+    Accepted,
+    Duplicate,
+    CapacityRejected,
+    Invalid,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RealLookupProgress {
+    outstanding: usize,
+    peers_found: bool,
+}
+
+struct RealLookupTracker {
+    metrics: Arc<CrawlerMetrics>,
+    next_id: u64,
+    active: HashMap<u64, RealLookupProgress>,
+}
+
+impl RealLookupTracker {
+    fn new(metrics: Arc<CrawlerMetrics>) -> Self {
+        Self {
+            metrics,
+            next_id: 0,
+            active: HashMap::new(),
+        }
+    }
+
+    fn begin(&mut self) -> u64 {
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1);
+        self.active.insert(
+            id,
+            RealLookupProgress {
+                outstanding: 0,
+                peers_found: false,
+            },
+        );
+        id
+    }
+
+    fn attach(&mut self, id: u64) {
+        if let Some(progress) = self.active.get_mut(&id) {
+            progress.outstanding += 1;
+        }
+    }
+
+    fn respond(&mut self, id: u64, found_peers: bool) {
+        self.complete(id, found_peers);
+    }
+
+    fn timeout(&mut self, id: u64) {
+        self.metrics.record_real_lookup_rpc_timeout();
+        self.complete(id, false);
+    }
+
+    fn failure(&mut self, id: u64) {
+        self.metrics.record_real_lookup_rpc_failure();
+        self.complete(id, false);
+    }
+
+    fn started(&mut self, id: u64) {
+        let initiated = self
+            .active
+            .get(&id)
+            .is_some_and(|progress| progress.outstanding > 0);
+        if initiated {
+            self.metrics.record_real_lookup_initiated();
+        } else {
+            self.active.remove(&id);
+        }
+    }
+
+    fn complete(&mut self, id: u64, found_peers: bool) {
+        let Some(progress) = self.active.get_mut(&id) else {
+            return;
+        };
+        progress.outstanding = progress.outstanding.saturating_sub(1);
+        progress.peers_found |= found_peers;
+        if progress.outstanding > 0 {
+            return;
+        }
+        let peers_found = progress.peers_found;
+        self.active
+            .remove(&id)
+            .expect("real lookup entry exists until finalization");
+        if peers_found {
+            self.metrics.record_real_lookup_succeeded();
+        } else {
+            self.metrics.record_real_lookup_failed();
+        }
+    }
 }
 
 pub struct DhtCrawler {
@@ -527,6 +623,7 @@ pub struct DhtCrawler {
     info_hash_tx: mpsc::Sender<HashDiscovery>,
     stats_tx: mpsc::Sender<CrawlStatsEvent>,
     metrics: Arc<CrawlerMetrics>,
+    lookups: RealLookupTracker,
     token_secret: [u8; 16],
     bootstrap_nodes: Vec<String>,
     discovery_queue: VecDeque<InfoHash>,
@@ -573,12 +670,14 @@ impl DhtCrawler {
     ) -> Self {
         let mut token_secret = [0; 16];
         rand::thread_rng().fill(&mut token_secret);
+        metrics.set_discovery_queue_capacity(config.max_discovery_hashes);
         Self {
             our_id,
             socket,
             routing: RoutingTable::with_candidate_capacity(our_id, config.max_candidate_nodes),
             info_hash_tx,
             stats_tx,
+            lookups: RealLookupTracker::new(Arc::clone(&metrics)),
             metrics,
             token_secret,
             bootstrap_nodes,
@@ -636,6 +735,7 @@ impl DhtCrawler {
         info_hash: Option<InfoHash>,
         is_real_lookup: bool,
         continuation_budget: u8,
+        lookup_id: Option<u64>,
     ) -> bool {
         let Some(transaction) = self.allocate_transaction() else {
             self.emit_stat(CrawlStatsEvent::DiscoveryBackpressure);
@@ -653,12 +753,16 @@ impl DhtCrawler {
                 is_real_lookup,
                 deadline: Instant::now() + self.config.rpc_timeout,
                 continuation_budget,
+                lookup_id,
             },
         );
         let message = query_message(method, &self.our_id, &target, transaction);
         match self.socket.send_to(&message.to_bytes(), addr).await {
             Ok(_) => {
                 self.queries_sent += 1;
+                if let Some(id) = lookup_id {
+                    self.lookups.attach(id);
+                }
                 true
             }
             Err(error) => {
@@ -678,8 +782,17 @@ impl DhtCrawler {
     pub async fn bootstrap(&mut self) {
         for configured in self.bootstrap_nodes.clone() {
             if let Some(addr) = resolve_v4(&configured).await {
-                self.send_rpc(addr, None, RpcMethod::FindNode, self.our_id, None, false, 2)
-                    .await;
+                self.send_rpc(
+                    addr,
+                    None,
+                    RpcMethod::FindNode,
+                    self.our_id,
+                    None,
+                    false,
+                    2,
+                    None,
+                )
+                .await;
             }
         }
     }
@@ -690,19 +803,27 @@ impl DhtCrawler {
     {
         let mut added = 0;
         for hash in hashes {
-            if self.queue_hash(hash) {
-                added += 1;
-                if self
-                    .info_hash_tx
-                    .try_send(HashDiscovery {
-                        info_hash: hash,
-                        peers: Vec::new(),
-                        source: DiscoverySource::Resume,
-                    })
-                    .is_err()
-                {
-                    self.emit_stat(CrawlStatsEvent::DiscoveryBackpressure);
-                }
+            if self.queue_hash(hash) != QueueAdmission::Accepted {
+                continue;
+            }
+            added += 1;
+            let send_ok = self
+                .info_hash_tx
+                .try_send(HashDiscovery {
+                    info_hash: hash,
+                    peers: Vec::new(),
+                    source: DiscoverySource::Resume,
+                })
+                .is_ok();
+            self.emit_stat(CrawlStatsEvent::HashObserved {
+                info_hash: hash,
+                source: DiscoverySource::Resume,
+                has_peers: false,
+                accepted: send_ok,
+                peers: 0,
+            });
+            if !send_ok {
+                self.emit_stat(CrawlStatsEvent::DiscoveryBackpressure);
             }
         }
         added
@@ -718,16 +839,24 @@ impl DhtCrawler {
             .count()
     }
 
-    fn queue_hash(&mut self, hash: InfoHash) -> bool {
-        if hash == [0; 20]
-            || self.discovery_set.contains(&hash)
-            || self.discovery_queue.len() >= self.config.max_discovery_hashes
-        {
-            return false;
+    fn queue_hash(&mut self, hash: InfoHash) -> QueueAdmission {
+        if hash == [0; 20] {
+            return QueueAdmission::Invalid;
+        }
+        if self.discovery_set.contains(&hash) {
+            self.metrics.record_lookup_queue_duplicate();
+            return QueueAdmission::Duplicate;
+        }
+        if self.discovery_queue.len() >= self.config.max_discovery_hashes {
+            self.metrics.record_lookup_queue_capacity_rejected();
+            return QueueAdmission::CapacityRejected;
         }
         self.discovery_queue.push_back(hash);
         self.discovery_set.insert(hash);
-        true
+        self.metrics
+            .set_discovery_queue_depth(self.discovery_queue.len());
+        self.metrics.record_lookup_queue_accepted();
+        QueueAdmission::Accepted
     }
 
     fn publish_discovery(
@@ -818,6 +947,9 @@ impl DhtCrawler {
                     if let Some(hash) = pending.info_hash {
                         self.queue_hash(hash);
                     }
+                }
+                if let Some(lookup_id) = pending.lookup_id {
+                    self.lookups.timeout(lookup_id);
                 }
                 self.emit_stat(CrawlStatsEvent::RpcTimedOut);
             }
@@ -980,6 +1112,10 @@ impl DhtCrawler {
 
     async fn handle_response(&mut self, message: KrpcMessage, source: SocketAddrV4) {
         let transaction = message.transaction_id().to_vec();
+        let lookup_id = self
+            .pending_rpcs
+            .get(message.transaction_id())
+            .and_then(|pending| pending.lookup_id);
         let (pending, response_id) =
             match correlate_response(&mut self.pending_rpcs, &message, source) {
                 Ok(correlated) => correlated,
@@ -995,6 +1131,9 @@ impl DhtCrawler {
                     self.retired_transactions
                         .insert(transaction, Instant::now() + self.config.rpc_timeout);
                     self.emit_stat(CrawlStatsEvent::RpcMalformed);
+                    if let Some(id) = lookup_id {
+                        self.lookups.failure(id);
+                    }
                     return;
                 }
             };
@@ -1017,15 +1156,21 @@ impl DhtCrawler {
             }
             RpcMethod::GetPeers => {
                 let (peers, nodes) = parse_get_peers_response(&message);
+                let has_peers = !peers.is_empty();
+                let lookup_id = pending.lookup_id;
+                self.metrics.record_get_peers_response(has_peers);
                 self.admit_candidates(&nodes);
                 if let Some(hash) = pending.info_hash {
                     for peer in &peers {
                         self.cache_peer(hash, peer.clone());
                     }
-                    if !peers.is_empty() || pending.is_real_lookup {
+                    if has_peers || pending.is_real_lookup {
                         self.publish_discovery(hash, peers, DiscoverySource::OutboundGetPeers);
                     }
                     self.continue_get_peers(hash, nodes, pending).await;
+                }
+                if let Some(id) = lookup_id {
+                    self.lookups.respond(id, has_peers);
                 }
             }
             RpcMethod::SampleInfohashes => {
@@ -1093,6 +1238,9 @@ impl DhtCrawler {
         if let Some(node_id) = pending.expected_node_id {
             self.routing.record_failure(&node_id);
         }
+        if let Some(lookup_id) = pending.lookup_id {
+            self.lookups.failure(lookup_id);
+        }
         self.emit_stat(CrawlStatsEvent::RpcAnswered);
     }
 
@@ -1115,6 +1263,7 @@ impl DhtCrawler {
                 None,
                 false,
                 pending.continuation_budget - 1,
+                None,
             )
             .await;
         }
@@ -1138,6 +1287,7 @@ impl DhtCrawler {
                 Some(hash),
                 pending.is_real_lookup,
                 pending.continuation_budget - 1,
+                pending.lookup_id,
             )
             .await;
         }
@@ -1152,6 +1302,8 @@ impl DhtCrawler {
             }
             None => (random_node_id(), false),
         };
+        self.metrics
+            .set_discovery_queue_depth(self.discovery_queue.len());
         let mut nodes = self.routing.closest_nodes(&hash, LOOKUP_FANOUT);
         if nodes.len() < LOOKUP_FANOUT {
             nodes.extend(
@@ -1166,6 +1318,7 @@ impl DhtCrawler {
             self.bootstrap().await;
             return;
         }
+        let lookup_id = real.then(|| self.lookups.begin());
         for node in nodes {
             self.send_rpc(
                 node.addr,
@@ -1175,8 +1328,12 @@ impl DhtCrawler {
                 Some(hash),
                 real,
                 2,
+                lookup_id,
             )
             .await;
+        }
+        if let Some(id) = lookup_id {
+            self.lookups.started(id);
         }
     }
 
@@ -1205,6 +1362,7 @@ impl DhtCrawler {
                 None,
                 false,
                 0,
+                None,
             )
             .await;
         }
@@ -1279,36 +1437,48 @@ mod tests {
         assert_eq!(count, 2);
     }
 
-    fn peer_discovery(hash: InfoHash) -> HashDiscovery {
+    fn discovery(hash: InfoHash, peers: Vec<PeerContact>) -> HashDiscovery {
         HashDiscovery {
             info_hash: hash,
-            peers: vec![PeerContact {
-                addr: "8.8.8.8:6881".parse().unwrap(),
-            }],
+            peers,
             source: DiscoverySource::AnnouncePeer,
         }
     }
 
+    fn peer_discovery(hash: InfoHash) -> HashDiscovery {
+        discovery(
+            hash,
+            vec![PeerContact {
+                addr: "8.8.8.8:6881".parse().unwrap(),
+            }],
+        )
+    }
+
     #[test]
-    fn saturated_discovery_channel_emits_peerless_fallback() {
+    fn rejected_peer_bearing_observation_preserves_original_peers() {
         let (tx, mut rx) = mpsc::channel(1);
         let (accepted, backpressure) = enqueue_discovery(&tx, peer_discovery([1; 20]));
         assert!(!backpressure);
-        assert!(matches!(
+        assert_eq!(
             accepted,
             CrawlStatsEvent::HashObserved {
+                info_hash: [1; 20],
+                source: DiscoverySource::AnnouncePeer,
                 has_peers: true,
-                ..
+                accepted: true,
+                peers: 1,
             }
-        ));
-        let (fallback, backpressure) = enqueue_discovery(&tx, peer_discovery([2; 20]));
+        );
+        let (rejected, backpressure) = enqueue_discovery(&tx, peer_discovery([2; 20]));
         assert!(backpressure);
         assert_eq!(
-            fallback,
+            rejected,
             CrawlStatsEvent::HashObserved {
                 info_hash: [2; 20],
                 source: DiscoverySource::AnnouncePeer,
-                has_peers: false,
+                has_peers: true,
+                accepted: false,
+                peers: 1,
             }
         );
         let queued = rx.try_recv().unwrap();
@@ -1316,15 +1486,50 @@ mod tests {
         assert_eq!(queued.peers, peer_discovery([1; 20]).peers);
         assert!(rx.try_recv().is_err());
         drop(rx);
-        let (fallback, backpressure) = enqueue_discovery(&tx, peer_discovery([3; 20]));
+        let (closed, backpressure) = enqueue_discovery(&tx, peer_discovery([3; 20]));
         assert!(backpressure);
-        assert!(matches!(
-            fallback,
+        assert_eq!(
+            closed,
             CrawlStatsEvent::HashObserved {
-                has_peers: false,
-                ..
+                info_hash: [3; 20],
+                source: DiscoverySource::AnnouncePeer,
+                has_peers: true,
+                accepted: false,
+                peers: 1,
             }
-        ));
+        );
+    }
+
+    #[test]
+    fn rejected_peerless_observation_reports_rejection() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let (accepted, backpressure) = enqueue_discovery(&tx, discovery([4; 20], Vec::new()));
+        assert!(!backpressure);
+        assert_eq!(
+            accepted,
+            CrawlStatsEvent::HashObserved {
+                info_hash: [4; 20],
+                source: DiscoverySource::AnnouncePeer,
+                has_peers: false,
+                accepted: true,
+                peers: 0,
+            }
+        );
+        let (rejected, backpressure) = enqueue_discovery(&tx, discovery([5; 20], Vec::new()));
+        assert!(backpressure);
+        assert_eq!(
+            rejected,
+            CrawlStatsEvent::HashObserved {
+                info_hash: [5; 20],
+                source: DiscoverySource::AnnouncePeer,
+                has_peers: false,
+                accepted: false,
+                peers: 0,
+            }
+        );
+        let queued = rx.try_recv().unwrap();
+        assert_eq!(queued.info_hash, [4; 20]);
+        assert!(queued.peers.is_empty());
     }
 
     #[tokio::test]
@@ -1357,6 +1562,209 @@ mod tests {
             store.hash_job_peers(&hash, 8).await.unwrap(),
             discovery.peers
         );
+    }
+
+    #[test]
+    fn real_lookup_succeeds_when_a_response_has_peers() {
+        let metrics = Arc::new(CrawlerMetrics::default());
+        let mut tracker = RealLookupTracker::new(Arc::clone(&metrics));
+        let id = tracker.begin();
+        tracker.attach(id);
+        tracker.started(id);
+        tracker.respond(id, true);
+        assert_eq!(metrics.real_lookups_initiated.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.real_lookups_succeeded.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.real_lookups_failed.load(Ordering::Relaxed), 0);
+        assert!(tracker.active.is_empty());
+    }
+
+    #[test]
+    fn real_lookup_fails_when_it_closes_with_nodes_only_responses() {
+        let metrics = Arc::new(CrawlerMetrics::default());
+        let mut tracker = RealLookupTracker::new(Arc::clone(&metrics));
+        let id = tracker.begin();
+        tracker.attach(id);
+        tracker.started(id);
+        tracker.respond(id, false);
+        assert_eq!(metrics.real_lookups_initiated.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.real_lookups_succeeded.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.real_lookups_failed.load(Ordering::Relaxed), 1);
+        assert!(tracker.active.is_empty());
+    }
+
+    #[test]
+    fn continuation_rpcs_keep_a_lookup_open_until_they_complete() {
+        let metrics = Arc::new(CrawlerMetrics::default());
+        let mut tracker = RealLookupTracker::new(Arc::clone(&metrics));
+        let id = tracker.begin();
+        tracker.attach(id);
+        tracker.started(id);
+        tracker.attach(id);
+        tracker.respond(id, true);
+        assert_eq!(tracker.active.get(&id).map(|p| p.outstanding), Some(1));
+        assert_eq!(metrics.real_lookups_succeeded.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.real_lookups_failed.load(Ordering::Relaxed), 0);
+        tracker.respond(id, false);
+        assert_eq!(metrics.real_lookups_succeeded.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.real_lookups_failed.load(Ordering::Relaxed), 0);
+        assert!(tracker.active.is_empty());
+    }
+
+    #[test]
+    fn lookup_without_sent_rpcs_is_not_initiated() {
+        let metrics = Arc::new(CrawlerMetrics::default());
+        let mut tracker = RealLookupTracker::new(Arc::clone(&metrics));
+        let id = tracker.begin();
+        tracker.started(id);
+        assert!(tracker.active.is_empty());
+        assert_eq!(metrics.real_lookups_initiated.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.real_lookups_failed.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn rpc_timeout_and_failure_counters_finish_real_lookups() {
+        let metrics = Arc::new(CrawlerMetrics::default());
+        let mut tracker = RealLookupTracker::new(Arc::clone(&metrics));
+        let timeout_id = tracker.begin();
+        tracker.attach(timeout_id);
+        tracker.started(timeout_id);
+        tracker.timeout(timeout_id);
+        assert_eq!(metrics.real_lookup_rpc_timeouts.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.real_lookups_failed.load(Ordering::Relaxed), 1);
+        assert!(tracker.active.is_empty());
+
+        let failure_id = tracker.begin();
+        tracker.attach(failure_id);
+        tracker.attach(failure_id);
+        tracker.started(failure_id);
+        tracker.failure(failure_id);
+        assert_eq!(metrics.real_lookup_rpc_failures.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.real_lookups_failed.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            tracker.active.get(&failure_id).map(|p| p.outstanding),
+            Some(1)
+        );
+        tracker.respond(failure_id, true);
+        assert_eq!(metrics.real_lookups_succeeded.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.real_lookups_failed.load(Ordering::Relaxed), 1);
+        assert!(tracker.active.is_empty());
+    }
+
+    async fn test_crawler(
+        config: DhtConfig,
+        info_hash_tx: mpsc::Sender<HashDiscovery>,
+        stats_tx: mpsc::Sender<CrawlStatsEvent>,
+        metrics: Arc<CrawlerMetrics>,
+    ) -> DhtCrawler {
+        let socket = Arc::new(
+            tokio::net::UdpSocket::bind("127.0.0.1:0")
+                .await
+                .expect("bind loopback socket"),
+        );
+        DhtCrawler::with_config(
+            random_node_id(),
+            socket,
+            info_hash_tx,
+            stats_tx,
+            Vec::new(),
+            config,
+            metrics,
+        )
+    }
+
+    #[tokio::test]
+    async fn queue_admission_tracks_counters_capacity_and_depth() {
+        let (info_hash_tx, _info_hash_rx) = mpsc::channel(1);
+        let (stats_tx, _stats_rx) = mpsc::channel(1);
+        let metrics = Arc::new(CrawlerMetrics::default());
+        let mut crawler = test_crawler(
+            DhtConfig {
+                max_discovery_hashes: 2,
+                ..DhtConfig::default()
+            },
+            info_hash_tx,
+            stats_tx,
+            Arc::clone(&metrics),
+        )
+        .await;
+        assert_eq!(metrics.discovery_queue_capacity.load(Ordering::Relaxed), 2);
+        assert_eq!(crawler.queue_hash([0; 20]), QueueAdmission::Invalid);
+        assert_eq!(crawler.queue_hash([1; 20]), QueueAdmission::Accepted);
+        assert_eq!(crawler.queue_hash([2; 20]), QueueAdmission::Accepted);
+        assert_eq!(crawler.queue_hash([1; 20]), QueueAdmission::Duplicate);
+        assert_eq!(
+            crawler.queue_hash([3; 20]),
+            QueueAdmission::CapacityRejected
+        );
+        assert_eq!(metrics.lookup_queue_accepted.load(Ordering::Relaxed), 2);
+        assert_eq!(metrics.lookup_queue_duplicate.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            metrics
+                .lookup_queue_capacity_rejected
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(metrics.discovery_queue_depth.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn resume_seeding_emits_observations_and_preserves_backpressure() {
+        let (info_hash_tx, mut info_hash_rx) = mpsc::channel(1);
+        let (stats_tx, mut stats_rx) = mpsc::channel(8);
+        let metrics = Arc::new(CrawlerMetrics::default());
+        let mut crawler = test_crawler(
+            DhtConfig::default(),
+            info_hash_tx,
+            stats_tx,
+            Arc::clone(&metrics),
+        )
+        .await;
+        let added = crawler.seed_info_hashes([[0; 20], [4; 20], [5; 20]]);
+        assert_eq!(added, 2);
+        assert!(crawler.discovery_set.contains(&[4; 20]));
+        assert!(crawler.discovery_set.contains(&[5; 20]));
+        assert_eq!(info_hash_rx.try_recv().unwrap().info_hash, [4; 20]);
+        assert!(info_hash_rx.try_recv().is_err());
+        assert_eq!(
+            stats_rx.try_recv().unwrap(),
+            CrawlStatsEvent::HashObserved {
+                info_hash: [4; 20],
+                source: DiscoverySource::Resume,
+                has_peers: false,
+                accepted: true,
+                peers: 0,
+            }
+        );
+        assert_eq!(
+            stats_rx.try_recv().unwrap(),
+            CrawlStatsEvent::HashObserved {
+                info_hash: [5; 20],
+                source: DiscoverySource::Resume,
+                has_peers: false,
+                accepted: false,
+                peers: 0,
+            }
+        );
+        assert_eq!(
+            stats_rx.try_recv().unwrap(),
+            CrawlStatsEvent::DiscoveryBackpressure
+        );
+        assert_eq!(metrics.discovery_by_source[2].load(Ordering::Relaxed), 2);
+        assert_eq!(
+            metrics
+                .discovery_peerless_observations
+                .load(Ordering::Relaxed),
+            2
+        );
+        assert_eq!(
+            metrics.discovery_channel_accepted.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            metrics.discovery_channel_rejected.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(metrics.lookup_queue_accepted.load(Ordering::Relaxed), 2);
     }
 
     fn response(
@@ -1474,6 +1882,7 @@ mod tests {
                 is_real_lookup: false,
                 deadline: Instant::now() + Duration::from_secs(30),
                 continuation_budget: 0,
+                lookup_id: None,
             },
         );
         let message = response(41, [1; 20], [("nodes", KrpcValue::Bytes(Vec::new()))]);

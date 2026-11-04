@@ -478,6 +478,7 @@ async fn run_stats_persistence(
         tokio::select! {
             _ = receipt_tick.tick() => {
                 if let Err(error) = store.prune_receipts().await {
+                    metrics.record_persistence_error();
                     tracing::warn!(
                         event = "persistence_prune_failed",
                         reason = "database",
@@ -535,7 +536,10 @@ async fn try_flush_stats_batch(
         .persist_runtime_batch(events, *snapshot, receipt)
         .await
     {
-        Ok(()) => {
+        Ok(outcome) => {
+            metrics.record_torrents_inserted(outcome.torrents_inserted);
+            metrics.record_hash_jobs_created(outcome.hash_jobs_created);
+            metrics.record_peerless_jobs_skipped(outcome.peerless_jobs_skipped);
             if let Err(error) = store.acknowledge_receipt(receipt).await {
                 metrics.record_persistence_error();
                 tracing::warn!(

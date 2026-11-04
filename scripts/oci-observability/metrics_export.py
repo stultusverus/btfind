@@ -34,6 +34,98 @@ CRAWLER_COUNTERS = (
     ("metadata_failed_total", "CrawlerMetadataFailures"),
     ("backpressure_events_total", "CrawlerBackpressureEvents"),
     ("persistence_errors_total", "CrawlerPersistenceErrors"),
+    ("discovery_observations_total", "CrawlerDiscoveryObservations"),
+    (
+        "discovery_observed_inbound_get_peers_total",
+        "CrawlerDiscoveryObservedInboundGetPeers",
+    ),
+    (
+        "discovery_observed_announce_peer_total",
+        "CrawlerDiscoveryObservedAnnouncePeer",
+    ),
+    ("discovery_observed_resume_total", "CrawlerDiscoveryObservedResume"),
+    (
+        "discovery_observed_sample_infohashes_total",
+        "CrawlerDiscoveryObservedSampleInfohashes",
+    ),
+    (
+        "discovery_observed_outbound_get_peers_total",
+        "CrawlerDiscoveryObservedOutboundGetPeers",
+    ),
+    (
+        "discovery_peer_bearing_observations_total",
+        "CrawlerDiscoveryPeerBearingObservations",
+    ),
+    (
+        "discovery_peerless_observations_total",
+        "CrawlerDiscoveryPeerlessObservations",
+    ),
+    ("discovery_channel_accepted_total", "CrawlerDiscoveryChannelAccepted"),
+    ("discovery_channel_rejected_total", "CrawlerDiscoveryChannelRejected"),
+    (
+        "discovery_peer_bearing_rejected_total",
+        "CrawlerDiscoveryPeerBearingRejected",
+    ),
+    (
+        "discovery_peer_addresses_lost_total",
+        "CrawlerDiscoveryPeerAddressesLost",
+    ),
+    ("lookup_queue_accepted_total", "CrawlerLookupQueueAccepted"),
+    ("lookup_queue_duplicate_total", "CrawlerLookupQueueDuplicate"),
+    (
+        "lookup_queue_capacity_rejected_total",
+        "CrawlerLookupQueueCapacityRejected",
+    ),
+    ("real_lookups_initiated_total", "CrawlerRealLookupsInitiated"),
+    ("real_lookups_succeeded_total", "CrawlerRealLookupsSucceeded"),
+    ("real_lookups_failed_total", "CrawlerRealLookupsFailed"),
+    ("real_lookup_rpc_timeouts_total", "CrawlerRealLookupRpcTimeouts"),
+    ("real_lookup_rpc_failures_total", "CrawlerRealLookupRpcFailures"),
+    (
+        "get_peers_responses_with_peers_total",
+        "CrawlerGetPeersResponsesWithPeers",
+    ),
+    (
+        "get_peers_responses_nodes_only_total",
+        "CrawlerGetPeersResponsesNodesOnly",
+    ),
+    (
+        "metadata_job_admissions_accepted_total",
+        "CrawlerMetadataJobAdmissionsAccepted",
+    ),
+    (
+        "metadata_job_admissions_unchanged_total",
+        "CrawlerMetadataJobAdmissionsUnchanged",
+    ),
+    (
+        "metadata_job_admissions_no_peers_total",
+        "CrawlerMetadataJobAdmissionsNoPeers",
+    ),
+    (
+        "metadata_job_admissions_at_capacity_total",
+        "CrawlerMetadataJobAdmissionsAtCapacity",
+    ),
+    ("metadata_retrieval_complete_total", "CrawlerMetadataRetrievalComplete"),
+    ("metadata_retrieval_retry_at_total", "CrawlerMetadataRetrievalRetryAt"),
+    (
+        "metadata_retrieval_waiting_peers_total",
+        "CrawlerMetadataRetrievalWaitingPeers",
+    ),
+    ("metadata_retrieval_invalid_total", "CrawlerMetadataRetrievalInvalid"),
+    (
+        "metadata_retrieval_unsupported_total",
+        "CrawlerMetadataRetrievalUnsupported",
+    ),
+    ("torrents_inserted_total", "CrawlerTorrentsInserted"),
+    ("hash_jobs_created_total", "CrawlerHashJobsCreated"),
+    ("peerless_jobs_skipped_total", "CrawlerPeerlessJobsSkipped"),
+    (
+        "peer_bearing_discoveries_persisted_total",
+        "CrawlerPeerBearingDiscoveriesPersisted",
+    ),
+    ("peer_records_inserted_total", "CrawlerPeerRecordsInserted"),
+    ("peer_records_updated_total", "CrawlerPeerRecordsUpdated"),
+    ("peer_records_deleted_total", "CrawlerPeerRecordsDeleted"),
 )
 
 CRAWLER_GAUGES = (
@@ -41,6 +133,12 @@ CRAWLER_GAUGES = (
     ("active_metadata_jobs", "CrawlerActiveMetadataJobs"),
     ("queued_metadata_jobs", "CrawlerQueuedMetadataJobs"),
     ("pending_metadata_peers", "CrawlerPendingMetadataPeers"),
+    ("discovery_queue_depth", "CrawlerDiscoveryQueueDepth"),
+    ("discovery_queue_capacity", "CrawlerDiscoveryQueueCapacity"),
+)
+
+CRAWLER_INTERVAL_COUNTERS = (
+    ("metadata_fetched_interval", "CrawlerMetadataFetchedInterval"),
 )
 
 STATUS_CLASSES = (
@@ -145,6 +243,19 @@ def map_crawler(content, instance, timestamp, baselines):
             )
 
     baselines["crawler"] = {"run_id": run_id, "counters": counters}
+
+    for field_name, metric_name in CRAWLER_INTERVAL_COUNTERS:
+        points.append(
+            MetricPoint(
+                timestamp,
+                metric_name,
+                _int(content, field_name),
+                "count",
+                "window_count",
+                dimensions,
+            )
+        )
+
     return points
 
 

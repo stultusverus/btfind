@@ -1,4 +1,6 @@
-use crate::types::CrawlStatsEvent;
+use crate::types::{
+    CrawlStatsEvent, DiscoverySource, MetadataJobAdmission, MetadataRetrievalOutcome,
+};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -6,6 +8,38 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::{interval, MissedTickBehavior};
 
 pub const SNAPSHOT_INTERVAL_SECONDS: u64 = 60;
+pub const DISCOVERY_SOURCE_COUNT: usize = 5;
+pub const METADATA_JOB_ADMISSION_COUNT: usize = 4;
+pub const METADATA_RETRIEVAL_OUTCOME_COUNT: usize = 5;
+
+fn discovery_source_index(source: DiscoverySource) -> usize {
+    match source {
+        DiscoverySource::InboundGetPeers => 0,
+        DiscoverySource::AnnouncePeer => 1,
+        DiscoverySource::Resume => 2,
+        DiscoverySource::SampleInfohashes => 3,
+        DiscoverySource::OutboundGetPeers => 4,
+    }
+}
+
+fn metadata_job_admission_index(admission: MetadataJobAdmission) -> usize {
+    match admission {
+        MetadataJobAdmission::Accepted => 0,
+        MetadataJobAdmission::Unchanged => 1,
+        MetadataJobAdmission::NoPeers => 2,
+        MetadataJobAdmission::AtCapacity => 3,
+    }
+}
+
+fn metadata_retrieval_outcome_index(outcome: MetadataRetrievalOutcome) -> usize {
+    match outcome {
+        MetadataRetrievalOutcome::Complete => 0,
+        MetadataRetrievalOutcome::RetryAt => 1,
+        MetadataRetrievalOutcome::WaitingPeers => 2,
+        MetadataRetrievalOutcome::Invalid => 3,
+        MetadataRetrievalOutcome::Unsupported => 4,
+    }
+}
 
 pub const ROUTES: &[&str] = &[
     "/",
@@ -52,6 +86,36 @@ pub struct CrawlerMetrics {
     active_metadata_jobs: AtomicU64,
     queued_metadata_jobs: AtomicU64,
     pending_metadata_peers: AtomicU64,
+    pub(crate) discovery_queue_depth: AtomicU64,
+    pub(crate) discovery_queue_capacity: AtomicU64,
+    pub(crate) discovery_observations: AtomicU64,
+    pub(crate) discovery_peer_bearing_observations: AtomicU64,
+    pub(crate) discovery_peerless_observations: AtomicU64,
+    pub(crate) discovery_channel_accepted: AtomicU64,
+    pub(crate) discovery_channel_rejected: AtomicU64,
+    pub(crate) discovery_peer_bearing_rejected: AtomicU64,
+    pub(crate) discovery_peer_addresses_lost: AtomicU64,
+    pub(crate) discovery_by_source: [AtomicU64; DISCOVERY_SOURCE_COUNT],
+    pub(crate) lookup_queue_accepted: AtomicU64,
+    pub(crate) lookup_queue_duplicate: AtomicU64,
+    pub(crate) lookup_queue_capacity_rejected: AtomicU64,
+    pub(crate) real_lookups_initiated: AtomicU64,
+    pub(crate) real_lookups_succeeded: AtomicU64,
+    pub(crate) real_lookups_failed: AtomicU64,
+    pub(crate) real_lookup_rpc_timeouts: AtomicU64,
+    pub(crate) real_lookup_rpc_failures: AtomicU64,
+    pub(crate) get_peers_responses_with_peers: AtomicU64,
+    pub(crate) get_peers_responses_nodes_only: AtomicU64,
+    pub(crate) metadata_job_admissions: [AtomicU64; METADATA_JOB_ADMISSION_COUNT],
+    pub(crate) metadata_retrieval_outcomes: [AtomicU64; METADATA_RETRIEVAL_OUTCOME_COUNT],
+    metadata_fetched_last_emit: AtomicU64,
+    pub(crate) torrents_inserted: AtomicU64,
+    pub(crate) hash_jobs_created: AtomicU64,
+    pub(crate) peerless_jobs_skipped: AtomicU64,
+    pub(crate) peer_bearing_discoveries_persisted: AtomicU64,
+    pub(crate) peer_records_inserted: AtomicU64,
+    pub(crate) peer_records_updated: AtomicU64,
+    pub(crate) peer_records_deleted: AtomicU64,
 }
 
 impl Default for CrawlerMetrics {
@@ -74,6 +138,36 @@ impl Default for CrawlerMetrics {
             active_metadata_jobs: AtomicU64::new(0),
             queued_metadata_jobs: AtomicU64::new(0),
             pending_metadata_peers: AtomicU64::new(0),
+            discovery_queue_depth: AtomicU64::new(0),
+            discovery_queue_capacity: AtomicU64::new(0),
+            discovery_observations: AtomicU64::new(0),
+            discovery_peer_bearing_observations: AtomicU64::new(0),
+            discovery_peerless_observations: AtomicU64::new(0),
+            discovery_channel_accepted: AtomicU64::new(0),
+            discovery_channel_rejected: AtomicU64::new(0),
+            discovery_peer_bearing_rejected: AtomicU64::new(0),
+            discovery_peer_addresses_lost: AtomicU64::new(0),
+            discovery_by_source: std::array::from_fn(|_| AtomicU64::new(0)),
+            lookup_queue_accepted: AtomicU64::new(0),
+            lookup_queue_duplicate: AtomicU64::new(0),
+            lookup_queue_capacity_rejected: AtomicU64::new(0),
+            real_lookups_initiated: AtomicU64::new(0),
+            real_lookups_succeeded: AtomicU64::new(0),
+            real_lookups_failed: AtomicU64::new(0),
+            real_lookup_rpc_timeouts: AtomicU64::new(0),
+            real_lookup_rpc_failures: AtomicU64::new(0),
+            get_peers_responses_with_peers: AtomicU64::new(0),
+            get_peers_responses_nodes_only: AtomicU64::new(0),
+            metadata_job_admissions: std::array::from_fn(|_| AtomicU64::new(0)),
+            metadata_retrieval_outcomes: std::array::from_fn(|_| AtomicU64::new(0)),
+            metadata_fetched_last_emit: AtomicU64::new(0),
+            torrents_inserted: AtomicU64::new(0),
+            hash_jobs_created: AtomicU64::new(0),
+            peerless_jobs_skipped: AtomicU64::new(0),
+            peer_bearing_discoveries_persisted: AtomicU64::new(0),
+            peer_records_inserted: AtomicU64::new(0),
+            peer_records_updated: AtomicU64::new(0),
+            peer_records_deleted: AtomicU64::new(0),
         }
     }
 }
@@ -117,8 +211,37 @@ impl CrawlerMetrics {
             CrawlStatsEvent::DiscoveryBackpressure => {
                 self.backpressure_events.fetch_add(1, Ordering::Relaxed);
             }
-            CrawlStatsEvent::HashObserved { .. } => {
+            CrawlStatsEvent::HashObserved {
+                source,
+                has_peers,
+                accepted,
+                peers,
+                ..
+            } => {
                 self.hashes_discovered.fetch_add(1, Ordering::Relaxed);
+                self.discovery_observations.fetch_add(1, Ordering::Relaxed);
+                self.discovery_by_source[discovery_source_index(*source)]
+                    .fetch_add(1, Ordering::Relaxed);
+                if *has_peers {
+                    self.discovery_peer_bearing_observations
+                        .fetch_add(1, Ordering::Relaxed);
+                } else {
+                    self.discovery_peerless_observations
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                if *accepted {
+                    self.discovery_channel_accepted
+                        .fetch_add(1, Ordering::Relaxed);
+                } else {
+                    self.discovery_channel_rejected
+                        .fetch_add(1, Ordering::Relaxed);
+                    if *has_peers {
+                        self.discovery_peer_bearing_rejected
+                            .fetch_add(1, Ordering::Relaxed);
+                        self.discovery_peer_addresses_lost
+                            .fetch_add(*peers as u64, Ordering::Relaxed);
+                    }
+                }
             }
             CrawlStatsEvent::SamplingResponse { .. } => {
                 self.sampling_responses.fetch_add(1, Ordering::Relaxed);
@@ -143,7 +266,108 @@ impl CrawlerMetrics {
         self.persistence_errors.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn set_discovery_queue_capacity(&self, capacity: usize) {
+        self.discovery_queue_capacity
+            .store(capacity as u64, Ordering::Relaxed);
+    }
+
+    pub fn set_discovery_queue_depth(&self, depth: usize) {
+        self.discovery_queue_depth
+            .store(depth as u64, Ordering::Relaxed);
+    }
+
+    pub fn record_lookup_queue_accepted(&self) {
+        self.lookup_queue_accepted.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_lookup_queue_duplicate(&self) {
+        self.lookup_queue_duplicate.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_lookup_queue_capacity_rejected(&self) {
+        self.lookup_queue_capacity_rejected
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_real_lookup_initiated(&self) {
+        self.real_lookups_initiated.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_real_lookup_succeeded(&self) {
+        self.real_lookups_succeeded.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_real_lookup_failed(&self) {
+        self.real_lookups_failed.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_real_lookup_rpc_timeout(&self) {
+        self.real_lookup_rpc_timeouts
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_real_lookup_rpc_failure(&self) {
+        self.real_lookup_rpc_failures
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_get_peers_response(&self, with_peers: bool) {
+        if with_peers {
+            self.get_peers_responses_with_peers
+                .fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.get_peers_responses_nodes_only
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn record_metadata_job_admission(&self, admission: MetadataJobAdmission) {
+        self.metadata_job_admissions[metadata_job_admission_index(admission)]
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_metadata_retrieval_outcome(&self, outcome: MetadataRetrievalOutcome) {
+        self.metadata_retrieval_outcomes[metadata_retrieval_outcome_index(outcome)]
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_torrents_inserted(&self, count: u64) {
+        self.torrents_inserted.fetch_add(count, Ordering::Relaxed);
+    }
+
+    pub fn record_hash_jobs_created(&self, count: u64) {
+        self.hash_jobs_created.fetch_add(count, Ordering::Relaxed);
+    }
+
+    pub fn record_peerless_jobs_skipped(&self, count: u64) {
+        self.peerless_jobs_skipped
+            .fetch_add(count, Ordering::Relaxed);
+    }
+
+    pub fn record_peer_bearing_discoveries_persisted(&self, count: u64) {
+        self.peer_bearing_discoveries_persisted
+            .fetch_add(count, Ordering::Relaxed);
+    }
+
+    pub fn record_peer_records(&self, inserted: u64, updated: u64, deleted: u64) {
+        self.peer_records_inserted
+            .fetch_add(inserted, Ordering::Relaxed);
+        self.peer_records_updated
+            .fetch_add(updated, Ordering::Relaxed);
+        self.peer_records_deleted
+            .fetch_add(deleted, Ordering::Relaxed);
+    }
+
+    fn metadata_fetched_interval(&self, total: u64) -> u64 {
+        total.saturating_sub(
+            self.metadata_fetched_last_emit
+                .swap(total, Ordering::Relaxed),
+        )
+    }
+
     pub fn emit(&self, final_snapshot: bool) {
+        let metadata_fetched = self.metadata_fetched.load(Ordering::Relaxed);
+        let metadata_fetched_interval = self.metadata_fetched_interval(metadata_fetched);
         tracing::info!(
             event = "crawler_status",
             final_snapshot = final_snapshot,
@@ -159,13 +383,79 @@ impl CrawlerMetrics {
             rpc_unexpected_source_total = self.rpc_unexpected_source.load(Ordering::Relaxed),
             hashes_discovered_total = self.hashes_discovered.load(Ordering::Relaxed),
             sampling_responses_total = self.sampling_responses.load(Ordering::Relaxed),
-            metadata_fetched_total = self.metadata_fetched.load(Ordering::Relaxed),
+            metadata_fetched_total = metadata_fetched,
+            metadata_fetched_interval = metadata_fetched_interval,
             metadata_failed_total = self.metadata_failed.load(Ordering::Relaxed),
             backpressure_events_total = self.backpressure_events.load(Ordering::Relaxed),
             persistence_errors_total = self.persistence_errors.load(Ordering::Relaxed),
             active_metadata_jobs = self.active_metadata_jobs.load(Ordering::Relaxed),
             queued_metadata_jobs = self.queued_metadata_jobs.load(Ordering::Relaxed),
             pending_metadata_peers = self.pending_metadata_peers.load(Ordering::Relaxed),
+            discovery_queue_depth = self.discovery_queue_depth.load(Ordering::Relaxed),
+            discovery_queue_capacity = self.discovery_queue_capacity.load(Ordering::Relaxed),
+            discovery_observations_total = self.discovery_observations.load(Ordering::Relaxed),
+            discovery_peer_bearing_observations_total = self
+                .discovery_peer_bearing_observations
+                .load(Ordering::Relaxed),
+            discovery_peerless_observations_total =
+                self.discovery_peerless_observations.load(Ordering::Relaxed),
+            discovery_channel_accepted_total =
+                self.discovery_channel_accepted.load(Ordering::Relaxed),
+            discovery_channel_rejected_total =
+                self.discovery_channel_rejected.load(Ordering::Relaxed),
+            discovery_peer_bearing_rejected_total =
+                self.discovery_peer_bearing_rejected.load(Ordering::Relaxed),
+            discovery_peer_addresses_lost_total =
+                self.discovery_peer_addresses_lost.load(Ordering::Relaxed),
+            discovery_observed_inbound_get_peers_total =
+                self.discovery_by_source[0].load(Ordering::Relaxed),
+            discovery_observed_announce_peer_total =
+                self.discovery_by_source[1].load(Ordering::Relaxed),
+            discovery_observed_resume_total = self.discovery_by_source[2].load(Ordering::Relaxed),
+            discovery_observed_sample_infohashes_total =
+                self.discovery_by_source[3].load(Ordering::Relaxed),
+            discovery_observed_outbound_get_peers_total =
+                self.discovery_by_source[4].load(Ordering::Relaxed),
+            lookup_queue_accepted_total = self.lookup_queue_accepted.load(Ordering::Relaxed),
+            lookup_queue_duplicate_total = self.lookup_queue_duplicate.load(Ordering::Relaxed),
+            lookup_queue_capacity_rejected_total =
+                self.lookup_queue_capacity_rejected.load(Ordering::Relaxed),
+            real_lookups_initiated_total = self.real_lookups_initiated.load(Ordering::Relaxed),
+            real_lookups_succeeded_total = self.real_lookups_succeeded.load(Ordering::Relaxed),
+            real_lookups_failed_total = self.real_lookups_failed.load(Ordering::Relaxed),
+            real_lookup_rpc_timeouts_total = self.real_lookup_rpc_timeouts.load(Ordering::Relaxed),
+            real_lookup_rpc_failures_total = self.real_lookup_rpc_failures.load(Ordering::Relaxed),
+            get_peers_responses_with_peers_total =
+                self.get_peers_responses_with_peers.load(Ordering::Relaxed),
+            get_peers_responses_nodes_only_total =
+                self.get_peers_responses_nodes_only.load(Ordering::Relaxed),
+            metadata_job_admissions_accepted_total =
+                self.metadata_job_admissions[0].load(Ordering::Relaxed),
+            metadata_job_admissions_unchanged_total =
+                self.metadata_job_admissions[1].load(Ordering::Relaxed),
+            metadata_job_admissions_no_peers_total =
+                self.metadata_job_admissions[2].load(Ordering::Relaxed),
+            metadata_job_admissions_at_capacity_total =
+                self.metadata_job_admissions[3].load(Ordering::Relaxed),
+            metadata_retrieval_complete_total =
+                self.metadata_retrieval_outcomes[0].load(Ordering::Relaxed),
+            metadata_retrieval_retry_at_total =
+                self.metadata_retrieval_outcomes[1].load(Ordering::Relaxed),
+            metadata_retrieval_waiting_peers_total =
+                self.metadata_retrieval_outcomes[2].load(Ordering::Relaxed),
+            metadata_retrieval_invalid_total =
+                self.metadata_retrieval_outcomes[3].load(Ordering::Relaxed),
+            metadata_retrieval_unsupported_total =
+                self.metadata_retrieval_outcomes[4].load(Ordering::Relaxed),
+            torrents_inserted_total = self.torrents_inserted.load(Ordering::Relaxed),
+            hash_jobs_created_total = self.hash_jobs_created.load(Ordering::Relaxed),
+            peerless_jobs_skipped_total = self.peerless_jobs_skipped.load(Ordering::Relaxed),
+            peer_bearing_discoveries_persisted_total = self
+                .peer_bearing_discoveries_persisted
+                .load(Ordering::Relaxed),
+            peer_records_inserted_total = self.peer_records_inserted.load(Ordering::Relaxed),
+            peer_records_updated_total = self.peer_records_updated.load(Ordering::Relaxed),
+            peer_records_deleted_total = self.peer_records_deleted.load(Ordering::Relaxed),
             "crawler status"
         );
     }
@@ -239,7 +529,7 @@ impl WebMetrics {
     fn end_request(&self) {
         let _ = self
             .active_requests
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |active| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |active| {
                 Some(active.saturating_sub(1))
             });
     }
@@ -468,5 +758,169 @@ mod tests {
         assert_eq!(metrics.queued_metadata_jobs.load(Ordering::Relaxed), 3);
         assert_eq!(metrics.pending_metadata_peers.load(Ordering::Relaxed), 4);
         assert_eq!(metrics.persistence_errors.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn discovery_observations_distinguish_source_admission_and_lost_peers() {
+        let metrics = CrawlerMetrics::default();
+        metrics.apply(&CrawlStatsEvent::HashObserved {
+            info_hash: [1; 20],
+            source: DiscoverySource::InboundGetPeers,
+            has_peers: false,
+            accepted: true,
+            peers: 0,
+        });
+        metrics.apply(&CrawlStatsEvent::HashObserved {
+            info_hash: [2; 20],
+            source: DiscoverySource::AnnouncePeer,
+            has_peers: true,
+            accepted: false,
+            peers: 3,
+        });
+        metrics.apply(&CrawlStatsEvent::HashObserved {
+            info_hash: [3; 20],
+            source: DiscoverySource::SampleInfohashes,
+            has_peers: false,
+            accepted: false,
+            peers: 0,
+        });
+        assert_eq!(metrics.hashes_discovered.load(Ordering::Relaxed), 3);
+        assert_eq!(metrics.discovery_observations.load(Ordering::Relaxed), 3);
+        assert_eq!(
+            metrics
+                .discovery_peer_bearing_observations
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            metrics
+                .discovery_peerless_observations
+                .load(Ordering::Relaxed),
+            2
+        );
+        assert_eq!(
+            metrics.discovery_channel_accepted.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            metrics.discovery_channel_rejected.load(Ordering::Relaxed),
+            2
+        );
+        assert_eq!(
+            metrics
+                .discovery_peer_bearing_rejected
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            metrics
+                .discovery_peer_addresses_lost
+                .load(Ordering::Relaxed),
+            3
+        );
+        assert_eq!(metrics.discovery_by_source[0].load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.discovery_by_source[1].load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.discovery_by_source[2].load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.discovery_by_source[3].load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.discovery_by_source[4].load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn lookup_and_persistence_helpers_track_bounded_counters() {
+        let metrics = CrawlerMetrics::default();
+        metrics.set_discovery_queue_capacity(100);
+        metrics.set_discovery_queue_depth(7);
+        metrics.record_lookup_queue_accepted();
+        metrics.record_lookup_queue_duplicate();
+        metrics.record_lookup_queue_capacity_rejected();
+        metrics.record_real_lookup_initiated();
+        metrics.record_real_lookup_succeeded();
+        metrics.record_real_lookup_failed();
+        metrics.record_real_lookup_rpc_timeout();
+        metrics.record_real_lookup_rpc_failure();
+        metrics.record_get_peers_response(true);
+        metrics.record_get_peers_response(false);
+        metrics.record_metadata_job_admission(MetadataJobAdmission::NoPeers);
+        metrics.record_metadata_job_admission(MetadataJobAdmission::AtCapacity);
+        metrics.record_metadata_retrieval_outcome(MetadataRetrievalOutcome::RetryAt);
+        metrics.record_metadata_retrieval_outcome(MetadataRetrievalOutcome::Unsupported);
+        metrics.record_torrents_inserted(2);
+        metrics.record_hash_jobs_created(1);
+        metrics.record_peerless_jobs_skipped(3);
+        metrics.record_peer_bearing_discoveries_persisted(1);
+        metrics.record_peer_records(4, 5, 6);
+        assert_eq!(
+            metrics.discovery_queue_capacity.load(Ordering::Relaxed),
+            100
+        );
+        assert_eq!(metrics.discovery_queue_depth.load(Ordering::Relaxed), 7);
+        assert_eq!(metrics.lookup_queue_accepted.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.lookup_queue_duplicate.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            metrics
+                .lookup_queue_capacity_rejected
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(metrics.real_lookups_initiated.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.real_lookups_succeeded.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.real_lookups_failed.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.real_lookup_rpc_timeouts.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.real_lookup_rpc_failures.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            metrics
+                .get_peers_responses_with_peers
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            metrics
+                .get_peers_responses_nodes_only
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            metrics.metadata_job_admissions[2].load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            metrics.metadata_job_admissions[3].load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            metrics.metadata_retrieval_outcomes[1].load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            metrics.metadata_retrieval_outcomes[4].load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(metrics.torrents_inserted.load(Ordering::Relaxed), 2);
+        assert_eq!(metrics.hash_jobs_created.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.peerless_jobs_skipped.load(Ordering::Relaxed), 3);
+        assert_eq!(
+            metrics
+                .peer_bearing_discoveries_persisted
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(metrics.peer_records_inserted.load(Ordering::Relaxed), 4);
+        assert_eq!(metrics.peer_records_updated.load(Ordering::Relaxed), 5);
+        assert_eq!(metrics.peer_records_deleted.load(Ordering::Relaxed), 6);
+    }
+
+    #[test]
+    fn metadata_fetched_interval_is_difference_since_previous_emit() {
+        let metrics = CrawlerMetrics::default();
+        for _ in 0..3 {
+            metrics.apply(&CrawlStatsEvent::MetadataFetched);
+        }
+        let total = metrics.metadata_fetched.load(Ordering::Relaxed);
+        assert_eq!(metrics.metadata_fetched_interval(total), 3);
+        assert_eq!(metrics.metadata_fetched_interval(total), 0);
+        metrics.apply(&CrawlStatsEvent::MetadataFetched);
+        let total = metrics.metadata_fetched.load(Ordering::Relaxed);
+        assert_eq!(metrics.metadata_fetched_interval(total), 1);
+        assert_eq!(metrics.metadata_fetched.load(Ordering::Relaxed), 4);
     }
 }
