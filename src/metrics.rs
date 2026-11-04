@@ -104,6 +104,7 @@ pub struct CrawlerMetrics {
     pub(crate) real_lookups_failed: AtomicU64,
     pub(crate) real_lookup_rpc_timeouts: AtomicU64,
     pub(crate) real_lookup_rpc_failures: AtomicU64,
+    pub(crate) real_lookup_rpc_unsent: AtomicU64,
     pub(crate) get_peers_responses_with_peers: AtomicU64,
     pub(crate) get_peers_responses_nodes_only: AtomicU64,
     pub(crate) metadata_job_admissions: [AtomicU64; METADATA_JOB_ADMISSION_COUNT],
@@ -156,6 +157,7 @@ impl Default for CrawlerMetrics {
             real_lookups_failed: AtomicU64::new(0),
             real_lookup_rpc_timeouts: AtomicU64::new(0),
             real_lookup_rpc_failures: AtomicU64::new(0),
+            real_lookup_rpc_unsent: AtomicU64::new(0),
             get_peers_responses_with_peers: AtomicU64::new(0),
             get_peers_responses_nodes_only: AtomicU64::new(0),
             metadata_job_admissions: std::array::from_fn(|_| AtomicU64::new(0)),
@@ -311,6 +313,10 @@ impl CrawlerMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn record_real_lookup_rpc_unsent(&self) {
+        self.real_lookup_rpc_unsent.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn record_get_peers_response(&self, with_peers: bool) {
         if with_peers {
             self.get_peers_responses_with_peers
@@ -425,6 +431,7 @@ impl CrawlerMetrics {
             real_lookups_failed_total = self.real_lookups_failed.load(Ordering::Relaxed),
             real_lookup_rpc_timeouts_total = self.real_lookup_rpc_timeouts.load(Ordering::Relaxed),
             real_lookup_rpc_failures_total = self.real_lookup_rpc_failures.load(Ordering::Relaxed),
+            real_lookup_rpc_unsent_total = self.real_lookup_rpc_unsent.load(Ordering::Relaxed),
             get_peers_responses_with_peers_total =
                 self.get_peers_responses_with_peers.load(Ordering::Relaxed),
             get_peers_responses_nodes_only_total =
@@ -838,6 +845,7 @@ mod tests {
         metrics.record_real_lookup_failed();
         metrics.record_real_lookup_rpc_timeout();
         metrics.record_real_lookup_rpc_failure();
+        metrics.record_real_lookup_rpc_unsent();
         metrics.record_get_peers_response(true);
         metrics.record_get_peers_response(false);
         metrics.record_metadata_job_admission(MetadataJobAdmission::NoPeers);
@@ -867,6 +875,7 @@ mod tests {
         assert_eq!(metrics.real_lookups_failed.load(Ordering::Relaxed), 1);
         assert_eq!(metrics.real_lookup_rpc_timeouts.load(Ordering::Relaxed), 1);
         assert_eq!(metrics.real_lookup_rpc_failures.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.real_lookup_rpc_unsent.load(Ordering::Relaxed), 1);
         assert_eq!(
             metrics
                 .get_peers_responses_with_peers

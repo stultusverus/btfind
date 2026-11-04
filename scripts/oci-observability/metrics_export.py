@@ -81,6 +81,7 @@ CRAWLER_COUNTERS = (
     ("real_lookups_failed_total", "CrawlerRealLookupsFailed"),
     ("real_lookup_rpc_timeouts_total", "CrawlerRealLookupRpcTimeouts"),
     ("real_lookup_rpc_failures_total", "CrawlerRealLookupRpcFailures"),
+    ("real_lookup_rpc_unsent_total", "CrawlerRealLookupRpcUnsent"),
     (
         "get_peers_responses_with_peers_total",
         "CrawlerGetPeersResponsesWithPeers",

@@ -738,6 +738,9 @@ impl DhtCrawler {
         lookup_id: Option<u64>,
     ) -> bool {
         let Some(transaction) = self.allocate_transaction() else {
+            if lookup_id.is_some() {
+                self.metrics.record_real_lookup_rpc_unsent();
+            }
             self.emit_stat(CrawlStatsEvent::DiscoveryBackpressure);
             return false;
         };
@@ -767,6 +770,9 @@ impl DhtCrawler {
             }
             Err(error) => {
                 self.pending_rpcs.remove(&key);
+                if lookup_id.is_some() {
+                    self.metrics.record_real_lookup_rpc_unsent();
+                }
                 tracing::debug!(
                     event = "dht_send_failed",
                     method = ?method,
@@ -1619,6 +1625,55 @@ mod tests {
         assert!(tracker.active.is_empty());
         assert_eq!(metrics.real_lookups_initiated.load(Ordering::Relaxed), 0);
         assert_eq!(metrics.real_lookups_failed.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn unsent_real_lookup_rpcs_are_counted_separately() {
+        let (info_hash_tx, _info_hash_rx) = mpsc::channel(1);
+        let (stats_tx, _stats_rx) = mpsc::channel(8);
+        let metrics = Arc::new(CrawlerMetrics::default());
+        let mut crawler = test_crawler(
+            DhtConfig {
+                max_pending_rpcs: 1,
+                ..DhtConfig::default()
+            },
+            info_hash_tx,
+            stats_tx,
+            Arc::clone(&metrics),
+        )
+        .await;
+        let lookup_id = crawler.lookups.begin();
+        let target = [3; 20];
+        let addr = "127.0.0.1:1".parse().unwrap();
+        assert!(
+            crawler
+                .send_rpc(
+                    addr,
+                    None,
+                    RpcMethod::GetPeers,
+                    target,
+                    Some(target),
+                    true,
+                    2,
+                    Some(lookup_id),
+                )
+                .await
+        );
+        assert!(
+            !crawler
+                .send_rpc(
+                    addr,
+                    None,
+                    RpcMethod::GetPeers,
+                    target,
+                    Some(target),
+                    true,
+                    2,
+                    Some(lookup_id),
+                )
+                .await
+        );
+        assert_eq!(metrics.real_lookup_rpc_unsent.load(Ordering::Relaxed), 1);
     }
 
     #[test]

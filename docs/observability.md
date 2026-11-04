@@ -135,7 +135,8 @@ rather than runtime labels, and no info hashes or peer addresses are logged.
 | `real_lookups_succeeded_total` | counter | count | Real lookups that closed after at least one response carried peer values |
 | `real_lookups_failed_total` | counter | count | Real lookups that closed without any response carrying peer values |
 | `real_lookup_rpc_timeouts_total` | counter | count | `get_peers` RPCs belonging to real lookups that timed out |
-| `real_lookup_rpc_failures_total` | counter | count | `get_peers` RPCs belonging to real lookups that failed otherwise |
+| `real_lookup_rpc_failures_total` | counter | count | `get_peers` RPCs belonging to real lookups that received an error or malformed response |
+| `real_lookup_rpc_unsent_total` | counter | count | `get_peers` RPCs belonging to real lookups that could not be sent because no transaction slot was free or the UDP send failed |
 | `get_peers_responses_with_peers_total` | counter | count | `get_peers` responses that carried peer values |
 | `get_peers_responses_nodes_only_total` | counter | count | `get_peers` responses that carried nodes only |
 
@@ -203,7 +204,10 @@ rather than runtime labels, and no info hashes or peer addresses are logged.
   `Δreal_lookups_succeeded_total / (Δreal_lookups_succeeded_total +
   Δreal_lookups_failed_total)`, where `Δ` is the change over the interval. This
   rate is distinct from the per-RPC response counters
-  (`get_peers_responses_*_total`) and `real_lookup_rpc_*_total`.
+  (`get_peers_responses_*_total`) and `real_lookup_rpc_*_total`. RPCs that could
+  not be sent at all are counted separately in
+  `real_lookup_rpc_unsent_total`; a lookup with no successfully sent RPC is never
+  initiated and therefore does not distort the success rate.
 - **Metadata admission and retrieval outcomes.** Admission counters count each
   in-memory scheduler admission attempt, whether it arrives from a discovery
   delivery or from the 30-second retry-scan restore
@@ -223,9 +227,14 @@ rather than runtime labels, and no info hashes or peer addresses are logged.
   `peerless_jobs_skipped_total`; the job row is created when a later peer-bearing
   discovery arrives. Failed, rolled-back, or retried
   operations are never counted as successful. `persistence_errors_total` counts
-  failed database operations on persistence/retry-state paths. Uncertain-commit
-  retries are deduplicated by stable receipts, so committed work is not counted
-  twice.
+  failed database operations on persistence/retry-state paths. Committed work is
+  counted exactly once: statistics batches and hash-discovery persistence record
+  their committed outcome counters in the persistence receipt inside the same
+  transaction, so a retry after an uncertain commit reports the originally
+  committed counts instead of losing them, and receipt replay cannot double count
+  the transaction. Metadata completion upserts the job's terminal `complete`
+  state even when no job row existed, and a later peer-bearing discovery never
+  reopens a job for a torrent whose metadata is already complete.
 - **Collection timing.** Crawler and metadata workers update the in-process
   metric registry, including critical counters, before any bounded
   statistics-channel send. Measurement therefore continues when the statistics

@@ -1100,7 +1100,20 @@ async fn mysql_runtime_batch_persists_only_rejected_hash_fallbacks() {
         .persist_runtime_batch(&[], None, "rejected-fallback")
         .await
         .unwrap();
-    assert_eq!(duplicate, RuntimeBatchPersistence::default());
+    assert_eq!(
+        duplicate,
+        RuntimeBatchPersistence {
+            torrents_inserted: 1,
+            hash_jobs_created: 0,
+            peerless_jobs_skipped: 1,
+        },
+        "a committed receipt must replay the originally committed counts"
+    );
+    assert_eq!(
+        store.get_stats().await.unwrap().total_torrents,
+        1,
+        "replaying a committed batch must not write the rows again"
+    );
     let sampled = [95; 20];
     let outcome = store
         .persist_runtime_batch(
@@ -1164,4 +1177,99 @@ async fn mysql_update_hash_job_failure_reports_rows_affected() {
             .unwrap(),
         0
     );
+}
+
+#[tokio::test]
+#[ignore = "requires BTFIND_TEST_DATABASE_URL; run scripts/test-mysql.sh"]
+async fn mysql_metadata_completion_establishes_terminal_job() {
+    let store = Store::open_test_database().await.unwrap();
+    let hash = [98; 20];
+    store
+        .commit_metadata(&hash, "complete", 16, 10, &[("file".into(), 10)])
+        .await
+        .unwrap();
+    assert_eq!(
+        store.hash_job_schedule_for_test(&hash).await.unwrap().0,
+        "complete"
+    );
+    assert!(store.hash_job_is_terminal(&hash).await.unwrap());
+    assert!(store.due_hash_jobs(10).await.unwrap().is_empty());
+
+    let peer = PeerContact {
+        addr: "8.8.8.8:6881".parse().unwrap(),
+    };
+    let outcome = store
+        .persist_hash_discovery(&hash, "announce_peer", std::slice::from_ref(&peer), 8)
+        .await
+        .unwrap();
+    assert!(!outcome.torrent_inserted);
+    assert!(!outcome.hash_job_created);
+    assert_eq!(
+        store.hash_job_schedule_for_test(&hash).await.unwrap().0,
+        "complete",
+        "a peer-bearing discovery must not reopen a completed metadata job"
+    );
+    assert!(store.hash_job_is_terminal(&hash).await.unwrap());
+    assert!(store.due_hash_jobs(10).await.unwrap().is_empty());
+    assert_eq!(store.get_stats().await.unwrap().total_torrents, 1);
+    assert_eq!(store.hash_job_peers(&hash, 8).await.unwrap(), vec![peer]);
+}
+
+#[tokio::test]
+#[ignore = "requires BTFIND_TEST_DATABASE_URL; run scripts/test-mysql.sh"]
+async fn mysql_discovery_receipt_replay_returns_committed_counts() {
+    let store = Store::open_test_database().await.unwrap();
+    let hash = [99; 20];
+    let peers = vec![
+        PeerContact {
+            addr: "1.1.1.1:6881".parse().unwrap(),
+        },
+        PeerContact {
+            addr: "8.8.8.8:6881".parse().unwrap(),
+        },
+    ];
+    let receipt = "recovered-discovery-receipt";
+    let committed = DiscoveryPersistence {
+        torrent_inserted: true,
+        hash_job_created: true,
+        peerless_job_skipped: false,
+        peers_inserted: 2,
+        peers_updated: 0,
+        peers_deleted: 0,
+    };
+    sqlx::query(
+        "INSERT INTO persistence_receipts(id,created_at,acknowledged_at,result) VALUES (?,?,?,?)",
+    )
+    .bind(receipt)
+    .bind(now())
+    .bind(now())
+    .bind(serde_json::to_string(&committed).unwrap())
+    .execute(&store.pool)
+    .await
+    .unwrap();
+    let replayed = store
+        .persist_hash_discovery_with_receipt(&hash, "announce_peer", &peers, 8, receipt)
+        .await
+        .unwrap();
+    assert_eq!(replayed, committed);
+    assert!(
+        store.get_torrent(&hash).await.unwrap().is_none(),
+        "replaying a committed receipt must not repeat the transaction"
+    );
+
+    let fresh_receipt = "fresh-discovery-receipt";
+    let first = store
+        .persist_hash_discovery_with_receipt(&hash, "announce_peer", &peers, 8, fresh_receipt)
+        .await
+        .unwrap();
+    assert!(first.torrent_inserted);
+    assert!(first.hash_job_created);
+    assert_eq!(first.peers_inserted, 2);
+    let receipt_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM persistence_receipts WHERE id=?")
+            .bind(fresh_receipt)
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+    assert_eq!(receipt_rows, 0, "processed receipts are cleaned up");
 }

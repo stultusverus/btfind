@@ -1453,12 +1453,14 @@ pub async fn run_metadata_fetcher(
                 let source = discovery.source;
                 let discovery_has_peers = !peers.is_empty();
                 let mut retry_delay = Duration::from_millis(100);
+                let receipt = uuid::Uuid::new_v4().to_string();
                 let persisted = loop {
-                    match store.persist_hash_discovery(
+                    match store.persist_hash_discovery_with_receipt(
                         &info_hash,
                         source.as_str(),
                         &peers,
                         max_peers_per_hash,
+                        &receipt,
                     ).await {
                         Ok(persisted) => break persisted,
                         Err(error) => {

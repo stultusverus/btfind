@@ -70,6 +70,11 @@ these skipped job creations are counted in `peerless_jobs_skipped_total`.
 Committed retained peer candidates and retry state survive restarts. Workers
 negotiate `ut_metadata`, retrieve and validate the info dictionary, and commit
 metadata, files, search documents, job completion, and counters atomically.
+Metadata completion also upserts the job's terminal `complete` state in the same
+transaction, so a completed torrent always has a durable terminal job row even
+when no peer-bearing discovery had created one; a later peer-bearing discovery
+never reopens a completed job. A peer-bearing discovery for a torrent whose
+metadata is already complete creates a terminal job row instead of a queued one.
 `MetadataFetched` is emitted after persistence succeeds. Timeout, retry, queue,
 and size limits are configured in `src/config.rs`; tests use simulated peers.
 

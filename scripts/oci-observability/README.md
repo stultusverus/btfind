@@ -155,7 +155,8 @@ addition to the original RPC, metadata, and queue counters. Every
 `discovery_observations_total` -> `CrawlerDiscoveryObservations`,
 `lookup_queue_capacity_rejected_total` -> `CrawlerLookupQueueCapacityRejected`,
 and `peer_records_inserted_total` -> `CrawlerPeerRecordsInserted`; the full mapping
-is `CRAWLER_COUNTERS` and `CRAWLER_GAUGES` in `metrics_export.py`.
+is `CRAWLER_COUNTERS`, `CRAWLER_GAUGES`, and `CRAWLER_INTERVAL_COUNTERS` in
+`metrics_export.py`.
 `metadata_fetched_interval` is emitted directly as
 `CrawlerMetadataFetchedInterval` with `window_count` semantics (unit `count`),
 while `metadata_fetched_total` remains the cumulative counter. Deltas are computed

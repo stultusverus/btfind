@@ -516,7 +516,8 @@ async fn flush_stats_batch(
 ) {
     let mut retry_delay = Duration::from_millis(100);
     let receipt = uuid::Uuid::new_v4().to_string();
-    while !try_flush_stats_batch(store, events, snapshot, &receipt, metrics).await {
+    let mut applied = false;
+    while !try_flush_stats_batch(store, events, snapshot, &receipt, metrics, &mut applied).await {
         tokio::time::sleep(retry_delay).await;
         retry_delay = retry_delay.saturating_mul(2).min(Duration::from_secs(5));
     }
@@ -528,6 +529,7 @@ async fn try_flush_stats_batch(
     snapshot: &mut Option<store::RuntimeSnapshot>,
     receipt: &str,
     metrics: &metrics::CrawlerMetrics,
+    applied: &mut bool,
 ) -> bool {
     if events.is_empty() {
         return true;
@@ -537,9 +539,12 @@ async fn try_flush_stats_batch(
         .await
     {
         Ok(outcome) => {
-            metrics.record_torrents_inserted(outcome.torrents_inserted);
-            metrics.record_hash_jobs_created(outcome.hash_jobs_created);
-            metrics.record_peerless_jobs_skipped(outcome.peerless_jobs_skipped);
+            if !*applied {
+                metrics.record_torrents_inserted(outcome.torrents_inserted);
+                metrics.record_hash_jobs_created(outcome.hash_jobs_created);
+                metrics.record_peerless_jobs_skipped(outcome.peerless_jobs_skipped);
+                *applied = true;
+            }
             if let Err(error) = store.acknowledge_receipt(receipt).await {
                 metrics.record_persistence_error();
                 tracing::warn!(
@@ -1405,7 +1410,8 @@ mod integration_tests {
                 &mut events,
                 &mut snapshot,
                 &uuid::Uuid::new_v4().to_string(),
-                &metrics::CrawlerMetrics::default()
+                &metrics::CrawlerMetrics::default(),
+                &mut false,
             )
             .await
         );
