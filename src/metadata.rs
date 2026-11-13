@@ -9,7 +9,7 @@ use rand::Rng;
 use sha1::{Digest, Sha1};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -837,15 +837,20 @@ struct HashJob {
     peer_set: HashSet<std::net::SocketAddrV4>,
     running: bool,
     attempt_count: u32,
+    tracked_since: Instant,
+    ready_since: Option<Instant>,
 }
 
 impl HashJob {
     fn new(attempt_count: u32) -> Self {
+        let now = Instant::now();
         Self {
             peers: VecDeque::new(),
             peer_set: HashSet::new(),
             running: false,
             attempt_count,
+            tracked_since: now,
+            ready_since: None,
         }
     }
 
@@ -902,6 +907,7 @@ fn admit_job_peers(
         job.attempt_count = job.attempt_count.max(attempt_count);
         let added = job.merge_peers(peers, max_peers_per_hash);
         if added > 0 && !job.running && ready_set.insert(info_hash) {
+            job.ready_since = Some(Instant::now());
             ready.push_back(info_hash);
         }
         return if added > 0 {
@@ -920,6 +926,7 @@ fn admit_job_peers(
     if job.merge_peers(peers, max_peers_per_hash) == 0 {
         return JobAdmission::NoPeers;
     }
+    job.ready_since = Some(Instant::now());
     jobs.insert(info_hash, job);
     ready_set.insert(info_hash);
     ready.push_back(info_hash);
@@ -950,6 +957,7 @@ fn apply_job_outcome(
             true
         } else {
             if ready_set.insert(outcome.info_hash) {
+                job.ready_since = Some(Instant::now());
                 ready.push_back(outcome.info_hash);
             }
             false
@@ -1419,9 +1427,13 @@ pub async fn run_metadata_fetcher(
             if job.running {
                 continue;
             }
+            let ready_since = job.ready_since.take();
             let peers = job.take_round(max_peer_attempts_per_round);
             if peers.is_empty() {
                 continue;
+            }
+            if let Some(ready_since) = ready_since {
+                metrics.record_metadata_ready_dwell(ready_since.elapsed());
             }
             job.running = true;
             let round_store = store.clone();
@@ -1511,7 +1523,23 @@ pub async fn run_metadata_fetcher(
                 }
             }
             _ = status_tick.tick() => {
+                let now = Instant::now();
                 let pending_peers = jobs.values().map(|job| job.peers.len()).sum();
+                let runnable_jobs = jobs
+                    .values()
+                    .filter(|job| !job.running && !job.peers.is_empty())
+                    .count();
+                let tracked_oldest_age_seconds = jobs
+                    .values()
+                    .map(|job| now.saturating_duration_since(job.tracked_since).as_secs())
+                    .max()
+                    .unwrap_or_default();
+                let ready_oldest_age_seconds = ready
+                    .iter()
+                    .filter_map(|info_hash| jobs.get(info_hash)?.ready_since)
+                    .map(|ready_since| now.saturating_duration_since(ready_since).as_secs())
+                    .max()
+                    .unwrap_or_default();
                 if !emit_stat(
                     &metrics,
                     &stats_tx,
@@ -1519,6 +1547,10 @@ pub async fn run_metadata_fetcher(
                         active_jobs: jobs.len(),
                         queued_jobs: ready.len(),
                         pending_peers,
+                        runnable_jobs,
+                        active_workers: workers.len(),
+                        tracked_oldest_age_seconds,
+                        ready_oldest_age_seconds,
                     },
                 ) {
                     tracing::debug!(

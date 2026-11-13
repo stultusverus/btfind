@@ -325,6 +325,12 @@ async fn cmd_run(
         .await;
     });
 
+    let backlog_store = store.clone();
+    let backlog_metrics = crawler_metrics.clone();
+    let backlog_handle = tokio::spawn(async move {
+        run_metadata_backlog_reporter(backlog_store, backlog_metrics).await;
+    });
+
     let store_clone = store.clone();
     let connect_timeout = config.metadata.connect_timeout_secs;
     let peer_timeout = config.metadata.peer_timeout_secs;
@@ -396,6 +402,8 @@ async fn cmd_run(
         Duration::from_secs(config.crawl.shutdown_drain_secs),
     )
     .await;
+    backlog_handle.abort();
+    join_aborted_task("metadata_backlog", backlog_handle).await;
     metrics_handle.abort();
     let _ = metrics_handle.await;
     crawler_metrics.emit(true);
@@ -503,6 +511,44 @@ async fn run_stats_persistence(
             }
             _ = flush_tick.tick(), if !events.is_empty() => {
                 flush_stats_batch(&store, &mut events, &mut snapshot, &metrics).await;
+            }
+        }
+    }
+}
+
+async fn run_metadata_backlog_reporter(
+    store: Arc<store::Store>,
+    metrics: Arc<metrics::CrawlerMetrics>,
+) {
+    let mut ticker = tokio::time::interval(Duration::from_secs(60));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ticker.tick().await;
+    loop {
+        ticker.tick().await;
+        match tokio::time::timeout(Duration::from_secs(10), store.metadata_backlog()).await {
+            Ok(Ok(backlog)) => metrics.set_metadata_durable_backlog(
+                backlog.queued,
+                backlog.retry_at,
+                backlog.waiting_peers,
+                backlog.due,
+                backlog.oldest_due_age_seconds,
+            ),
+            Ok(Err(error)) => {
+                metrics.record_metadata_backlog_error();
+                tracing::warn!(
+                    event = "metadata_backlog_sample_failed",
+                    reason = "database",
+                    error = %error,
+                    "failed to sample durable metadata backlog"
+                );
+            }
+            Err(_) => {
+                metrics.record_metadata_backlog_error();
+                tracing::warn!(
+                    event = "metadata_backlog_sample_failed",
+                    reason = "timeout",
+                    "durable metadata backlog sample timed out"
+                );
             }
         }
     }

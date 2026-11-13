@@ -50,7 +50,10 @@ per-hash peer limit still apply. Persisted due jobs retain the existing order by
 terminal-state checks. Database-wide freshness ordering is deferred until a
 query/index design is evaluated at realistic scale. The retry loader does no
 database work at capacity and only loads peer lists for untracked jobs that fit
-available slots. No age cutoff deletes older work; continuous fresh arrivals can defer it.
+available slots. No age cutoff deletes older work; continuous fresh arrivals can
+defer it. An independent diagnostics task samples durable job status counts and
+the oldest due work once per minute; it does not change retry eligibility or
+admission and cannot delay statistics persistence.
 
 Discovery persistence writes the torrent, job, supplied peer addresses, and peer
 retention changes in one transaction, locking catalogue totals before the torrent.

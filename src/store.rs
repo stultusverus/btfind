@@ -80,6 +80,14 @@ pub struct HashJobRecord {
     pub next_attempt_at: i64,
     pub last_failure: Option<String>,
 }
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MetadataBacklog {
+    pub queued: u64,
+    pub retry_at: u64,
+    pub waiting_peers: u64,
+    pub due: u64,
+    pub oldest_due_age_seconds: u64,
+}
 #[derive(Debug, Clone, Copy)]
 pub struct RuntimeSnapshot {
     pub nodes_known: i64,
@@ -552,6 +560,36 @@ impl Store {
         let terminal: Option<bool> = sqlx::query_scalar("SELECT status IN ('complete','invalid','unsupported') FROM hash_jobs WHERE info_hash=?")
             .bind(hex::encode(hash)).fetch_optional(&self.pool).await?;
         Ok(terminal.unwrap_or(false))
+    }
+    pub async fn metadata_backlog(&self) -> Result<MetadataBacklog, Error> {
+        let now = now();
+        let mut backlog = MetadataBacklog::default();
+        let rows = sqlx::query("SELECT status,COUNT(*) AS count FROM hash_jobs WHERE status IN ('queued','retry_at','waiting_peers') GROUP BY status")
+            .fetch_all(&self.pool)
+            .await?;
+        for row in rows {
+            let status: String = row.try_get("status")?;
+            let count = u64::try_from(row.try_get::<i64, _>("count")?)
+                .map_err(|_| invalid("invalid metadata backlog count"))?;
+            match status.as_str() {
+                "queued" => backlog.queued = count,
+                "retry_at" => backlog.retry_at = count,
+                "waiting_peers" => backlog.waiting_peers = count,
+                _ => {}
+            }
+        }
+        let row = sqlx::query("SELECT COUNT(*) AS count,COALESCE(MIN(j.updated_at),0) AS oldest FROM hash_jobs j WHERE j.status IN ('queued','retry_at') AND j.next_attempt_at<=? AND EXISTS (SELECT 1 FROM hash_job_peers p WHERE p.info_hash=j.info_hash)")
+            .bind(now)
+            .fetch_one(&self.pool)
+            .await?;
+        backlog.due = u64::try_from(row.try_get::<i64, _>("count")?)
+            .map_err(|_| invalid("invalid due metadata job count"))?;
+        let oldest: i64 = row.try_get("oldest")?;
+        if backlog.due > 0 {
+            backlog.oldest_due_age_seconds = u64::try_from(now.saturating_sub(oldest).max(0))
+                .map_err(|_| invalid("invalid metadata backlog age"))?;
+        }
+        Ok(backlog)
     }
     pub async fn due_hash_jobs(&self, limit: usize) -> Result<Vec<HashJobRecord>, Error> {
         sqlx::query("SELECT j.* FROM hash_jobs j WHERE j.status IN ('queued','retry_at') AND j.next_attempt_at<=? AND EXISTS (SELECT 1 FROM hash_job_peers p WHERE p.info_hash=j.info_hash) ORDER BY j.next_attempt_at,j.updated_at,j.info_hash LIMIT ?").bind(now()).bind(limit as u64).fetch_all(&self.pool).await?.iter().map(|r| Ok(HashJobRecord {
