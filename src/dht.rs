@@ -859,7 +859,7 @@ impl DhtCrawler {
             return QueueAdmission::Duplicate;
         }
         if self.discovery_queue.len() >= self.config.max_discovery_hashes {
-            self.metrics.record_lookup_queue_capacity_rejected();
+            self.metrics.record_lookup_queue_capacity_rejected(&hash);
             return QueueAdmission::CapacityRejected;
         }
         self.discovery_queue.push_back(QueuedLookup {

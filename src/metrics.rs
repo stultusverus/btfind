@@ -137,8 +137,24 @@ fn unique_hash(info_hash: &crate::types::InfoHash) -> u64 {
 struct DiscoveryUniqueness {
     all: UniqueSketch,
     peer_bearing: UniqueSketch,
+    peer_bearing_rejected: UniqueSketch,
+    capacity_rejected: UniqueSketch,
     interval_all: UniqueSketch,
     interval_peer_bearing: UniqueSketch,
+    interval_peer_bearing_rejected: UniqueSketch,
+    interval_capacity_rejected: UniqueSketch,
+}
+
+#[derive(Default)]
+struct UniqueEstimates {
+    all: u64,
+    peer_bearing: u64,
+    peer_bearing_rejected: u64,
+    capacity_rejected: u64,
+    interval_all: u64,
+    interval_peer_bearing: u64,
+    interval_peer_bearing_rejected: u64,
+    interval_capacity_rejected: u64,
 }
 
 pub struct CrawlerMetrics {
@@ -344,6 +360,10 @@ impl CrawlerMetrics {
                     if *has_peers {
                         unique.peer_bearing.insert(info_hash);
                         unique.interval_peer_bearing.insert(info_hash);
+                        if !*accepted {
+                            unique.peer_bearing_rejected.insert(info_hash);
+                            unique.interval_peer_bearing_rejected.insert(info_hash);
+                        }
                     }
                 }
                 if *has_peers {
@@ -467,17 +487,23 @@ impl CrawlerMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    fn unique_estimates(&self, reset_interval: bool) -> (u64, u64, u64, u64) {
+    fn unique_estimates(&self, reset_interval: bool) -> UniqueEstimates {
         let mut unique = lock(&self.discovery_uniqueness);
-        let estimates = (
-            unique.all.estimate(),
-            unique.peer_bearing.estimate(),
-            unique.interval_all.estimate(),
-            unique.interval_peer_bearing.estimate(),
-        );
+        let estimates = UniqueEstimates {
+            all: unique.all.estimate(),
+            peer_bearing: unique.peer_bearing.estimate(),
+            peer_bearing_rejected: unique.peer_bearing_rejected.estimate(),
+            capacity_rejected: unique.capacity_rejected.estimate(),
+            interval_all: unique.interval_all.estimate(),
+            interval_peer_bearing: unique.interval_peer_bearing.estimate(),
+            interval_peer_bearing_rejected: unique.interval_peer_bearing_rejected.estimate(),
+            interval_capacity_rejected: unique.interval_capacity_rejected.estimate(),
+        };
         if reset_interval {
             unique.interval_all.reset();
             unique.interval_peer_bearing.reset();
+            unique.interval_peer_bearing_rejected.reset();
+            unique.interval_capacity_rejected.reset();
         }
         estimates
     }
@@ -490,9 +516,12 @@ impl CrawlerMetrics {
         self.lookup_queue_duplicate.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn record_lookup_queue_capacity_rejected(&self) {
+    pub fn record_lookup_queue_capacity_rejected(&self, info_hash: &crate::types::InfoHash) {
         self.lookup_queue_capacity_rejected
             .fetch_add(1, Ordering::Relaxed);
+        let mut unique = lock(&self.discovery_uniqueness);
+        unique.capacity_rejected.insert(info_hash);
+        unique.interval_capacity_rejected.insert(info_hash);
     }
 
     pub fn record_real_lookup_initiated(&self) {
@@ -578,12 +607,7 @@ impl CrawlerMetrics {
     pub fn emit(&self, final_snapshot: bool) {
         let metadata_fetched = self.metadata_fetched.load(Ordering::Relaxed);
         let metadata_fetched_interval = self.metadata_fetched_interval(metadata_fetched);
-        let (
-            discovery_unique_candidates,
-            discovery_unique_peer_bearing_candidates,
-            discovery_unique_candidates_interval,
-            discovery_unique_peer_bearing_candidates_interval,
-        ) = self.unique_estimates(true);
+        let unique = self.unique_estimates(true);
         tracing::info!(
             event = "crawler_status",
             final_snapshot = final_snapshot,
@@ -637,12 +661,13 @@ impl CrawlerMetrics {
             discovery_queue_depth = self.discovery_queue_depth.load(Ordering::Relaxed),
             discovery_queue_capacity = self.discovery_queue_capacity.load(Ordering::Relaxed),
             discovery_observations_total = self.discovery_observations.load(Ordering::Relaxed),
-            discovery_unique_candidates_total = discovery_unique_candidates,
-            discovery_unique_peer_bearing_candidates_total =
-                discovery_unique_peer_bearing_candidates,
-            discovery_unique_candidates_interval = discovery_unique_candidates_interval,
-            discovery_unique_peer_bearing_candidates_interval =
-                discovery_unique_peer_bearing_candidates_interval,
+            discovery_unique_candidates_total = unique.all,
+            discovery_unique_peer_bearing_candidates_total = unique.peer_bearing,
+            discovery_unique_candidates_interval = unique.interval_all,
+            discovery_unique_peer_bearing_candidates_interval = unique.interval_peer_bearing,
+            discovery_peer_bearing_rejected_unique_candidates_total = unique.peer_bearing_rejected,
+            discovery_peer_bearing_rejected_unique_candidates_interval =
+                unique.interval_peer_bearing_rejected,
             discovery_peer_bearing_observations_total = self
                 .discovery_peer_bearing_observations
                 .load(Ordering::Relaxed),
@@ -669,6 +694,9 @@ impl CrawlerMetrics {
             lookup_queue_duplicate_total = self.lookup_queue_duplicate.load(Ordering::Relaxed),
             lookup_queue_capacity_rejected_total =
                 self.lookup_queue_capacity_rejected.load(Ordering::Relaxed),
+            lookup_queue_capacity_rejected_unique_candidates_total = unique.capacity_rejected,
+            lookup_queue_capacity_rejected_unique_candidates_interval =
+                unique.interval_capacity_rejected,
             lookup_queue_oldest_age_seconds =
                 self.lookup_queue_oldest_age_seconds.load(Ordering::Relaxed),
             lookup_queue_mean_age_seconds =
@@ -1122,15 +1150,39 @@ mod tests {
             accepted: true,
             peers: 0,
         });
-        let (all, peer_bearing, interval_all, interval_peer_bearing) =
-            metrics.unique_estimates(true);
-        assert_eq!(all, 2);
-        assert_eq!(peer_bearing, 1);
-        assert_eq!(interval_all, 2);
-        assert_eq!(interval_peer_bearing, 1);
-        let (_, _, interval_all, interval_peer_bearing) = metrics.unique_estimates(false);
-        assert_eq!(interval_all, 0);
-        assert_eq!(interval_peer_bearing, 0);
+        for _ in 0..3 {
+            metrics.apply(&CrawlStatsEvent::HashObserved {
+                info_hash: [3; 20],
+                source: DiscoverySource::AnnouncePeer,
+                has_peers: true,
+                accepted: false,
+                peers: 2,
+            });
+        }
+        metrics.apply(&CrawlStatsEvent::HashObserved {
+            info_hash: [4; 20],
+            source: DiscoverySource::InboundGetPeers,
+            has_peers: false,
+            accepted: true,
+            peers: 0,
+        });
+        for _ in 0..4 {
+            metrics.record_lookup_queue_capacity_rejected(&[4; 20]);
+        }
+        let unique = metrics.unique_estimates(true);
+        assert_eq!(unique.all, 4);
+        assert_eq!(unique.peer_bearing, 2);
+        assert_eq!(unique.peer_bearing_rejected, 1);
+        assert_eq!(unique.capacity_rejected, 1);
+        assert_eq!(unique.interval_all, 4);
+        assert_eq!(unique.interval_peer_bearing, 2);
+        assert_eq!(unique.interval_peer_bearing_rejected, 1);
+        assert_eq!(unique.interval_capacity_rejected, 1);
+        let unique = metrics.unique_estimates(false);
+        assert_eq!(unique.interval_all, 0);
+        assert_eq!(unique.interval_peer_bearing, 0);
+        assert_eq!(unique.interval_peer_bearing_rejected, 0);
+        assert_eq!(unique.interval_capacity_rejected, 0);
     }
 
     #[test]
@@ -1233,7 +1285,7 @@ mod tests {
         metrics.set_discovery_queue_depth(7);
         metrics.record_lookup_queue_accepted();
         metrics.record_lookup_queue_duplicate();
-        metrics.record_lookup_queue_capacity_rejected();
+        metrics.record_lookup_queue_capacity_rejected(&[5; 20]);
         metrics.record_real_lookup_initiated();
         metrics.record_real_lookup_succeeded();
         metrics.record_real_lookup_failed();

@@ -75,6 +75,10 @@ CRAWLER_COUNTERS = (
         "CrawlerDiscoveryPeerBearingRejected",
     ),
     (
+        "discovery_peer_bearing_rejected_unique_candidates_total",
+        "CrawlerDiscoveryPeerBearingRejectedUniqueCandidates",
+    ),
+    (
         "discovery_peer_addresses_lost_total",
         "CrawlerDiscoveryPeerAddressesLost",
     ),
@@ -83,6 +87,10 @@ CRAWLER_COUNTERS = (
     (
         "lookup_queue_capacity_rejected_total",
         "CrawlerLookupQueueCapacityRejected",
+    ),
+    (
+        "lookup_queue_capacity_rejected_unique_candidates_total",
+        "CrawlerLookupQueueCapacityRejectedUniqueCandidates",
     ),
     ("lookup_queue_dwell_count_total", "CrawlerLookupQueueDwellCount"),
     ("lookup_queue_dwell_seconds_total", "CrawlerLookupQueueDwellSeconds"),
@@ -198,6 +206,14 @@ CRAWLER_INTERVAL_COUNTERS = (
     (
         "discovery_unique_peer_bearing_candidates_interval",
         "CrawlerDiscoveryUniquePeerBearingCandidatesInterval",
+    ),
+    (
+        "discovery_peer_bearing_rejected_unique_candidates_interval",
+        "CrawlerDiscoveryPeerBearingRejectedUniqueCandidatesInterval",
+    ),
+    (
+        "lookup_queue_capacity_rejected_unique_candidates_interval",
+        "CrawlerLookupQueueCapacityRejectedUniqueCandidatesInterval",
     ),
 )
 

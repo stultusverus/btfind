@@ -137,6 +137,8 @@ rather than runtime labels, and no info hashes or peer addresses are logged.
 | `discovery_channel_accepted_total` | counter | count | Bounded discovery-channel sends that succeeded |
 | `discovery_channel_rejected_total` | counter | count | Bounded discovery-channel sends rejected because the channel was full or closed |
 | `discovery_peer_bearing_rejected_total` | counter | count | Peer-bearing observations rejected by the bounded discovery channel |
+| `discovery_peer_bearing_rejected_unique_candidates_total` | counter estimate | count | Distinct peer-bearing hashes rejected by the bounded discovery channel |
+| `discovery_peer_bearing_rejected_unique_candidates_interval` | interval estimate | count | Distinct peer-bearing hashes rejected since the previous `crawler_status` emission |
 | `discovery_peer_addresses_lost_total` | counter | count | Peer addresses lost with rejected peer-bearing observations |
 | `discovery_queue_depth` | gauge | count | Queued hashes in the bounded discovery / real-hash lookup queue |
 | `discovery_queue_capacity` | gauge | count | Configured capacity of that queue (`max_discovery_hashes`) |
@@ -148,6 +150,8 @@ rather than runtime labels, and no info hashes or peer addresses are logged.
 | `lookup_queue_accepted_total` | counter | count | Hashes admitted to the bounded discovery / real-hash lookup queue |
 | `lookup_queue_duplicate_total` | counter | count | Admissions coalesced because the hash was already queued |
 | `lookup_queue_capacity_rejected_total` | counter | count | Admissions rejected because the queue was at `max_discovery_hashes` |
+| `lookup_queue_capacity_rejected_unique_candidates_total` | counter estimate | count | Distinct hashes whose lookup admission was capacity-rejected |
+| `lookup_queue_capacity_rejected_unique_candidates_interval` | interval estimate | count | Distinct capacity-rejected lookup hashes since the previous `crawler_status` emission |
 | `lookup_queue_oldest_age_seconds` | gauge | seconds | Age of the hash at the front of the lookup queue at snapshot time |
 | `lookup_queue_mean_age_seconds` | gauge | seconds | Mean age of all hashes in the lookup queue at snapshot time |
 | `lookup_queue_dwell_count_total` | counter | count | Real lookup hashes removed from the queue with a measured wait |
@@ -200,15 +204,17 @@ rather than runtime labels, and no info hashes or peer addresses are logged.
   `metadata_fetched_total` remains the cumulative counter. The
   `discovery_unique_*_total` fields are monotonic cardinality estimates, not
   exact integer counters; use the interval fields for window comparisons.
-- **Bounded unique-candidate estimates.** Four fixed-size HyperLogLog sketches
+- **Bounded unique-candidate estimates.** Eight fixed-size HyperLogLog sketches
   (about 16 KiB each) estimate distinct hashes: all observations, peer-bearing
-  observations, and a second pair reset at every status emission for aligned
+  observations, peer-bearing discovery-channel rejections, and lookup capacity
+  rejections, plus a second set reset at every status emission for aligned
   windows. The standard error at the configured precision is about 0.8%. Hash
   values are consumed inside the estimator and are never emitted, stored in
   metrics, or used as dimensions. Repeated observations do not increase the
-  estimate. These fields answer "how many distinct candidate hashes were seen?"
-  while `discovery_observations_total` remains the repeated-observation
-  denominator.
+  estimate. These fields answer "how many distinct candidate hashes were seen or
+  rejected?" while the existing rejection counters remain attempt denominators.
+  Distinct rejected divided by total rejected quantifies repeated rejection
+  pressure versus actual unique candidate loss.
 - **Observed versus accepted versus persisted.** "Observed" counts info-hash
   observations in-process, regardless of whether the bounded discovery-channel
   send succeeds. "Accepted" and "rejected" describe that send outcome. "Persisted"
@@ -255,13 +261,15 @@ rather than runtime labels, and no info hashes or peer addresses are logged.
   The oldest tracked and ready ages expose starvation even when the tracked-job
   gauge is full. Ready-queue mean wait is
   `Δmetadata_ready_dwell_seconds_total / Δmetadata_ready_dwell_count_total`.
-- **Durable metadata backlog.** The statistics worker samples durable
+- **Durable metadata backlog.** An independent diagnostics task samples durable
   `hash_jobs` status counts once per minute: queued, retry/cooldown, and
-  waiting-for-peers. `metadata_durable_due_jobs` counts only due jobs with at
-  least one peer, matching the retry loader's eligibility. The oldest-due age is
-  measured from the job's last durable state change (`updated_at`), because
-  immediate `next_attempt_at=0` rows do not carry a meaningful due timestamp.
-  These gauges retain their last successful sample; failures increment
+  waiting-for-peers. It does not run inside the statistics persistence worker, so
+  a slow backlog query cannot delay event draining, flushing, or peerless-fallback
+  persistence. `metadata_durable_due_jobs` counts only due jobs with at least one
+  peer, matching the retry loader's eligibility. The oldest-due age is measured
+  from the job's last durable state change (`updated_at`), because immediate
+  `next_attempt_at=0` rows do not carry a meaningful due timestamp. These gauges
+  retain their last successful sample; failures increment
   `metadata_backlog_sample_errors_total` instead of being shown as zero backlog.
   Compare `metadata_durable_due_jobs` with the tracked/runnable gauges to see
   durable work deferred by in-memory capacity; the exact deferred subset is not
