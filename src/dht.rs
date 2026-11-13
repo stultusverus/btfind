@@ -529,6 +529,11 @@ enum QueueAdmission {
     Invalid,
 }
 
+struct QueuedLookup {
+    info_hash: InfoHash,
+    queued_at: Instant,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct RealLookupProgress {
     outstanding: usize,
@@ -626,7 +631,7 @@ pub struct DhtCrawler {
     lookups: RealLookupTracker,
     token_secret: [u8; 16],
     bootstrap_nodes: Vec<String>,
-    discovery_queue: VecDeque<InfoHash>,
+    discovery_queue: VecDeque<QueuedLookup>,
     discovery_set: HashSet<InfoHash>,
     provisional: HashMap<SocketAddrV4, (NodeId, Instant)>,
     pending_rpcs: HashMap<Vec<u8>, PendingRpc>,
@@ -857,12 +862,41 @@ impl DhtCrawler {
             self.metrics.record_lookup_queue_capacity_rejected();
             return QueueAdmission::CapacityRejected;
         }
-        self.discovery_queue.push_back(hash);
+        self.discovery_queue.push_back(QueuedLookup {
+            info_hash: hash,
+            queued_at: Instant::now(),
+        });
         self.discovery_set.insert(hash);
         self.metrics
             .set_discovery_queue_depth(self.discovery_queue.len());
         self.metrics.record_lookup_queue_accepted();
         QueueAdmission::Accepted
+    }
+
+    fn requeue_lookup(&mut self, hash: InfoHash) {
+        if self.queue_hash(hash) == QueueAdmission::Accepted {
+            self.metrics.record_lookup_queue_requeued();
+        }
+    }
+
+    fn update_lookup_queue_ages(&self) {
+        let now = Instant::now();
+        let oldest = self
+            .discovery_queue
+            .front()
+            .map(|entry| now.saturating_duration_since(entry.queued_at))
+            .unwrap_or_default();
+        let mean = if self.discovery_queue.is_empty() {
+            Duration::ZERO
+        } else {
+            let total: u64 = self
+                .discovery_queue
+                .iter()
+                .map(|entry| now.saturating_duration_since(entry.queued_at).as_secs())
+                .fold(0u64, u64::saturating_add);
+            Duration::from_secs(total / self.discovery_queue.len() as u64)
+        };
+        self.metrics.set_lookup_queue_ages(oldest, mean);
     }
 
     fn publish_discovery(
@@ -922,6 +956,7 @@ impl DhtCrawler {
                     self.expire_peer_cache();
                 }
                 _ = stats_tick.tick() => {
+                    self.update_lookup_queue_ages();
                     self.emit_stat(CrawlStatsEvent::DhtSnapshot {
                         nodes_known: self.routing.node_count(),
                         queries_sent: self.queries_sent,
@@ -951,7 +986,7 @@ impl DhtCrawler {
                 }
                 if pending.is_real_lookup {
                     if let Some(hash) = pending.info_hash {
-                        self.queue_hash(hash);
+                        self.requeue_lookup(hash);
                     }
                 }
                 if let Some(lookup_id) = pending.lookup_id {
@@ -1302,9 +1337,11 @@ impl DhtCrawler {
     async fn discover_peers(&mut self) {
         self.expire_pending();
         let (hash, real) = match self.discovery_queue.pop_front() {
-            Some(hash) => {
-                self.discovery_set.remove(&hash);
-                (hash, true)
+            Some(entry) => {
+                self.discovery_set.remove(&entry.info_hash);
+                self.metrics
+                    .record_lookup_queue_dwell(entry.queued_at.elapsed());
+                (entry.info_hash, true)
             }
             None => (random_node_id(), false),
         };
@@ -1319,7 +1356,7 @@ impl DhtCrawler {
         }
         if nodes.is_empty() {
             if real {
-                self.queue_hash(hash);
+                self.requeue_lookup(hash);
             }
             self.bootstrap().await;
             return;
@@ -1760,6 +1797,43 @@ mod tests {
             1
         );
         assert_eq!(metrics.discovery_queue_depth.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn lookup_queue_age_and_requeue_are_measurable() {
+        let (info_hash_tx, _info_hash_rx) = mpsc::channel(1);
+        let (stats_tx, _stats_rx) = mpsc::channel(1);
+        let metrics = Arc::new(CrawlerMetrics::default());
+        let mut crawler = test_crawler(
+            DhtConfig::default(),
+            info_hash_tx,
+            stats_tx,
+            Arc::clone(&metrics),
+        )
+        .await;
+
+        assert_eq!(crawler.queue_hash([1; 20]), QueueAdmission::Accepted);
+        crawler.discovery_queue.front_mut().unwrap().queued_at =
+            Instant::now() - Duration::from_secs(15);
+        crawler.update_lookup_queue_ages();
+        assert_eq!(
+            metrics
+                .lookup_queue_oldest_age_seconds
+                .load(Ordering::Relaxed),
+            15
+        );
+        assert_eq!(
+            metrics
+                .lookup_queue_mean_age_seconds
+                .load(Ordering::Relaxed),
+            15
+        );
+
+        crawler.discovery_queue.clear();
+        crawler.discovery_set.clear();
+        crawler.requeue_lookup([1; 20]);
+        assert_eq!(metrics.lookup_queue_requeued.load(Ordering::Relaxed), 1);
+        assert_eq!(metrics.discovery_queue_depth.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]

@@ -143,6 +143,10 @@ pub enum CrawlStatsEvent {
         active_jobs: usize,
         queued_jobs: usize,
         pending_peers: usize,
+        runnable_jobs: usize,
+        active_workers: usize,
+        tracked_oldest_age_seconds: u64,
+        ready_oldest_age_seconds: u64,
     },
     SampleObserved {
         info_hash: InfoHash,

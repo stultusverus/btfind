@@ -101,15 +101,32 @@ rather than runtime labels, and no info hashes or peer addresses are logged.
 | `metadata_fetched_total` | counter | count | Successful metadata retrievals since process start |
 | `metadata_fetched_interval` | interval count | count | Successful metadata retrievals completed since the previous `crawler_status` emission |
 | `metadata_failed_total` | counter | count | Failed metadata fetch attempts (reasons are persisted in `metadata_failure_counts`) |
-| `active_metadata_jobs` | gauge | count | Metadata jobs with an active worker |
-| `queued_metadata_jobs` | gauge | count | Metadata jobs waiting for a worker |
+| `active_metadata_jobs` | gauge | count | Tracked in-memory metadata jobs (`jobs.len()`); the field name is retained for compatibility |
+| `queued_metadata_jobs` | gauge | count | Ready-queue length: tracked jobs waiting for a worker |
 | `pending_metadata_peers` | gauge | count | Peer addresses pending across tracked metadata jobs |
+| `metadata_runnable_jobs` | gauge | count | Tracked jobs that are not running and have at least one pending peer |
+| `metadata_active_workers` | gauge | count | Metadata network workers currently in the worker set |
+| `metadata_tracked_oldest_age_seconds` | gauge | seconds | Age of the longest-tracked in-memory job since it entered the scheduler |
+| `metadata_ready_oldest_age_seconds` | gauge | seconds | Age of the longest-waiting ready job since it was last placed in the ready queue |
+| `metadata_ready_dwell_count_total` | counter | count | Ready jobs dequeued for a worker round with a measured wait |
+| `metadata_ready_dwell_seconds_total` | counter | seconds | Cumulative ready-queue wait for those dequeues |
+| `metadata_ready_dwell_max_seconds` | gauge | seconds | Maximum ready-queue wait observed since process start |
+| `metadata_durable_queued_jobs` | gauge | count | Durable `hash_jobs` rows with status `queued` |
+| `metadata_durable_retry_jobs` | gauge | count | Durable `hash_jobs` rows with status `retry_at` (retry/cooldown backlog, including not-yet-due jobs) |
+| `metadata_durable_waiting_peers_jobs` | gauge | count | Durable `hash_jobs` rows with status `waiting_peers` |
+| `metadata_durable_due_jobs` | gauge | count | Durable `queued`/`retry_at` jobs whose `next_attempt_at` is due and that have at least one peer row |
+| `metadata_durable_oldest_due_age_seconds` | gauge | seconds | Age since the last durable state change of the oldest due job, or zero when none are due |
+| `metadata_backlog_sample_errors_total` | counter | count | Failed or timed-out durable-backlog samples; gauges retain the last successful sample |
 
 **Discovery observations**
 
 | Field | Kind | Unit | Meaning |
 | --- | --- | --- | --- |
 | `discovery_observations_total` | counter | count | Info-hash observations counted in-process, regardless of the bounded discovery-channel send outcome |
+| `discovery_unique_candidates_total` | counter estimate | count | Distinct non-zero info hashes observed since process start, estimated with a bounded HyperLogLog sketch |
+| `discovery_unique_peer_bearing_candidates_total` | counter estimate | count | Distinct non-zero info hashes observed at least once with peer addresses |
+| `discovery_unique_candidates_interval` | interval estimate | count | Distinct hashes first observed since the previous `crawler_status` emission |
+| `discovery_unique_peer_bearing_candidates_interval` | interval estimate | count | Distinct peer-bearing hashes first observed since the previous `crawler_status` emission |
 | `discovery_observed_inbound_get_peers_total` | counter | count | Observations sourced from inbound `get_peers` queries |
 | `discovery_observed_announce_peer_total` | counter | count | Observations sourced from inbound `announce_peer` queries |
 | `discovery_observed_resume_total` | counter | count | Observations sourced from persisted-hash resume |
@@ -129,8 +146,14 @@ rather than runtime labels, and no info hashes or peer addresses are logged.
 | Field | Kind | Unit | Meaning |
 | --- | --- | --- | --- |
 | `lookup_queue_accepted_total` | counter | count | Hashes admitted to the bounded discovery / real-hash lookup queue |
-| `lookup_queue_duplicate_total` | counter | count | Admissions skipped because the hash was already queued |
+| `lookup_queue_duplicate_total` | counter | count | Admissions coalesced because the hash was already queued |
 | `lookup_queue_capacity_rejected_total` | counter | count | Admissions rejected because the queue was at `max_discovery_hashes` |
+| `lookup_queue_oldest_age_seconds` | gauge | seconds | Age of the hash at the front of the lookup queue at snapshot time |
+| `lookup_queue_mean_age_seconds` | gauge | seconds | Mean age of all hashes in the lookup queue at snapshot time |
+| `lookup_queue_dwell_count_total` | counter | count | Real lookup hashes removed from the queue with a measured wait |
+| `lookup_queue_dwell_seconds_total` | counter | seconds | Cumulative dequeue wait for those real lookup hashes |
+| `lookup_queue_dwell_max_seconds` | gauge | seconds | Maximum dequeue wait observed since process start |
+| `lookup_queue_requeued_total` | counter | count | Lookup hashes returned to the queue after an incomplete lookup or no usable nodes |
 | `real_lookups_initiated_total` | counter | count | Real hash lookups that sent at least one initial `get_peers` RPC |
 | `real_lookups_succeeded_total` | counter | count | Real lookups that closed after at least one response carried peer values |
 | `real_lookups_failed_total` | counter | count | Real lookups that closed without any response carrying peer values |
@@ -171,10 +194,21 @@ rather than runtime labels, and no info hashes or peer addresses are logged.
 
 - **Cumulative counters, gauges, and interval counts.** Every `*_total` field is
   cumulative since process start and resets to zero on restart; `run_id`
-  identifies the run. Gauges are instantaneous samples. `metadata_fetched_interval`
-  is the only interval count: successful metadata retrievals completed since the
-  previous `crawler_status` emission. `metadata_fetched_total` remains the
-  cumulative counter.
+  identifies the run. Gauges are instantaneous samples. Interval fields
+  (`metadata_fetched_interval` and the two `discovery_unique_*_interval` fields)
+  describe only the period since the previous `crawler_status` emission.
+  `metadata_fetched_total` remains the cumulative counter. The
+  `discovery_unique_*_total` fields are monotonic cardinality estimates, not
+  exact integer counters; use the interval fields for window comparisons.
+- **Bounded unique-candidate estimates.** Four fixed-size HyperLogLog sketches
+  (about 16 KiB each) estimate distinct hashes: all observations, peer-bearing
+  observations, and a second pair reset at every status emission for aligned
+  windows. The standard error at the configured precision is about 0.8%. Hash
+  values are consumed inside the estimator and are never emitted, stored in
+  metrics, or used as dimensions. Repeated observations do not increase the
+  estimate. These fields answer "how many distinct candidate hashes were seen?"
+  while `discovery_observations_total` remains the repeated-observation
+  denominator.
 - **Observed versus accepted versus persisted.** "Observed" counts info-hash
   observations in-process, regardless of whether the bounded discovery-channel
   send succeeds. "Accepted" and "rejected" describe that send outcome. "Persisted"
@@ -207,7 +241,31 @@ rather than runtime labels, and no info hashes or peer addresses are logged.
   (`get_peers_responses_*_total`) and `real_lookup_rpc_*_total`. RPCs that could
   not be sent at all are counted separately in
   `real_lookup_rpc_unsent_total`; a lookup with no successfully sent RPC is never
-  initiated and therefore does not distort the success rate.
+  initiated and therefore does not distort the success rate. Duplicate admissions
+  are coalesced observations. Queue age is sampled once per minute; dequeue dwell
+  is measured for real hashes when they leave the queue. The current queue has no
+  age-based expiry: entries leave by dequeue, and a real lookup hash can be
+  returned by `lookup_queue_requeued_total` after an incomplete lookup or when no
+  usable nodes are available. Mean dwell is
+  `Δlookup_queue_dwell_seconds_total / Δlookup_queue_dwell_count_total`.
+- **Metadata scheduler occupancy.** `active_metadata_jobs` is the tracked-job
+  total, retained under its existing name; `queued_metadata_jobs` is the ready
+  queue and `metadata_runnable_jobs` counts non-running jobs with pending peers.
+  `metadata_active_workers` counts network workers separately from tracked jobs.
+  The oldest tracked and ready ages expose starvation even when the tracked-job
+  gauge is full. Ready-queue mean wait is
+  `Δmetadata_ready_dwell_seconds_total / Δmetadata_ready_dwell_count_total`.
+- **Durable metadata backlog.** The statistics worker samples durable
+  `hash_jobs` status counts once per minute: queued, retry/cooldown, and
+  waiting-for-peers. `metadata_durable_due_jobs` counts only due jobs with at
+  least one peer, matching the retry loader's eligibility. The oldest-due age is
+  measured from the job's last durable state change (`updated_at`), because
+  immediate `next_attempt_at=0` rows do not carry a meaningful due timestamp.
+  These gauges retain their last successful sample; failures increment
+  `metadata_backlog_sample_errors_total` instead of being shown as zero backlog.
+  Compare `metadata_durable_due_jobs` with the tracked/runnable gauges to see
+  durable work deferred by in-memory capacity; the exact deferred subset is not
+  projected as a separate counter because tracked jobs and due rows can overlap.
 - **Metadata admission and retrieval outcomes.** Admission counters count each
   in-memory scheduler admission attempt, whether it arrives from a discovery
   delivery or from the 30-second retry-scan restore
@@ -238,6 +296,13 @@ rather than runtime labels, and no info hashes or peer addresses are logged.
   the transaction. Metadata completion upserts the job's terminal `complete`
   state even when no job row existed, and a later peer-bearing discovery never
   reopens a job for a torrent whose metadata is already complete.
+- **Baseline comparison.** The 6–13 November 2026 baseline (revision
+  `51932f58296f`) predates these unique-work, age, dwell, and scheduler-occupancy
+  fields. Compare only fields present in both revisions directly, and label the
+  first window that contains the new field set. Use `run_id` and UTC status
+  timestamps to align windows, cumulative deltas for counters, and the interval
+  fields for unique candidates. Do not treat the transition from a baseline
+  revision to a new revision as a change in workload by itself.
 - **Collection timing.** Crawler and metadata workers update the in-process
   metric registry, including critical counters, before any bounded
   statistics-channel send. Measurement therefore continues when the statistics
@@ -274,15 +339,17 @@ admission/retrieval, and database-persistence measurements in addition to the
 original RPC, metadata, and queue counters. Each `crawler_status` field maps to a
 bounded CamelCase OCI metric name, for example `discovery_observations_total` →
 `CrawlerDiscoveryObservations` and `peer_records_inserted_total` →
-`CrawlerPeerRecordsInserted`. `metadata_fetched_interval` is published directly as
-`CrawlerMetadataFetchedInterval` with `window_count` semantics. Crawler metrics
-carry only the `instance` and `service` dimensions. Web metrics additionally carry
-`route`, `status_class`, and `le`; OCI Monitoring dimensions overall remain
-limited to `instance`, `service`, `route`, `status_class`, and `le`. Metric
-metadata records `unit` and `semantics` (`gauge`, `interval_delta`,
-`window_count`, or `window_sum`). The exporter converts crawler cumulative
-counters to interval deltas using a stored `run_id` baseline; a new run starts at
-a zero delta rather than republishing reset counters.
+`CrawlerPeerRecordsInserted`. `metadata_fetched_interval` and the unique-candidate
+interval fields are published directly with `window_count` semantics. Crawler
+metrics carry only the `instance` and `service` dimensions. Web metrics
+additionally carry `route`, `status_class`, and `le`; OCI Monitoring dimensions
+overall remain limited to `instance`, `service`, `route`, `status_class`, and
+`le`. Metric metadata records `unit` (`count`, `seconds`, or `milliseconds`) and
+`semantics` (`gauge`, `interval_delta`, `window_count`, or `window_sum`). The
+exporter converts crawler cumulative counters to interval deltas using a stored
+`run_id` baseline; a new run starts at a zero delta rather than republishing reset
+counters. HyperLogLog estimates are published as their current value or interval
+estimate, not as exact counts.
 
 ### Volume controls
 

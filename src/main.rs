@@ -473,9 +473,39 @@ async fn run_stats_persistence(
     flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     flush_tick.tick().await;
     let mut receipt_tick = tokio::time::interval(Duration::from_secs(3600));
+    let mut backlog_tick = tokio::time::interval(Duration::from_secs(60));
+    backlog_tick.tick().await;
 
     loop {
         tokio::select! {
+            _ = backlog_tick.tick() => {
+                match tokio::time::timeout(Duration::from_secs(10), store.metadata_backlog()).await {
+                    Ok(Ok(backlog)) => metrics.set_metadata_durable_backlog(
+                        backlog.queued,
+                        backlog.retry_at,
+                        backlog.waiting_peers,
+                        backlog.due,
+                        backlog.oldest_due_age_seconds,
+                    ),
+                    Ok(Err(error)) => {
+                        metrics.record_metadata_backlog_error();
+                        tracing::warn!(
+                            event = "metadata_backlog_sample_failed",
+                            reason = "database",
+                            error = %error,
+                            "failed to sample durable metadata backlog"
+                        );
+                    }
+                    Err(_) => {
+                        metrics.record_metadata_backlog_error();
+                        tracing::warn!(
+                            event = "metadata_backlog_sample_failed",
+                            reason = "timeout",
+                            "durable metadata backlog sample timed out"
+                        );
+                    }
+                }
+            }
             _ = receipt_tick.tick() => {
                 if let Err(error) = store.prune_receipts().await {
                     metrics.record_persistence_error();

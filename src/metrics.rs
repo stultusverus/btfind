@@ -68,6 +68,79 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+const UNIQUE_PRECISION: u32 = 14;
+const UNIQUE_REGISTERS: usize = 1 << UNIQUE_PRECISION;
+
+struct UniqueSketch {
+    registers: Box<[u8]>,
+}
+
+impl Default for UniqueSketch {
+    fn default() -> Self {
+        Self {
+            registers: vec![0; UNIQUE_REGISTERS].into_boxed_slice(),
+        }
+    }
+}
+
+impl UniqueSketch {
+    fn insert(&mut self, info_hash: &crate::types::InfoHash) {
+        let hash = unique_hash(info_hash);
+        let index = (hash >> (64 - UNIQUE_PRECISION)) as usize;
+        let rank = ((hash << UNIQUE_PRECISION).leading_zeros() + 1) as u8;
+        if rank > self.registers[index] {
+            self.registers[index] = rank;
+        }
+    }
+
+    fn estimate(&self) -> u64 {
+        let registers = UNIQUE_REGISTERS as f64;
+        let alpha = 0.7213 / (1.0 + 1.079 / registers);
+        let sum: f64 = self
+            .registers
+            .iter()
+            .map(|register| 2f64.powi(-i32::from(*register)))
+            .sum();
+        let raw = alpha * registers * registers / sum;
+        let empty = self
+            .registers
+            .iter()
+            .filter(|register| **register == 0)
+            .count();
+        let estimate = if raw <= 2.5 * registers && empty > 0 {
+            registers * (registers / empty as f64).ln()
+        } else {
+            raw
+        };
+        estimate.round().clamp(0.0, u64::MAX as f64) as u64
+    }
+
+    fn reset(&mut self) {
+        self.registers.fill(0);
+    }
+}
+
+fn unique_hash(info_hash: &crate::types::InfoHash) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in info_hash {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash ^= hash >> 30;
+    hash = hash.wrapping_mul(0xbf58476d1ce4e5b9);
+    hash ^= hash >> 27;
+    hash = hash.wrapping_mul(0x94d049bb133111eb);
+    hash ^ (hash >> 31)
+}
+
+#[derive(Default)]
+struct DiscoveryUniqueness {
+    all: UniqueSketch,
+    peer_bearing: UniqueSketch,
+    interval_all: UniqueSketch,
+    interval_peer_bearing: UniqueSketch,
+}
+
 pub struct CrawlerMetrics {
     process_started_unix: i64,
     known_nodes: AtomicU64,
@@ -86,8 +159,28 @@ pub struct CrawlerMetrics {
     active_metadata_jobs: AtomicU64,
     queued_metadata_jobs: AtomicU64,
     pending_metadata_peers: AtomicU64,
+    metadata_runnable_jobs: AtomicU64,
+    metadata_active_workers: AtomicU64,
+    metadata_tracked_oldest_age_seconds: AtomicU64,
+    metadata_ready_oldest_age_seconds: AtomicU64,
+    pub(crate) metadata_ready_dwell_count: AtomicU64,
+    pub(crate) metadata_ready_dwell_seconds: AtomicU64,
+    pub(crate) metadata_ready_dwell_max_seconds: AtomicU64,
+    pub(crate) metadata_durable_queued_jobs: AtomicU64,
+    pub(crate) metadata_durable_retry_jobs: AtomicU64,
+    pub(crate) metadata_durable_waiting_peers_jobs: AtomicU64,
+    pub(crate) metadata_durable_due_jobs: AtomicU64,
+    pub(crate) metadata_durable_oldest_due_age_seconds: AtomicU64,
+    pub(crate) metadata_backlog_sample_errors: AtomicU64,
+    discovery_uniqueness: Mutex<DiscoveryUniqueness>,
     pub(crate) discovery_queue_depth: AtomicU64,
     pub(crate) discovery_queue_capacity: AtomicU64,
+    pub(crate) lookup_queue_oldest_age_seconds: AtomicU64,
+    pub(crate) lookup_queue_mean_age_seconds: AtomicU64,
+    pub(crate) lookup_queue_dwell_count: AtomicU64,
+    pub(crate) lookup_queue_dwell_seconds: AtomicU64,
+    pub(crate) lookup_queue_dwell_max_seconds: AtomicU64,
+    pub(crate) lookup_queue_requeued: AtomicU64,
     pub(crate) discovery_observations: AtomicU64,
     pub(crate) discovery_peer_bearing_observations: AtomicU64,
     pub(crate) discovery_peerless_observations: AtomicU64,
@@ -139,8 +232,28 @@ impl Default for CrawlerMetrics {
             active_metadata_jobs: AtomicU64::new(0),
             queued_metadata_jobs: AtomicU64::new(0),
             pending_metadata_peers: AtomicU64::new(0),
+            metadata_runnable_jobs: AtomicU64::new(0),
+            metadata_active_workers: AtomicU64::new(0),
+            metadata_tracked_oldest_age_seconds: AtomicU64::new(0),
+            metadata_ready_oldest_age_seconds: AtomicU64::new(0),
+            metadata_ready_dwell_count: AtomicU64::new(0),
+            metadata_ready_dwell_seconds: AtomicU64::new(0),
+            metadata_ready_dwell_max_seconds: AtomicU64::new(0),
+            metadata_durable_queued_jobs: AtomicU64::new(0),
+            metadata_durable_retry_jobs: AtomicU64::new(0),
+            metadata_durable_waiting_peers_jobs: AtomicU64::new(0),
+            metadata_durable_due_jobs: AtomicU64::new(0),
+            metadata_durable_oldest_due_age_seconds: AtomicU64::new(0),
+            metadata_backlog_sample_errors: AtomicU64::new(0),
+            discovery_uniqueness: Mutex::new(DiscoveryUniqueness::default()),
             discovery_queue_depth: AtomicU64::new(0),
             discovery_queue_capacity: AtomicU64::new(0),
+            lookup_queue_oldest_age_seconds: AtomicU64::new(0),
+            lookup_queue_mean_age_seconds: AtomicU64::new(0),
+            lookup_queue_dwell_count: AtomicU64::new(0),
+            lookup_queue_dwell_seconds: AtomicU64::new(0),
+            lookup_queue_dwell_max_seconds: AtomicU64::new(0),
+            lookup_queue_requeued: AtomicU64::new(0),
             discovery_observations: AtomicU64::new(0),
             discovery_peer_bearing_observations: AtomicU64::new(0),
             discovery_peerless_observations: AtomicU64::new(0),
@@ -214,16 +327,25 @@ impl CrawlerMetrics {
                 self.backpressure_events.fetch_add(1, Ordering::Relaxed);
             }
             CrawlStatsEvent::HashObserved {
+                info_hash,
                 source,
                 has_peers,
                 accepted,
                 peers,
-                ..
             } => {
                 self.hashes_discovered.fetch_add(1, Ordering::Relaxed);
                 self.discovery_observations.fetch_add(1, Ordering::Relaxed);
                 self.discovery_by_source[discovery_source_index(*source)]
                     .fetch_add(1, Ordering::Relaxed);
+                {
+                    let mut unique = lock(&self.discovery_uniqueness);
+                    unique.all.insert(info_hash);
+                    unique.interval_all.insert(info_hash);
+                    if *has_peers {
+                        unique.peer_bearing.insert(info_hash);
+                        unique.interval_peer_bearing.insert(info_hash);
+                    }
+                }
                 if *has_peers {
                     self.discovery_peer_bearing_observations
                         .fetch_add(1, Ordering::Relaxed);
@@ -252,6 +374,10 @@ impl CrawlerMetrics {
                 active_jobs,
                 queued_jobs,
                 pending_peers,
+                runnable_jobs,
+                active_workers,
+                tracked_oldest_age_seconds,
+                ready_oldest_age_seconds,
             } => {
                 self.active_metadata_jobs
                     .store(*active_jobs as u64, Ordering::Relaxed);
@@ -259,6 +385,14 @@ impl CrawlerMetrics {
                     .store(*queued_jobs as u64, Ordering::Relaxed);
                 self.pending_metadata_peers
                     .store(*pending_peers as u64, Ordering::Relaxed);
+                self.metadata_runnable_jobs
+                    .store(*runnable_jobs as u64, Ordering::Relaxed);
+                self.metadata_active_workers
+                    .store(*active_workers as u64, Ordering::Relaxed);
+                self.metadata_tracked_oldest_age_seconds
+                    .store(*tracked_oldest_age_seconds, Ordering::Relaxed);
+                self.metadata_ready_oldest_age_seconds
+                    .store(*ready_oldest_age_seconds, Ordering::Relaxed);
             }
             CrawlStatsEvent::DhtNodeSeen { .. } | CrawlStatsEvent::SampleObserved { .. } => {}
         }
@@ -276,6 +410,76 @@ impl CrawlerMetrics {
     pub fn set_discovery_queue_depth(&self, depth: usize) {
         self.discovery_queue_depth
             .store(depth as u64, Ordering::Relaxed);
+    }
+
+    pub fn set_lookup_queue_ages(&self, oldest: Duration, mean: Duration) {
+        self.lookup_queue_oldest_age_seconds
+            .store(oldest.as_secs(), Ordering::Relaxed);
+        self.lookup_queue_mean_age_seconds
+            .store(mean.as_secs(), Ordering::Relaxed);
+    }
+
+    pub fn record_lookup_queue_dwell(&self, elapsed: Duration) {
+        let seconds = elapsed.as_secs();
+        self.lookup_queue_dwell_count
+            .fetch_add(1, Ordering::Relaxed);
+        self.lookup_queue_dwell_seconds
+            .fetch_add(seconds, Ordering::Relaxed);
+        self.lookup_queue_dwell_max_seconds
+            .fetch_max(seconds, Ordering::Relaxed);
+    }
+
+    pub fn record_lookup_queue_requeued(&self) {
+        self.lookup_queue_requeued.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_metadata_ready_dwell(&self, elapsed: Duration) {
+        let seconds = elapsed.as_secs();
+        self.metadata_ready_dwell_count
+            .fetch_add(1, Ordering::Relaxed);
+        self.metadata_ready_dwell_seconds
+            .fetch_add(seconds, Ordering::Relaxed);
+        self.metadata_ready_dwell_max_seconds
+            .fetch_max(seconds, Ordering::Relaxed);
+    }
+
+    pub fn set_metadata_durable_backlog(
+        &self,
+        queued: u64,
+        retry_at: u64,
+        waiting_peers: u64,
+        due: u64,
+        oldest_due_age_seconds: u64,
+    ) {
+        self.metadata_durable_queued_jobs
+            .store(queued, Ordering::Relaxed);
+        self.metadata_durable_retry_jobs
+            .store(retry_at, Ordering::Relaxed);
+        self.metadata_durable_waiting_peers_jobs
+            .store(waiting_peers, Ordering::Relaxed);
+        self.metadata_durable_due_jobs.store(due, Ordering::Relaxed);
+        self.metadata_durable_oldest_due_age_seconds
+            .store(oldest_due_age_seconds, Ordering::Relaxed);
+    }
+
+    pub fn record_metadata_backlog_error(&self) {
+        self.metadata_backlog_sample_errors
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn unique_estimates(&self, reset_interval: bool) -> (u64, u64, u64, u64) {
+        let mut unique = lock(&self.discovery_uniqueness);
+        let estimates = (
+            unique.all.estimate(),
+            unique.peer_bearing.estimate(),
+            unique.interval_all.estimate(),
+            unique.interval_peer_bearing.estimate(),
+        );
+        if reset_interval {
+            unique.interval_all.reset();
+            unique.interval_peer_bearing.reset();
+        }
+        estimates
     }
 
     pub fn record_lookup_queue_accepted(&self) {
@@ -374,6 +578,12 @@ impl CrawlerMetrics {
     pub fn emit(&self, final_snapshot: bool) {
         let metadata_fetched = self.metadata_fetched.load(Ordering::Relaxed);
         let metadata_fetched_interval = self.metadata_fetched_interval(metadata_fetched);
+        let (
+            discovery_unique_candidates,
+            discovery_unique_peer_bearing_candidates,
+            discovery_unique_candidates_interval,
+            discovery_unique_peer_bearing_candidates_interval,
+        ) = self.unique_estimates(true);
         tracing::info!(
             event = "crawler_status",
             final_snapshot = final_snapshot,
@@ -397,9 +607,42 @@ impl CrawlerMetrics {
             active_metadata_jobs = self.active_metadata_jobs.load(Ordering::Relaxed),
             queued_metadata_jobs = self.queued_metadata_jobs.load(Ordering::Relaxed),
             pending_metadata_peers = self.pending_metadata_peers.load(Ordering::Relaxed),
+            metadata_runnable_jobs = self.metadata_runnable_jobs.load(Ordering::Relaxed),
+            metadata_active_workers = self.metadata_active_workers.load(Ordering::Relaxed),
+            metadata_tracked_oldest_age_seconds = self
+                .metadata_tracked_oldest_age_seconds
+                .load(Ordering::Relaxed),
+            metadata_ready_oldest_age_seconds = self
+                .metadata_ready_oldest_age_seconds
+                .load(Ordering::Relaxed),
+            metadata_ready_dwell_count_total =
+                self.metadata_ready_dwell_count.load(Ordering::Relaxed),
+            metadata_ready_dwell_seconds_total =
+                self.metadata_ready_dwell_seconds.load(Ordering::Relaxed),
+            metadata_ready_dwell_max_seconds = self
+                .metadata_ready_dwell_max_seconds
+                .load(Ordering::Relaxed),
+            metadata_durable_queued_jobs =
+                self.metadata_durable_queued_jobs.load(Ordering::Relaxed),
+            metadata_durable_retry_jobs = self.metadata_durable_retry_jobs.load(Ordering::Relaxed),
+            metadata_durable_waiting_peers_jobs = self
+                .metadata_durable_waiting_peers_jobs
+                .load(Ordering::Relaxed),
+            metadata_durable_due_jobs = self.metadata_durable_due_jobs.load(Ordering::Relaxed),
+            metadata_durable_oldest_due_age_seconds = self
+                .metadata_durable_oldest_due_age_seconds
+                .load(Ordering::Relaxed),
+            metadata_backlog_sample_errors_total =
+                self.metadata_backlog_sample_errors.load(Ordering::Relaxed),
             discovery_queue_depth = self.discovery_queue_depth.load(Ordering::Relaxed),
             discovery_queue_capacity = self.discovery_queue_capacity.load(Ordering::Relaxed),
             discovery_observations_total = self.discovery_observations.load(Ordering::Relaxed),
+            discovery_unique_candidates_total = discovery_unique_candidates,
+            discovery_unique_peer_bearing_candidates_total =
+                discovery_unique_peer_bearing_candidates,
+            discovery_unique_candidates_interval = discovery_unique_candidates_interval,
+            discovery_unique_peer_bearing_candidates_interval =
+                discovery_unique_peer_bearing_candidates_interval,
             discovery_peer_bearing_observations_total = self
                 .discovery_peer_bearing_observations
                 .load(Ordering::Relaxed),
@@ -426,6 +669,16 @@ impl CrawlerMetrics {
             lookup_queue_duplicate_total = self.lookup_queue_duplicate.load(Ordering::Relaxed),
             lookup_queue_capacity_rejected_total =
                 self.lookup_queue_capacity_rejected.load(Ordering::Relaxed),
+            lookup_queue_oldest_age_seconds =
+                self.lookup_queue_oldest_age_seconds.load(Ordering::Relaxed),
+            lookup_queue_mean_age_seconds =
+                self.lookup_queue_mean_age_seconds.load(Ordering::Relaxed),
+            lookup_queue_dwell_count_total = self.lookup_queue_dwell_count.load(Ordering::Relaxed),
+            lookup_queue_dwell_seconds_total =
+                self.lookup_queue_dwell_seconds.load(Ordering::Relaxed),
+            lookup_queue_dwell_max_seconds =
+                self.lookup_queue_dwell_max_seconds.load(Ordering::Relaxed),
+            lookup_queue_requeued_total = self.lookup_queue_requeued.load(Ordering::Relaxed),
             real_lookups_initiated_total = self.real_lookups_initiated.load(Ordering::Relaxed),
             real_lookups_succeeded_total = self.real_lookups_succeeded.load(Ordering::Relaxed),
             real_lookups_failed_total = self.real_lookups_failed.load(Ordering::Relaxed),
@@ -754,6 +1007,10 @@ mod tests {
             active_jobs: 2,
             queued_jobs: 3,
             pending_peers: 4,
+            runnable_jobs: 3,
+            active_workers: 1,
+            tracked_oldest_age_seconds: 5,
+            ready_oldest_age_seconds: 2,
         });
         metrics.record_persistence_error();
         assert_eq!(metrics.known_nodes.load(Ordering::Relaxed), 12);
@@ -764,6 +1021,20 @@ mod tests {
         assert_eq!(metrics.active_metadata_jobs.load(Ordering::Relaxed), 2);
         assert_eq!(metrics.queued_metadata_jobs.load(Ordering::Relaxed), 3);
         assert_eq!(metrics.pending_metadata_peers.load(Ordering::Relaxed), 4);
+        assert_eq!(metrics.metadata_runnable_jobs.load(Ordering::Relaxed), 3);
+        assert_eq!(metrics.metadata_active_workers.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            metrics
+                .metadata_tracked_oldest_age_seconds
+                .load(Ordering::Relaxed),
+            5
+        );
+        assert_eq!(
+            metrics
+                .metadata_ready_oldest_age_seconds
+                .load(Ordering::Relaxed),
+            2
+        );
         assert_eq!(metrics.persistence_errors.load(Ordering::Relaxed), 1);
     }
 
@@ -830,6 +1101,129 @@ mod tests {
         assert_eq!(metrics.discovery_by_source[2].load(Ordering::Relaxed), 0);
         assert_eq!(metrics.discovery_by_source[3].load(Ordering::Relaxed), 1);
         assert_eq!(metrics.discovery_by_source[4].load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn unique_candidate_estimates_ignore_repeated_observations() {
+        let metrics = CrawlerMetrics::default();
+        for _ in 0..5 {
+            metrics.apply(&CrawlStatsEvent::HashObserved {
+                info_hash: [1; 20],
+                source: DiscoverySource::AnnouncePeer,
+                has_peers: true,
+                accepted: true,
+                peers: 1,
+            });
+        }
+        metrics.apply(&CrawlStatsEvent::HashObserved {
+            info_hash: [2; 20],
+            source: DiscoverySource::InboundGetPeers,
+            has_peers: false,
+            accepted: true,
+            peers: 0,
+        });
+        let (all, peer_bearing, interval_all, interval_peer_bearing) =
+            metrics.unique_estimates(true);
+        assert_eq!(all, 2);
+        assert_eq!(peer_bearing, 1);
+        assert_eq!(interval_all, 2);
+        assert_eq!(interval_peer_bearing, 1);
+        let (_, _, interval_all, interval_peer_bearing) = metrics.unique_estimates(false);
+        assert_eq!(interval_all, 0);
+        assert_eq!(interval_peer_bearing, 0);
+    }
+
+    #[test]
+    fn unique_sketch_has_bounded_error_for_large_sets() {
+        let mut sketch = UniqueSketch::default();
+        for value in 0..10_000u32 {
+            let mut info_hash = [0; 20];
+            info_hash[..4].copy_from_slice(&value.to_be_bytes());
+            sketch.insert(&info_hash);
+        }
+        let estimate = sketch.estimate();
+        assert!(
+            (9_000..=11_000).contains(&estimate),
+            "unexpected estimate: {estimate}"
+        );
+    }
+
+    #[test]
+    fn lookup_and_metadata_age_helpers_store_bounded_values() {
+        let metrics = CrawlerMetrics::default();
+        metrics.set_lookup_queue_ages(Duration::from_secs(30), Duration::from_secs(12));
+        metrics.record_lookup_queue_dwell(Duration::from_secs(7));
+        metrics.record_lookup_queue_dwell(Duration::from_secs(3));
+        metrics.record_lookup_queue_requeued();
+        metrics.record_metadata_ready_dwell(Duration::from_secs(9));
+        metrics.record_metadata_ready_dwell(Duration::from_secs(4));
+        metrics.set_metadata_durable_backlog(5, 6, 7, 8, 9);
+        metrics.record_metadata_backlog_error();
+        assert_eq!(
+            metrics
+                .lookup_queue_oldest_age_seconds
+                .load(Ordering::Relaxed),
+            30
+        );
+        assert_eq!(
+            metrics
+                .lookup_queue_mean_age_seconds
+                .load(Ordering::Relaxed),
+            12
+        );
+        assert_eq!(metrics.lookup_queue_dwell_count.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            metrics.lookup_queue_dwell_seconds.load(Ordering::Relaxed),
+            10
+        );
+        assert_eq!(
+            metrics
+                .lookup_queue_dwell_max_seconds
+                .load(Ordering::Relaxed),
+            7
+        );
+        assert_eq!(metrics.lookup_queue_requeued.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            metrics.metadata_ready_dwell_count.load(Ordering::Relaxed),
+            2
+        );
+        assert_eq!(
+            metrics.metadata_ready_dwell_seconds.load(Ordering::Relaxed),
+            13
+        );
+        assert_eq!(
+            metrics
+                .metadata_ready_dwell_max_seconds
+                .load(Ordering::Relaxed),
+            9
+        );
+        assert_eq!(
+            metrics.metadata_durable_queued_jobs.load(Ordering::Relaxed),
+            5
+        );
+        assert_eq!(
+            metrics.metadata_durable_retry_jobs.load(Ordering::Relaxed),
+            6
+        );
+        assert_eq!(
+            metrics
+                .metadata_durable_waiting_peers_jobs
+                .load(Ordering::Relaxed),
+            7
+        );
+        assert_eq!(metrics.metadata_durable_due_jobs.load(Ordering::Relaxed), 8);
+        assert_eq!(
+            metrics
+                .metadata_durable_oldest_due_age_seconds
+                .load(Ordering::Relaxed),
+            9
+        );
+        assert_eq!(
+            metrics
+                .metadata_backlog_sample_errors
+                .load(Ordering::Relaxed),
+            1
+        );
     }
 
     #[test]

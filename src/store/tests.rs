@@ -1276,6 +1276,64 @@ async fn mysql_discovery_receipt_replay_returns_committed_counts() {
 
 #[tokio::test]
 #[ignore = "requires BTFIND_TEST_DATABASE_URL; run scripts/test-mysql.sh"]
+async fn mysql_metadata_backlog_separates_status_and_due_work() {
+    let store = Store::open_test_database().await.unwrap();
+    let peer = PeerContact {
+        addr: "8.8.8.8:6881".parse().unwrap(),
+    };
+    let hashes = [[201u8; 20], [202u8; 20], [203u8; 20], [204u8; 20]];
+    for hash in hashes {
+        store
+            .persist_hash_discovery(&hash, "test", std::slice::from_ref(&peer), 8)
+            .await
+            .unwrap();
+    }
+    let stamp = now();
+    sqlx::query(
+        "UPDATE hash_jobs SET status='queued',next_attempt_at=?,updated_at=? WHERE info_hash=?",
+    )
+    .bind(stamp - 30)
+    .bind(stamp - 30)
+    .bind(hex::encode(hashes[0]))
+    .execute(&store.pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE hash_jobs SET status='retry_at',next_attempt_at=? WHERE info_hash=?")
+        .bind(stamp + 3600)
+        .bind(hex::encode(hashes[1]))
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE hash_jobs SET status='waiting_peers',next_attempt_at=0 WHERE info_hash=?")
+        .bind(hex::encode(hashes[2]))
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE hash_jobs SET status='queued',next_attempt_at=0 WHERE info_hash=?")
+        .bind(hex::encode(hashes[3]))
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM hash_job_peers WHERE info_hash=?")
+        .bind(hex::encode(hashes[3]))
+        .execute(&store.pool)
+        .await
+        .unwrap();
+
+    let backlog = store.metadata_backlog().await.unwrap();
+    assert_eq!(backlog.queued, 2);
+    assert_eq!(backlog.retry_at, 1);
+    assert_eq!(backlog.waiting_peers, 1);
+    assert_eq!(backlog.due, 1);
+    assert!(
+        backlog.oldest_due_age_seconds >= 30,
+        "oldest due age was {}",
+        backlog.oldest_due_age_seconds
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires BTFIND_TEST_DATABASE_URL; run scripts/test-mysql.sh"]
 async fn mysql_repeated_identical_discovery_does_not_report_job_creation() {
     let store = Store::open_test_database().await.unwrap();
     let peer = PeerContact {
