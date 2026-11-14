@@ -13,6 +13,9 @@ use std::{
 use futures_util::TryStreamExt;
 use unicode_normalization::UnicodeNormalization;
 
+mod expiry;
+pub use expiry::{ExpiryCursor, ExpiryPolicy, ExpiryReport};
+
 pub type Error = sqlx::Error;
 pub fn invalid(message: impl Into<String>) -> Error {
     Error::Protocol(message.into())
@@ -697,34 +700,6 @@ impl Store {
         )
         .fetch_all(&self.pool)
         .await
-    }
-    pub async fn prune_old_torrents(&self, days: i64) -> Result<i64, Error> {
-        let cutoff = now().saturating_sub(days.saturating_mul(86400));
-        let mut total = 0;
-        loop {
-            let mut tx = self.pool.begin().await?;
-            lock_totals(&mut tx).await?;
-            let rows=sqlx::query("SELECT info_hash,total_size,metadata_complete FROM torrents WHERE last_seen<? ORDER BY last_seen,info_hash LIMIT 128 FOR UPDATE").bind(cutoff).fetch_all(&mut *tx).await?;
-            if rows.is_empty() {
-                tx.rollback().await?;
-                return Ok(total);
-            }
-            for r in rows {
-                let h: String = r.try_get("info_hash")?;
-                let files = sqlx::query("DELETE FROM files WHERE torrent_id=?")
-                    .bind(&h)
-                    .execute(&mut *tx)
-                    .await?
-                    .rows_affected() as i64;
-                sqlx::query("DELETE FROM torrents WHERE info_hash=?")
-                    .bind(&h)
-                    .execute(&mut *tx)
-                    .await?;
-                sqlx::query("UPDATE catalog_totals SET total_torrents=total_torrents-1,total_metadata_complete=total_metadata_complete-?,total_files=total_files-?,total_size=total_size-? WHERE id=1").bind(i64::from(r.try_get::<bool,_>("metadata_complete")?)).bind(files).bind(r.try_get::<i64,_>("total_size")?).execute(&mut *tx).await?;
-                total += 1;
-            }
-            tx.commit().await?;
-        }
     }
     pub async fn search_torrents(
         &self,

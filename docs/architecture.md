@@ -133,6 +133,19 @@ rerun. See the README for exact limits and memory behavior. Rebuilds, schema mig
 require stopped services and never run within HTTP requests. After a logical
 restore, `db analyze` refreshes optimizer/full-text statistics.
 
+## Incomplete catalog retention
+
+`btfind prune` previews bounded age/inactivity expiry of empty incomplete hashes.
+It requires owner-selected sighting and activity periods; deletion also requires
+an explicit maintenance assertion with services stopped. Completed metadata,
+file/search content, recent activity and peer-bearing queued/retry jobs are
+retained. Indexed keyset scans have per-batch and per-invocation bounds and a
+resume cursor. Apply batches lock totals before torrent rows and atomically
+cascade deletion and decrement catalog counts. No automatic expiry is scheduled.
+`btfind db storage [--physical]` reports estimated table usage and optional physical
+tablespace allocation. See [retention](retention.md) for measured storage growth,
+eligibility, restart, recovery and space-reuse constraints.
+
 ## Verification
 
 `cargo test` runs offline tests; database integration tests are explicitly ignored

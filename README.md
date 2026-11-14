@@ -26,8 +26,8 @@ btfind search    Search collected torrents
 btfind magnet    Print a magnet URI for an info hash
 btfind stats     Show crawler statistics
 btfind serve     Start local HTTP API/dashboard
-btfind prune     Remove old torrents
-btfind db        Migrate/check schema, rebuild search, reconcile statistics, analyze
+btfind prune     Preview/expire inactive metadata-incomplete torrents
+btfind db        Schema/search maintenance and storage attribution
 ```
 
 ### btfind run
@@ -95,9 +95,24 @@ and metadata failure counts.
 ### btfind prune
 
 ```bash
-# Remove torrents not seen in 90 days
-btfind prune --older-than 90
+# Preview a bounded scan with owner-selected retention periods
+btfind prune --older-than "$SIGHTING_DAYS" --inactive-for "$ACTIVITY_DAYS"
+
+# Apply only in an approved maintenance window, after stopping both services
+btfind prune --older-than "$SIGHTING_DAYS" --inactive-for "$ACTIVITY_DAYS" \
+  --apply --services-stopped
+
+# Attribute estimated table usage and physical allocation (requires PROCESS)
+btfind db storage --physical
 ```
+
+Both retention periods are required; there is no automatic expiry schedule or
+default age. `prune` now preserves completed metadata, file/search content,
+recent activity and peer-bearing queued/retry work. Preview is the default.
+Each invocation examines at most `--batch-size` (128 by default, maximum 500)
+times `--max-batches` (10 by default, maximum 10000) old incomplete rows.
+JSON output includes candidate/deletion counts and `next_cursor` for `--after`.
+See [retention controls and storage evidence](docs/retention.md) before applying.
 
 ## HTTP API
 
