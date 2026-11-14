@@ -550,6 +550,182 @@ for `ap-osaka-1`, `vm-sub01`, batching, lookback, and the freshness cutoff.
   crawler summaries still advance the counter baseline. No API call is made when a
   scanned batch has no summary events.
 
+## Querying ingested logs
+
+Successful `put_logs` ingestion does not by itself make the records readable by
+an operator principal. Logging Search is a separate OCI API with its own endpoint
+and authorization, so a healthy exporter can coexist with failing operator
+queries. Ingestion health and search access must be checked independently.
+
+### Log stream scope
+
+A Logging Search query must begin with a log-stream path that is rooted at a
+compartment. Log groups and custom logs are optional path components, not
+standalone scopes:
+
+```text
+search "<compartment-ocid>"
+search "<compartment-ocid>/<log-group-name-or-ocid>"
+search "<compartment-ocid>/<log-group-name-or-ocid>/<log-name-or-ocid>"
+```
+
+The production deployment ingests into log group `btfind-production` in the
+tenancy root compartment, with custom logs `btfind-crawler` and `btfind-web`.
+Pass `--region ap-osaka-1`, the tenancy's home region; the Logging Search
+endpoint is region-specific. Path components after the compartment may be
+names or OCIDs; the production log group is in the tenancy root compartment, so
+the compartment OCID is the tenancy OCID (`OCI_METRICS_COMPARTMENT_OCID` in
+`/etc/btfind/observability.env`).
+
+A bare log-group OCID or custom-log OCID is not a valid log stream. OCI rejects
+it with HTTP 404 `NotAuthorizedOrNotFound`, the same code returned for a missing
+resource and for a principal without permission, so the response alone cannot
+distinguish a scope mistake from an authorization gap. Rooting the query at the
+compartment is the difference between a 404 and the records that are present in
+Logging.
+
+### Required IAM policy
+
+OCI documents Logging Search access as `read` on log content plus read access to
+the log group. A least-privilege operator group for this tenancy would use:
+
+```text
+Allow group btfind-operators to read log-groups in tenancy
+Allow group btfind-operators to read log-content in tenancy
+```
+
+Compartment-scoped statements are equivalent when the log group lives in a
+subcompartment. These policies are administered outside this repository; the
+infrastructure stage creates the logging resources and their ingestion policy
+only.
+
+The exporter's instance-principal policy grants `use log-content` to
+`dynamic-group btfind-observability` for ingestion and `use metrics` for
+Monitoring. That dynamic group cannot be assumed from an operator workstation or
+API-key profile. Tenancy administrators can search because of the tenant admin
+policy; a dedicated group keeps that access least-privilege. Searching does not
+require Monitoring access, and reading Monitoring metrics does not grant log
+content access.
+
+### Repeatable queries
+
+`scripts/oci-log-search.sh` builds the compartment-rooted path, region, and a
+bounded time window, so it cannot repeat the bare-OCID scope mistake. Only the
+compartment OCID is required; the helper defaults to the production log group
+and custom-log names and accepts OCIDs for those components as well:
+
+```bash
+export OCI_COMPARTMENT_OCID='<tenancy or compartment OCID>'
+
+./scripts/oci-log-search.sh --service crawler --recent 5
+./scripts/oci-log-search.sh --service web --count --since-hours 24
+./scripts/oci-log-search.sh --service crawler --per-day --since-hours 336
+
+# Optional path-component overrides; each may be a name or an OCID.
+export BTFIND_LOG_GROUP='btfind-production'
+export BTFIND_CRAWLER_LOG='btfind-crawler'
+export BTFIND_WEB_LOG='btfind-web'
+```
+
+The same queries without the helper, using epoch seconds so the commands work on
+both macOS and Oracle Linux:
+
+```bash
+C='<compartment-ocid>'
+NOW=$(date -u +%s); START=$((NOW - 3600))
+oci logging-search search-logs --region ap-osaka-1 \
+  --search-query "search \"$C/btfind-production/btfind-crawler\" | where data.fields.event = 'crawler_status' | sort by datetime desc" \
+  --time-start "$START" --time-end "$NOW" --limit 5 --output json
+```
+
+Application JSON is nested under `data` and event fields under `data.fields`;
+field names are case-sensitive (`data.Fields.event` matches nothing). Useful
+fields and operators:
+
+```text
+data.fields.event, data.fields.message, data.service, data.timestamp
+datetime                                # event timestamp, epoch milliseconds
+| count                                 # number of matching records
+| summarize count() as count by rounddown(datetime, '1d') as day
+| sort by datetime desc
+| top 5 by datetime desc
+| select datetime, data.fields.event as event, data.fields.message as message
+```
+
+A single query can cover at most 14 days; a wider `--time-start`/`--time-end`
+fails with HTTP 400 `InvalidParameter` ("Period between start time and end time
+cannot be more than 14 days"). This is a per-query range limit, not an absolute
+lookback. Custom-log retention is 30 days, so older history is reachable through
+consecutive windows of 14 days or less. journald on the host retains about three
+days. A healthy service emits one status record per minute, 1,440 per service per
+full UTC day; a short day usually means a process restart rather than a search or
+ingestion fault.
+
+### Verifying ingestion independently of Logging Search
+
+Three checks do not depend on `read log-content`:
+
+1. **Exporter state and diagnostics.** On the host:
+
+   ```bash
+   sudo journalctl -t btfind-observability -o cat |
+     grep -E '"event":"(export_completed|log_batch_committed)"' | tail
+   sudo cat /var/lib/btfind-observability/state.json
+   ```
+
+   A successful pass has `export_completed` with `"failed_streams":[]`, recent
+   `log_batch_committed` diagnostics, a recent `logs.last_success_unix`, and no
+   `logs.gaps` entries. A missing recent success is an exporter or OCI ingestion
+   problem, not a Logging Search problem.
+
+2. **OCI Logging service metrics.** OCI Monitoring publishes the `oci_logging`
+   namespace separately from custom application metrics. `BytesIngested` is
+   reported per log object and `CustomLogAcceptanceRate` per tenancy:
+
+   ```bash
+   NOW=$(date -u +%s); START=$((NOW - 86400))
+   oci monitoring metric-data summarize-metrics-data --region ap-osaka-1 \
+     --compartment-id '<tenancy-ocid>' --namespace oci_logging \
+     --query-text "BytesIngested[1h].sum()" \
+     --start-time "$START" --end-time "$NOW" --output json
+   ```
+
+   Continuous non-zero values prove that OCI accepted exporter batches even when
+   search is unavailable to the operator. This requires Monitoring read access,
+   not log content access.
+
+3. **Host journal.** The retained status records are visible locally:
+
+   ```bash
+   sudo journalctl _SYSTEMD_USER_UNIT=btfind.service -o cat |
+     grep -c crawler_status
+   sudo journalctl _SYSTEMD_USER_UNIT=btfind-web.service -o cat |
+     grep -c web_status
+   ```
+
+   Counts are limited by the three-day journald retention, so compare the same
+   window when cross-checking Logging Search results.
+
+If journald, the exporter diagnostics, and `oci_logging` metrics all agree while
+Logging Search returns 404 or no rows, the fault is in search scoping or
+authorization rather than ingestion. Search access is independent of the
+exporter's cursors: do not reset `/var/lib/btfind-observability/state.json`,
+restart or re-enable the timer, or replay journald history to repair a scope or
+permission fault. Those actions would discard at-least-once delivery state
+without affecting search authorization, and the existing resources, checkpoints,
+Monitoring datapoints, and running services must be preserved.
+
+### Distinguishing search faults from ingestion faults
+
+| Observation | Likely cause | Read-only check |
+| --- | --- | --- |
+| 404 `NotAuthorizedOrNotFound` | Scope is not a valid log stream (bare log-group/log OCID, wrong compartment), or the principal lacks `read log-content`/`read log-groups`. OCI does not disclose which. | Confirm the OCIDs with `oci logging log-group list --compartment-id ...` and `oci logging log list --log-group-id ...`; retry with the compartment-rooted path; then check the policy statements. |
+| 400 `InvalidParameter` | Query window longer than 14 days, or an invalid time value. | Split into windows of 14 days or less. |
+| 400 `CannotParseRequest` | Logging query language error: malformed syntax or an unsupported operator/function. | Compare with the examples above; counting uses `\| count`, not `stats`. |
+| 401 `NotAuthenticated` | CLI profile, API key, or region does not match the tenancy. | `oci iam region-subscription list` should show `ap-osaka-1` as the home region and `READY`; pass `--region ap-osaka-1`. |
+| Empty result for a valid scope | Wrong event field path (field names are case-sensitive), wrong time window, or the window predates searchable retention. | Search the scope without a filter and inspect the newest record; run the independent ingestion checks. |
+| Records stop before the requested end time | Ingestion or exporter failure, or application downtime. | Run the independent ingestion checks and compare with the host journal. |
+
 ## Resource expectations
 
 On the 1 GiB E2.1.Micro host, the Rust additions are in-memory atomics and one
@@ -565,4 +741,7 @@ required.
 - [OCI Logging ingestion Python API](https://docs.oracle.com/en-us/iaas/tools/python/latest/api/loggingingestion.html)
 - [OCI `put_logs` example](https://docs.oracle.com/en-us/iaas/tools/python-sdk-examples/latest/loggingingestion/put_logs.py.html)
 - [OCI `post_metric_data` example](https://docs.oracle.com/en-us/iaas/tools/python-sdk-examples/latest/monitoring/post_metric_data.py.html)
+- [OCI Logging Search](https://docs.oracle.com/en-us/iaas/Content/Logging/Concepts/searchinglogs.htm)
+- [Logging query language specification](https://docs.oracle.com/en-us/iaas/Content/Logging/Reference/query_language_specification.htm)
+- [Details for Logging policy](https://docs.oracle.com/en-us/iaas/Content/Identity/policyreference/loggingpolicyreference.htm)
 - [journalctl manual](https://www.freedesktop.org/software/systemd/man/journalctl.html)
