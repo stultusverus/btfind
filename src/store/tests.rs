@@ -2,6 +2,274 @@ use super::*;
 
 #[tokio::test]
 #[ignore = "requires BTFIND_TEST_DATABASE_URL; run scripts/test-mysql.sh"]
+async fn mysql_incomplete_expiry_rechecks_changes_after_preview() {
+    let store = Store::open_test_database().await.unwrap();
+    for hash in [[91; 20], [92; 20], [93; 20]] {
+        store
+            .persist_hash_discovery(&hash, "dht", &[], 64)
+            .await
+            .unwrap();
+    }
+    sqlx::query("UPDATE torrents SET last_seen=1")
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    let policy = ExpiryPolicy::new(30, 7, 128, 10).unwrap();
+    assert_eq!(
+        store
+            .expire_incomplete(&policy, None, false)
+            .await
+            .unwrap()
+            .candidates,
+        3
+    );
+    store
+        .commit_metadata(
+            &[91; 20],
+            "retained title",
+            1,
+            42,
+            &[("retained/file.txt".into(), 42)],
+        )
+        .await
+        .unwrap();
+    store
+        .persist_hash_discovery(&[92; 20], "dht", &[], 64)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .expire_incomplete(&policy, None, true)
+            .await
+            .unwrap()
+            .deleted,
+        1
+    );
+    assert_eq!(
+        store
+            .expire_incomplete(&policy, None, true)
+            .await
+            .unwrap()
+            .deleted,
+        0
+    );
+    assert!(
+        store
+            .get_torrent(&[91; 20])
+            .await
+            .unwrap()
+            .unwrap()
+            .metadata_complete
+    );
+    assert!(store.get_torrent(&[92; 20]).await.unwrap().is_some());
+    assert!(store.get_torrent(&[93; 20]).await.unwrap().is_none());
+    assert_eq!(
+        store
+            .search_torrents("retained", 10, "rank")
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    let before = store.get_stats().await.unwrap();
+    assert_eq!(
+        (
+            before.total_torrents,
+            before.total_metadata_complete,
+            before.total_files,
+            before.total_size
+        ),
+        (2, 1, 1, 42)
+    );
+    store.reconcile().await.unwrap();
+    assert_eq!(store.get_stats().await.unwrap(), before);
+}
+
+#[tokio::test]
+#[ignore = "requires BTFIND_TEST_DATABASE_URL; run scripts/test-mysql.sh"]
+async fn mysql_incomplete_expiry_eligibility_and_rediscovery() {
+    let store = Store::open_test_database().await.unwrap();
+    let policy = ExpiryPolicy {
+        last_seen_before: 100,
+        inactive_before: 200,
+        started_at: 300,
+        batch_size: 4,
+        max_batches: 100,
+    };
+    let cases = [
+        ("peerless", "", true),
+        ("waiting with stale state", "INSERT INTO hash_jobs(info_hash,status,updated_at) VALUES ('$h','waiting_peers',1); INSERT INTO hash_job_peers VALUES ('$h','127.0.0.1:1',1); INSERT INTO metadata_peer_attempts VALUES ('$h','127.0.0.1:1',1,'timeout'); INSERT INTO sample_observations(info_hash,first_seen,last_seen) VALUES ('$h',1,1)", true),
+        ("invalid", "INSERT INTO hash_jobs(info_hash,status,updated_at) VALUES ('$h','invalid',1)", true),
+        ("unsupported", "INSERT INTO hash_jobs(info_hash,status,updated_at) VALUES ('$h','unsupported',1); INSERT INTO hash_job_peers VALUES ('$h','127.0.0.1:1',1)", true),
+        ("queued without peers", "INSERT INTO hash_jobs(info_hash,status,updated_at) VALUES ('$h','queued',1)", true),
+        ("overdue without peers", "INSERT INTO hash_jobs(info_hash,status,updated_at,next_attempt_at) VALUES ('$h','retry_at',1,1)", true),
+        ("queued with old peers", "INSERT INTO hash_jobs(info_hash,status,updated_at) VALUES ('$h','queued',1); INSERT INTO hash_job_peers VALUES ('$h','127.0.0.1:1',1)", false),
+        ("retry with old peers", "INSERT INTO hash_jobs(info_hash,status,updated_at) VALUES ('$h','retry_at',1); INSERT INTO hash_job_peers VALUES ('$h','127.0.0.1:1',1)", false),
+        ("future retry", "INSERT INTO hash_jobs(info_hash,status,updated_at,next_attempt_at) VALUES ('$h','retry_at',1,300)", false),
+        ("recent sighting boundary", "UPDATE torrents SET last_seen=100 WHERE info_hash='$h'", false),
+        ("recent attempt boundary", "UPDATE torrents SET last_attempt=200 WHERE info_hash='$h'", false),
+        ("recent job boundary", "INSERT INTO hash_jobs(info_hash,status,updated_at) VALUES ('$h','waiting_peers',200)", false),
+        ("recent new peer boundary", "INSERT INTO hash_jobs(info_hash,status,updated_at,last_new_peer_at) VALUES ('$h','waiting_peers',1,200)", false),
+        ("complete metadata", "UPDATE torrents SET metadata_complete=1 WHERE info_hash='$h'", false),
+        ("complete job", "INSERT INTO hash_jobs(info_hash,status,updated_at) VALUES ('$h','complete',1)", false),
+        ("unknown job status", "INSERT INTO hash_jobs(info_hash,status,updated_at) VALUES ('$h','running',1)", false),
+        ("name", "UPDATE torrents SET name='valuable' WHERE info_hash='$h'", false),
+        ("files", "INSERT INTO files(torrent_id,path,size) VALUES ('$h','valuable',1)", false),
+        ("search content", "INSERT INTO search_documents VALUES ('$h','valuable','valuable')", false),
+        ("size", "UPDATE torrents SET total_size=42 WHERE info_hash='$h'", false),
+        ("file count", "UPDATE torrents SET file_count=1 WHERE info_hash='$h'", false),
+        ("piece length", "UPDATE torrents SET piece_length=1 WHERE info_hash='$h'", false),
+        ("recent peer attempt", "INSERT INTO metadata_peer_attempts VALUES ('$h','127.0.0.1:1',200,'timeout')", false),
+        ("recent sample", "INSERT INTO sample_observations(info_hash,first_seen,last_seen) VALUES ('$h',1,200)", false),
+        ("recent success", "INSERT INTO hash_jobs(info_hash,status,updated_at,last_success_at) VALUES ('$h','waiting_peers',1,200)", false),
+        ("recent retained peer", "INSERT INTO hash_job_peers VALUES ('$h','127.0.0.1:1',200)", false),
+    ];
+    for (i, (_, sql, _)) in cases.iter().enumerate() {
+        let hash = format!("{i:040x}");
+        sqlx::query("INSERT INTO torrents(info_hash,first_seen,last_seen) VALUES (?,1,1)")
+            .bind(&hash)
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        if !sql.is_empty() {
+            store
+                .execute_batch_for_test(&sql.replace("$h", &hash))
+                .await
+                .unwrap();
+        }
+    }
+    store.reconcile().await.unwrap();
+    let before = store.get_stats().await.unwrap();
+    let preview = store.expire_incomplete(&policy, None, false).await.unwrap();
+    assert_eq!(preview.candidates, 6);
+    assert_eq!(preview.deleted, 0);
+    assert!(preview.exhausted);
+    assert_eq!(store.get_stats().await.unwrap(), before);
+    let applied = store.expire_incomplete(&policy, None, true).await.unwrap();
+    assert_eq!(applied.candidates, preview.candidates);
+    assert_eq!(applied.deleted, 6);
+    for (i, (label, _, expired)) in cases.iter().enumerate() {
+        assert_eq!(
+            store
+                .get_torrent_by_hex(&format!("{i:040x}"))
+                .await
+                .unwrap()
+                .is_none(),
+            *expired,
+            "{label}"
+        );
+    }
+    let after = store.get_stats().await.unwrap();
+    assert_eq!(after.total_torrents, before.total_torrents - 6);
+    assert_eq!(
+        after.total_metadata_complete,
+        before.total_metadata_complete
+    );
+    assert_eq!(after.total_files, before.total_files);
+    assert_eq!(after.total_size, before.total_size);
+    store.reconcile().await.unwrap();
+    assert_eq!(store.get_stats().await.unwrap(), after);
+    for table in [
+        "hash_jobs",
+        "hash_job_peers",
+        "metadata_peer_attempts",
+        "sample_observations",
+    ] {
+        let n: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table} WHERE info_hash=?"))
+            .bind(format!("{:040x}", 1))
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 0, "{table}");
+    }
+    let rediscovered = decode_hash(&format!("{:040x}", 1)).unwrap();
+    let peers = [PeerContact {
+        addr: "127.0.0.1:1234".parse().unwrap(),
+    }];
+    let discovery = store
+        .persist_hash_discovery(&rediscovered, "dht", &peers, 64)
+        .await
+        .unwrap();
+    assert!(discovery.torrent_inserted && discovery.hash_job_created);
+    store
+        .persist_hash_discovery(&rediscovered, "dht", &peers, 64)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.get_stats().await.unwrap().total_torrents,
+        after.total_torrents + 1
+    );
+    assert_eq!(
+        store.hash_job_peers(&rediscovered, 64).await.unwrap().len(),
+        1
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires BTFIND_TEST_DATABASE_URL; run scripts/test-mysql.sh"]
+async fn mysql_incomplete_expiry_bounded_cursor_and_rollback() {
+    let store = Store::open_test_database().await.unwrap();
+    for i in 0..8 {
+        sqlx::query("INSERT INTO torrents(info_hash,first_seen,last_seen,name) VALUES (?,1,?,?)")
+            .bind(format!("{i:040x}"))
+            .bind(1 + i / 6)
+            .bind(if i < 3 { Some("keep") } else { None })
+            .execute(&store.pool)
+            .await
+            .unwrap();
+    }
+    store.reconcile().await.unwrap();
+    let policy = ExpiryPolicy::new(30, 7, 3, 1).unwrap();
+    let first = store.expire_incomplete(&policy, None, true).await.unwrap();
+    assert_eq!(
+        (first.scanned, first.deleted, first.exhausted),
+        (3, 0, false)
+    );
+    let cursor: ExpiryCursor = first.next_cursor.unwrap().parse().unwrap();
+    let preview = store
+        .expire_incomplete(&policy, Some(cursor.clone()), false)
+        .await
+        .unwrap();
+    assert_eq!(
+        (preview.scanned, preview.candidates, preview.deleted),
+        (3, 3, 0)
+    );
+    let second = store
+        .expire_incomplete(&policy, Some(cursor.clone()), true)
+        .await
+        .unwrap();
+    assert_eq!(second.deleted, 3);
+    let last = store
+        .expire_incomplete(
+            &policy,
+            Some(second.next_cursor.unwrap().parse().unwrap()),
+            true,
+        )
+        .await
+        .unwrap();
+    assert_eq!((last.scanned, last.deleted, last.exhausted), (2, 2, true));
+    assert_eq!(store.get_stats().await.unwrap().total_torrents, 3);
+
+    store
+        .persist_hash_discovery(&[99; 20], "dht", &[], 64)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE torrents SET last_seen=1 WHERE info_hash=?")
+        .bind(hex::encode([99; 20]))
+        .execute(&store.pool)
+        .await
+        .unwrap();
+    store.execute_batch_for_test("CREATE TRIGGER expiry_failure BEFORE UPDATE ON catalog_totals FOR EACH ROW SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT='test rollback'").await.unwrap();
+    assert!(store
+        .expire_incomplete(&policy, Some(cursor), true)
+        .await
+        .is_err());
+    assert!(store.get_torrent(&[99; 20]).await.unwrap().is_some());
+    assert_eq!(store.get_stats().await.unwrap().total_torrents, 4);
+}
+
+#[tokio::test]
+#[ignore = "requires BTFIND_TEST_DATABASE_URL; run scripts/test-mysql.sh"]
 async fn mysql_torrent_indexes_after_migration() {
     let store = Store::open_test_database().await.unwrap();
     let indexes: Vec<String> = sqlx::query_scalar(
@@ -442,8 +710,12 @@ async fn mysql_metadata_search_and_counters() {
         .execute(&store.pool)
         .await
         .unwrap();
-    assert_eq!(store.prune_old_torrents(1).await.unwrap(), 1);
-    assert_eq!(store.get_stats().await.unwrap().total_size, 5);
+    let report = store
+        .expire_incomplete(&ExpiryPolicy::new(1, 1, 128, 10).unwrap(), None, true)
+        .await
+        .unwrap();
+    assert_eq!(report.deleted, 0);
+    assert_eq!(store.get_stats().await.unwrap(), after);
 }
 
 #[tokio::test]

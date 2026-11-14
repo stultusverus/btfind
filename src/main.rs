@@ -6,6 +6,7 @@ mod logging;
 mod magnet;
 mod metadata;
 mod metrics;
+mod prune;
 mod routing;
 mod store;
 mod types;
@@ -85,12 +86,8 @@ enum Commands {
     /// Show crawler statistics
     Stats,
 
-    /// Remove torrents not seen in N days
-    Prune {
-        /// Remove torrents older than this many days
-        #[arg(long, default_value = "90")]
-        older_than: u32,
-    },
+    /// Preview or expire inactive incomplete torrents (apply requires stopped services)
+    Prune(prune::Options),
 
     /// Start local HTTP API and dashboard
     Serve {
@@ -173,7 +170,16 @@ fn main() {
                 magnet,
             } => cmd_search(&config, query, limit, &sort, json, magnet).await,
             Commands::Stats => cmd_stats(&config).await,
-            Commands::Prune { older_than } => cmd_prune(&config, older_than).await,
+            Commands::Prune(options) => {
+                match prune::run(&config, options).await {
+                    Ok(report) => println!("{}", serde_json::to_string(&report).expect("expiry report serializes")),
+                    Err(error) => {
+                        tracing::error!(event = "command_failed", command = "prune", error = %error, "prune failed");
+                        eprintln!("prune failed: {error}");
+                        std::process::exit(1);
+                    }
+                }
+            }
             Commands::Magnet { info_hash, name } => cmd_magnet(&info_hash, name.as_deref()),
             Commands::Serve { host, port } => {
                 let host = host.unwrap_or_else(|| config.web.host.clone());
@@ -1076,41 +1082,6 @@ async fn shutdown_signal() {
     }
 }
 
-async fn cmd_prune(config: &config::Config, older_than: u32) {
-    let store = match open_store(config, false).await {
-        Ok(store) => store,
-        Err(error) => {
-            tracing::error!(
-                event = "command_failed",
-                command = "prune",
-                reason = "database",
-                error = %error,
-                "prune failed"
-            );
-            eprintln!("prune failed: {error}");
-            std::process::exit(1);
-        }
-    };
-    let removed = match store.prune_old_torrents(older_than as i64).await {
-        Ok(removed) => removed,
-        Err(error) => {
-            tracing::error!(
-                event = "command_failed",
-                command = "prune",
-                reason = "database",
-                error = %error,
-                "prune failed"
-            );
-            eprintln!("prune failed: {error}");
-            std::process::exit(1);
-        }
-    };
-    println!(
-        "Removed {} torrents older than {} days",
-        removed, older_than
-    );
-}
-
 fn format_size(bytes: i64) -> String {
     if bytes < 0 {
         return "0 B".to_string();
@@ -1219,8 +1190,15 @@ mod integration_tests {
         assert_eq!(history[0].metadata_fetched, Some(3));
 
         // Prune old torrents (won't prune anything since all are recent)
-        let removed = store.prune_old_torrents(365).await.unwrap();
-        assert_eq!(removed, 0);
+        let report = store
+            .expire_incomplete(
+                &store::ExpiryPolicy::new(365, 365, 128, 10).unwrap(),
+                None,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(report.deleted, 0);
     }
 
     #[test]
